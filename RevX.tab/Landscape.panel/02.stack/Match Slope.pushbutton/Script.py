@@ -1,19 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-MatchSlope.py v99
-
-Environment-style mesh tracing — FAST version with spatial hashing +
-crease/edge sampling for clean split-line reproduction.
-
-Changes from v98.1:
-- Added collect_shared_edges() to find real crease/split lines in the source
-  mesh (edges between triangles with different normals) and naked (boundary)
-  edges of the mesh.
-- Updated collect_mesh_xy() to also densify samples ALONG those edges and
-  to insert exact intersections with the target boundary — so split lines
-  project cleanly, and edges stay sharp instead of getting smoothed away.
-- Zero changes to workflow, transactions, options prompts, or vertex logic.
-"""
 
 import sys
 import math
@@ -1176,8 +1161,6 @@ def main():
     if skipped:
         msg += "\nFailed ({}):\n".format(len(skipped))
         msg += "\n".join("  • " + s for s in skipped)
-
-    forms.alert(msg, title="Match Slope  —  Done")
 
 
 # =============================================================================
