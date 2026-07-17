@@ -1,0 +1,17 @@
+title: Section Box
+author: Jesto Joy
+description: >
+  This tool automatically creates or reuses a 3D view and generates a
+  section box around a selected linked element. It reads the linked
+  element’s bounding box, applies the Revit link transform, and expands
+  the section box with an offset for better visibility.
+
+how_to_use: >
+  1. Run the tool from pyRevit.
+  2. Select a linked element in the model.
+  3. The script will automatically:
+     - Detect or create a 3D view
+     - Compute the element bounding box
+     - Apply link transform
+     - Create a section box with offset
+  4. The 3D view will open automatically, isolating the selected element.

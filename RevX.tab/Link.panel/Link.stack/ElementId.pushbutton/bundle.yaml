@@ -1,0 +1,20 @@
+title: Linked Element ID
+author: Jesto Joy
+description: >
+  This tool allows selection of elements inside Revit links and extracts
+  detailed identification data including host link name, host instance ID,
+  linked element ID, and robust type name resolution.
+
+  The output is displayed in a structured table inside pyRevit showing
+  all selected linked elements and their resolved metadata.
+
+how_to_use: >
+  1. Run the tool from pyRevit.
+  2. Select one or more elements inside a Revit linked model.
+  3. Finish the selection.
+  4. The script will extract:
+     - Link name
+     - Host instance ID
+     - Linked element ID
+     - Type name (family/type/category resolved)
+  5. View results in a formatted table inside the pyRevit output window.
