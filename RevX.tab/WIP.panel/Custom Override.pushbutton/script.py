@@ -7,6 +7,10 @@ Copies:
   including visibility, halftone, line weight, color, pattern, transparency
 - Category visibility (on/off)
 
+Handles views with or without view templates:
+- If target has no template (or template doesn't control RVT Links): writes to view
+- If target has a template controlling RVT Links: writes to the template directly
+
 Requires Revit 2018+ (View.GetLinkOverrides / SetLinkOverrides API).
 """
 
@@ -16,6 +20,27 @@ import Autodesk.Revit.DB as RDB
 doc = revit.doc
 uidoc = revit.uidoc
 output = script.get_output()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SAFE ELEMENT ID TO INT
+# ─────────────────────────────────────────────────────────────────────
+
+def eid_to_int(element_id):
+    """Convert ElementId to int - handles both old and new Revit API."""
+    try:
+        return element_id.IntegerValue
+    except AttributeError:
+        pass
+    try:
+        return element_id.Value
+    except AttributeError:
+        pass
+    try:
+        return int(element_id.ToString())
+    except Exception:
+        pass
+    return id(element_id)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -54,10 +79,7 @@ def find_link_visibility_type():
 
 LinkVisibilityType = find_link_visibility_type()
 
-if LinkVisibilityType is not None:
-    output.print_md("✅ Found `LinkVisibilityType` enum")
-else:
-    output.print_md("❌ Could not find `LinkVisibilityType` enum")
+if LinkVisibilityType is None:
     forms.alert("Cannot find LinkVisibilityType enum. Script cannot proceed.",
                 exitscript=True)
 
@@ -139,7 +161,6 @@ def get_link_type(link_inst):
 
 
 def get_linked_doc(link_inst):
-    """Get the linked Document from a RevitLinkInstance."""
     try:
         return link_inst.GetLinkDocument()
     except Exception:
@@ -201,186 +222,22 @@ def template_controls_link_overrides(view):
 
 
 def get_settings_owner(view):
+    """Return the element that actually owns the link override data.
+    If view has a template controlling RVT Links -> returns the template.
+    Otherwise -> returns the view itself."""
     if template_controls_link_overrides(view) is True:
         return doc.GetElement(view.ViewTemplateId)
     return view
 
 
-def free_link_param_from_template(template):
-    if RVT_LINK_PARAM_ID is None:
-        return
-    ids = list(template.GetNonControlledTemplateParameterIds())
-    if RVT_LINK_PARAM_ID not in ids:
-        ids.append(RVT_LINK_PARAM_ID)
-        template.SetNonControlledTemplateParameterIds(ids)
-
-
 # ─────────────────────────────────────────────────────────────────────
-# GET ALL CATEGORIES FROM LINKED DOCUMENT
+# FULL LINK OVERRIDE COPY
 # ─────────────────────────────────────────────────────────────────────
 
-def get_all_link_categories(link_inst):
+def copy_full_link_overrides(source_view, target_view_or_template, link_inst):
     """
-    Get all category IDs from the linked document that can have
-    visibility/graphic overrides applied.
-    Also includes sub-categories.
-    """
-    cat_ids = []
-    linked_doc = get_linked_doc(link_inst)
-
-    if linked_doc is not None:
-        # Get categories from the linked document
-        try:
-            cats = linked_doc.Settings.Categories
-            for cat in cats:
-                try:
-                    cat_ids.append(cat.Id)
-                    # Also get sub-categories
-                    if cat.SubCategories:
-                        for sub in cat.SubCategories:
-                            try:
-                                cat_ids.append(sub.Id)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # Also try host document categories (Revit uses host category IDs
-    # when setting overrides for linked model categories)
-    try:
-        host_cats = doc.Settings.Categories
-        for cat in host_cats:
-            try:
-                if cat.Id not in cat_ids:
-                    cat_ids.append(cat.Id)
-                if cat.SubCategories:
-                    for sub in cat.SubCategories:
-                        try:
-                            if sub.Id not in cat_ids:
-                                cat_ids.append(sub.Id)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return cat_ids
-
-
-# ─────────────────────────────────────────────────────────────────────
-# COPY ALL CATEGORY OVERRIDES FOR A LINK
-# ─────────────────────────────────────────────────────────────────────
-
-def copy_link_category_overrides(source_view, target_view, link_inst):
-    """
-    Copy ALL per-category overrides (visibility, halftone, line weight,
-    color, patterns, transparency) from source to target for a given link.
-
-    Uses the view's own GetCategoryOverrides/SetCategoryOverrides for
-    the linked model's categories.
-
-    Returns (copied_count, error_count, error_messages)
-    """
-    copied = 0
-    errors = 0
-    error_msgs = []
-
-    cat_ids = get_all_link_categories(link_inst)
-
-    for cat_id in cat_ids:
-        try:
-            # Get the override from source view
-            source_override = source_view.GetCategoryOverrides(cat_id)
-
-            # Get the visibility state from source view
-            try:
-                source_visible = source_view.GetCategoryHidden(cat_id)
-            except Exception:
-                source_visible = None
-
-            # Apply override to target view
-            target_view.SetCategoryOverrides(cat_id, source_override)
-
-            # Apply visibility state
-            if source_visible is not None:
-                try:
-                    target_view.SetCategoryHidden(cat_id, source_visible)
-                except Exception:
-                    pass
-
-            copied += 1
-
-        except Exception as e:
-            errors += 1
-            # Only log unique error types, not every single category
-            err_str = str(e)
-            if err_str not in error_msgs:
-                error_msgs.append(err_str)
-
-    return copied, errors, error_msgs
-
-
-# ─────────────────────────────────────────────────────────────────────
-# COPY LINK OVERRIDES USING THE LINK OVERRIDE MANAGER (2019+)
-# ─────────────────────────────────────────────────────────────────────
-
-def try_copy_via_override_manager(source_view, target_view, link_id):
-    """
-    Try to use View.GetLinkOverrides to get the full override settings
-    including nested category overrides, if the API version supports it.
-
-    The RevitLinkGraphicsSettings object may contain category-level
-    override data depending on the Revit API version.
-
-    Returns True if successfully copied detailed overrides, False otherwise.
-    """
-    try:
-        source_settings = source_view.GetLinkOverrides(link_id)
-        if source_settings is None:
-            return False
-
-        # Check if the settings object has category override methods
-        # (API availability varies by Revit version)
-
-        # Try to get category overrides from the settings object
-        has_cat_overrides = False
-
-        # Method 1: Check for GetCategoryOverrides on the settings object
-        if hasattr(source_settings, 'GetCategoryOverrides'):
-            has_cat_overrides = True
-
-        # Method 2: Check for LinkedOverridesMap or similar
-        if hasattr(source_settings, 'GetLinkCategoryOverridesMap'):
-            has_cat_overrides = True
-
-        if has_cat_overrides:
-            target_view.SetLinkOverrides(link_id, source_settings)
-            return True
-
-        # Even without explicit category override methods,
-        # SetLinkOverrides might carry the full data
-        target_view.SetLinkOverrides(link_id, source_settings)
-        return True
-
-    except Exception:
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────
-# FULL LINK OVERRIDE COPY (COMBINES ALL METHODS)
-# ─────────────────────────────────────────────────────────────────────
-
-def copy_full_link_overrides(source_view, target_view, link_inst):
-    """
-    Complete copy of all link display settings:
-    1. Copy the link-level override (Custom/ByHost/ByLink)
-    2. Copy all category overrides within the link
-    3. Copy category visibility states
-
-    Returns result dict with details.
+    Copy all link display settings from source to target.
+    target_view_or_template can be either a View or a View Template.
     """
     result = {
         "link_override_copied": False,
@@ -393,38 +250,32 @@ def copy_full_link_overrides(source_view, target_view, link_inst):
     link_id = link_inst.Id
     link_type = get_link_type(link_inst)
 
-    # ── Step 1: Copy the link-level settings ──
-    # Try instance first, then type
+    # Step 1: Copy link-level settings
     for eid in [link_id] + ([link_type.Id] if link_type else []):
         try:
             s = source_view.GetLinkOverrides(eid)
             if s is not None and is_custom(s):
-                target_view.SetLinkOverrides(eid, s)
+                target_view_or_template.SetLinkOverrides(eid, s)
                 result["link_override_copied"] = True
                 break
         except Exception:
             continue
 
     if not result["link_override_copied"]:
-        # Force set to Custom on target
         try:
             cs = make_custom_settings()
-            target_view.SetLinkOverrides(link_id, cs)
+            target_view_or_template.SetLinkOverrides(link_id, cs)
             result["link_override_copied"] = True
         except Exception as e:
             result["overall_error"] = str(e)
             return result
 
-    # ── Step 2: Copy per-category overrides ──
-    # These are the Model Categories, Annotation Categories, etc.
-    # that appear inside the link's Custom display settings
-
+    # Step 2: Copy per-category overrides
     linked_doc = get_linked_doc(link_inst)
     if linked_doc is None:
         result["overall_error"] = "Could not access linked document"
         return result
 
-    # Get all categories from the linked document
     all_cats = []
     try:
         for cat in linked_doc.Settings.Categories:
@@ -439,30 +290,17 @@ def copy_full_link_overrides(source_view, target_view, link_inst):
         result["overall_error"] = "Could not read linked doc categories: {}".format(e)
         return result
 
-    output.print_md("  Processing `{}` categories from linked model...".format(
-        len(all_cats)
-    ))
-
-    # For each category in the linked document, copy the override
     for cat in all_cats:
         try:
             cat_id = cat.Id
-
-            # ── Get source override for this category in the link context ──
-            # The API for per-link-category overrides varies by Revit version
-            # Try multiple approaches
-
             override_copied = False
 
-            # Approach A: Use View.GetCategoryOverrides with the category ID
-            # When a link is set to Custom, the view stores overrides
-            # keyed by the link's category IDs
             try:
                 src_ovr = source_view.GetCategoryOverrides(cat_id)
                 src_hidden = source_view.GetCategoryHidden(cat_id)
 
-                target_view.SetCategoryOverrides(cat_id, src_ovr)
-                target_view.SetCategoryHidden(cat_id, src_hidden)
+                target_view_or_template.SetCategoryOverrides(cat_id, src_ovr)
+                target_view_or_template.SetCategoryHidden(cat_id, src_hidden)
                 override_copied = True
             except Exception:
                 pass
@@ -484,7 +322,6 @@ def copy_full_link_overrides(source_view, target_view, link_inst):
 # ─────────────────────────────────────────────────────────────────────
 
 def get_real_source_override(owner_view, link_inst):
-    """Check INSTANCE then TYPE for a Custom override."""
     candidates = []
     candidates.append(("INSTANCE", link_inst.Id, link_label(link_inst)))
 
@@ -555,19 +392,10 @@ source_view = view_map[source_key]
 source_owner = get_settings_owner(source_view)
 source_is_tpl = source_owner.Id != source_view.Id
 
-output.print_md("---")
-output.print_md("## Source View Info")
-output.print_md("**Source View:** `{}`".format(safe_name(source_view)))
-output.print_md("**Settings Owner:** `{}` ({})".format(
-    safe_name(source_owner), "TEMPLATE" if source_is_tpl else "VIEW"
-))
-
 
 # ─────────────────────────────────────────────────────────────────────
 # STEP 3 – Validate source
 # ─────────────────────────────────────────────────────────────────────
-
-output.print_md("## Source Override Check")
 
 valid_links = []
 missing_links = []
@@ -576,29 +404,10 @@ for link in selected_links:
     kind, eid, label, settings = get_real_source_override(source_owner, link)
 
     if settings is None:
-        output.print_md("❌ `{}` - No override found".format(link_label(link)))
         missing_links.append(link)
     elif not is_custom(settings):
-        output.print_md(
-            "⚠ `{}` - Found but not Custom (type=`{}`)".format(
-                link_label(link), int(settings.LinkVisibilityType)
-            )
-        )
         missing_links.append(link)
     else:
-        linked_doc = get_linked_doc(link)
-        cat_count = 0
-        if linked_doc:
-            try:
-                for cat in linked_doc.Settings.Categories:
-                    cat_count += 1
-            except Exception:
-                pass
-        output.print_md(
-            "✅ `{}` - Custom override on {} | Linked doc has `{}` categories".format(
-                link_label(link), kind, cat_count
-            )
-        )
         valid_links.append(link)
 
 if not valid_links:
@@ -637,104 +446,58 @@ target_views = [view_map[k] for k in target_keys]
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 5 – Check target template locks
+# STEP 5 – Resolve target owners (view or its template)
+#           Group by unique owner to avoid writing to same template twice
 # ─────────────────────────────────────────────────────────────────────
 
-locked_targets = []
-free_targets = []
-for v in target_views:
-    if template_controls_link_overrides(v) is True:
-        locked_targets.append(v)
-    else:
-        free_targets.append(v)
+target_owner_map = {}
 
-unlock_confirmed = False
-if locked_targets:
-    locked_names = "\n".join(
-        "  - {} (template: {})".format(
-            safe_name(v), safe_name(doc.GetElement(v.ViewTemplateId))
-        )
-        for v in locked_targets
-    )
-    unlock_confirmed = forms.alert(
-        "These targets have templates controlling RVT Link overrides:\n\n"
-        "{}\n\nUnlock and proceed?".format(locked_names),
-        yes=True, no=True,
-    )
+for v in target_views:
+    owner = get_settings_owner(v)
+    owner_key = eid_to_int(owner.Id)
+
+    if owner_key not in target_owner_map:
+        target_owner_map[owner_key] = {
+            "owner": owner,
+            "is_template": owner.Id != v.Id,
+            "views": []
+        }
+    target_owner_map[owner_key]["views"].append(safe_name(v))
 
 
 # ─────────────────────────────────────────────────────────────────────
 # STEP 6 – Apply
 # ─────────────────────────────────────────────────────────────────────
 
-results = {"success": [], "skipped": [], "failed": []}
+success_count = 0
+fail_count = 0
+template_count = 0
+view_count = 0
 
 t = DB.Transaction(doc, "Copy RVT Link Display Settings + Category Overrides")
 t.Start()
 
 try:
-    # Unlock templates
-    if locked_targets and unlock_confirmed:
-        done = set()
-        for v in locked_targets:
-            tid = v.ViewTemplateId
-            if tid not in done:
-                free_link_param_from_template(doc.GetElement(tid))
-                done.add(tid)
-        free_targets.extend(locked_targets)
-        locked_targets = []
+    for owner_key, info in target_owner_map.items():
+        owner = info["owner"]
+        is_tpl = info["is_template"]
+        view_names = info["views"]
 
-    # Copy to each target
-    for v in free_targets:
         for link in valid_links:
             try:
-                output.print_md(
-                    "### Copying `{}` -> `{}`".format(
-                        link_label(link), safe_name(v)
-                    )
-                )
-
-                r = copy_full_link_overrides(source_owner, v, link)
-
+                r = copy_full_link_overrides(source_owner, owner, link)
                 if r["overall_error"]:
-                    results["failed"].append(
-                        "{} <- {} | {}".format(
-                            safe_name(v), link_label(link),
-                            r["overall_error"]
-                        )
-                    )
+                    fail_count += len(view_names)
                 else:
-                    detail = (
-                        "link_override={}, categories_copied={}, "
-                        "cat_errors={}".format(
-                            r["link_override_copied"],
-                            r["categories_copied"],
-                            r["categories_errored"]
-                        )
-                    )
-                    results["success"].append(
-                        "{} <- {} ({})".format(
-                            safe_name(v), link_label(link), detail
-                        )
-                    )
-                    if r["cat_errors"]:
-                        for ce in r["cat_errors"][:3]:
-                            output.print_md("  ⚠ Cat error: `{}`".format(ce))
-
-            except Exception as e:
-                results["failed"].append(
-                    "{} <- {} | ERROR: {}".format(
-                        safe_name(v), link_label(link), e
-                    )
-                )
-
-    for v in locked_targets:
-        results["skipped"].append(
-            "{} (template still controls overrides)".format(safe_name(v))
-        )
+                    success_count += len(view_names)
+                    if is_tpl:
+                        template_count += 1
+                    else:
+                        view_count += len(view_names)
+            except Exception:
+                fail_count += len(view_names)
 
     t.Commit()
-    output.print_md("✅ **Transaction committed successfully**")
 
 except Exception as ex:
     t.RollBack()
@@ -743,31 +506,16 @@ except Exception as ex:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# STEP 7 – Report
+# STEP 7 – Toast notification
 # ─────────────────────────────────────────────────────────────────────
 
-output.print_md("---")
-output.print_md("## Final Results")
-
-if source_is_tpl:
-    output.print_md(
-        "_Source read from template: **{}**_".format(safe_name(source_owner))
+if fail_count == 0:
+    msg = "Link overrides copied to {} view(s).".format(success_count)
+    if template_count > 0:
+        msg += " ({} via template)".format(template_count)
+    forms.toaster.send_toast(msg, title="Copy Link Overrides")
+else:
+    forms.toaster.send_toast(
+        "Copied: {} | Failed: {}".format(success_count, fail_count),
+        title="Copy Link Overrides"
     )
-
-if results["success"]:
-    output.print_md("### ✅ Applied ({})".format(len(results["success"])))
-    for r in results["success"]:
-        output.print_md("- " + r)
-
-if results["skipped"]:
-    output.print_md("### ⏭ Skipped ({})".format(len(results["skipped"])))
-    for r in results["skipped"]:
-        output.print_md("- " + r)
-
-if results["failed"]:
-    output.print_md("### ❌ Failed ({})".format(len(results["failed"])))
-    for r in results["failed"]:
-        output.print_md("- " + r)
-
-if not any(results.values()):
-    output.print_md("_No operations performed._")

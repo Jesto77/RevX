@@ -326,7 +326,7 @@
                                 <TextBlock Text="🔍  Search" Style="{StaticResource FieldLabel}"/>
                                 <TextBox x:Name="searchBox" Style="{StaticResource AppTextBox}"
                                          TextChanged="OnSearchChanged"
-                                         ToolTip="Search by name, category, type or GUID"/>
+                                         ToolTip="Search by name, category or type"/>
                             </StackPanel>
                             <StackPanel Grid.Column="1">
                                 <TextBlock Text="Source" Style="{StaticResource FieldLabel}"/>
@@ -410,9 +410,9 @@
                                         </DataTemplate>
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>
-                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="220" IsReadOnly="True"/>
-                                <DataGridTextColumn Header="Type" Binding="{Binding ParameterType}" Width="140" IsReadOnly="True"/>
-                                <DataGridTextColumn Header="Group" Binding="{Binding ParameterGroup}" Width="160" IsReadOnly="True"/>
+                                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="240" IsReadOnly="True"/>
+                                <DataGridTextColumn Header="Type" Binding="{Binding ParameterType}" Width="150" IsReadOnly="True"/>
+                                <DataGridTextColumn Header="Group" Binding="{Binding ParameterGroup}" Width="180" IsReadOnly="True"/>
                                 <DataGridTemplateColumn Header="Instance" Width="80">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
@@ -427,9 +427,8 @@
                                         </DataTemplate>
                                     </DataGridTemplateColumn.CellTemplate>
                                 </DataGridTemplateColumn>
-                                <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="90" IsReadOnly="True"/>
-                                <DataGridTextColumn Header="GUID" Binding="{Binding GUID}" Width="260" IsReadOnly="True"/>
-                                <DataGridTemplateColumn Header="Categories" Width="400" MinWidth="200">
+                                <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="100" IsReadOnly="True"/>
+                                <DataGridTemplateColumn Header="Categories" Width="*" MinWidth="250">
                                     <DataGridTemplateColumn.CellTemplate>
                                         <DataTemplate>
                                             <TextBlock Text="{Binding Categories}"
