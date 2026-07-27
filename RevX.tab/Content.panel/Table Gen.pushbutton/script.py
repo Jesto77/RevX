@@ -5,7 +5,7 @@ __title__ = "TableGen"
 __author__ = "Jesto Joy"
 __doc__ = "Import Excel/CSV tables into Revit as native schedules."
 
-SCRIPT_VERSION = "v31 (2026-07-16) pad-to-exact-equal split parts"
+SCRIPT_VERSION = "v32 (2026-07-16) configurable header rows in split"
 
 import os
 import re
@@ -59,6 +59,7 @@ IMG_BUFFER = 1.25
 PX_PER_MM = 12.0
 CANVAS_CAP_PX = 2000
 
+# Default header rows - used as fallback only; user can override per-split
 SPLIT_HEADER_ROWS = 3
 CATEGORY_MERGE_MIN_FRACTION = 0.6
 
@@ -751,12 +752,7 @@ def compute_balanced_split(nrows, header_rows, num_parts,
                            row_heights, merges, category_rows,
                            scale=1.0):
     """Split data rows into num_parts chunks that are as EQUAL
-    in total height as possible.
-
-    Uses rolling target: after each part, the target for the next
-    part is recomputed based on remaining height / remaining parts,
-    so overshoots automatically compensate on the following part.
-    Respects merges and category headers (never mid-split them)."""
+    in total height as possible."""
     if nrows <= header_rows or num_parts <= 1:
         return [(0, nrows - 1)] if nrows > 0 else []
     if num_parts > (nrows - header_rows):
@@ -920,19 +916,7 @@ def measure_part_height(full_table, part_start, part_end,
 def compute_capped_split(nrows, header_rows, num_parts,
                          row_heights, merges, category_rows,
                          max_h_mm, scale=1.0):
-    """Fill the first (num_parts - 1) parts up to max_h_mm EACH
-    (greedy, row-by-row - no shrinking, so image size stays
-    exactly as configured). The LAST part takes whatever data
-    rows remain, regardless of its resulting height.
-
-    Header rows are counted toward each part's max_h_mm budget
-    (since they repeat on every part). Merged cells are never
-    split, and a category-header row is always pushed to the
-    START of the next part rather than ending the current one.
-
-    If content runs out before (num_parts - 1) capped parts are
-    filled, fewer parts than requested are returned - the
-    leftover is folded into the final range."""
+    """Fill parts up to max_h_mm each (greedy)."""
     if nrows <= header_rows or num_parts <= 1:
         return [(header_rows, nrows - 1)] if nrows > header_rows \
             else ([(0, nrows - 1)] if nrows > 0 else [])
@@ -944,8 +928,6 @@ def compute_capped_split(nrows, header_rows, num_parts,
 
     total_data_h = sum(heights[header_rows:nrows])
     if total_data_h <= 0:
-        # No row-height info to budget against (e.g. clipboard/CSV
-        # paste) - fall back to an equal row-count split instead.
         return compute_equal_rowcount_split(
             nrows, header_rows, num_parts, merges, category_rows)
 
@@ -993,16 +975,11 @@ def compute_capped_split(nrows, header_rows, num_parts,
             last_valid = r
             r += 1
         if last_valid is None:
-            # even one row exceeds budget - include it anyway so
-            # we always make forward progress
             last_valid = cursor
 
         end_row = adjust_end(last_valid, cursor)
 
         if end_row >= nrows - 1:
-            # everything remaining fits in what would be this
-            # part - let the loop below fold it into the LAST
-            # part instead of creating an extra short one here
             break
 
         ranges.append((cursor, end_row))
@@ -1017,12 +994,7 @@ def compute_capped_split(nrows, header_rows, num_parts,
 
 def compute_fit_scale_factor(full_table, header_rows, num_parts,
                              max_h_mm, scale=1.0, ranges=None):
-    """Return a factor that scales ALL row heights so the TALLEST
-    part becomes exactly max_h_mm.
-
-    Combined with pad_parts_to_equal_height, this ensures ALL
-    parts become exactly max_h_mm (padding adjusts remaining
-    rows in shorter parts to match)."""
+    """Return factor so tallest part becomes exactly max_h_mm."""
     rh = full_table['row_heights']
 
     header_h = 0.0
@@ -1057,17 +1029,9 @@ def compute_fit_scale_factor(full_table, header_rows, num_parts,
 
 def pad_parts_to_equal_height(full_table, ranges, header_rows,
                               target_h_mm, scale=1.0):
-    """Adjust row heights per-part so every part becomes EXACTLY
-    target_h_mm tall.
+    """Adjust row heights per-part so every part is EXACTLY target_h_mm.
 
-    For each part, computes current height and distributes the
-    missing height evenly across all its data rows. Returns a
-    dict keyed by (part_index, source_row_idx) -> new_height_mm.
-
-    build_part_table applies these overrides when building each
-    part's table, so every part - even after integer row-count
-    rounding - ends up exactly target_h_mm tall.
-    """
+    Returns dict keyed by (part_index, source_row_idx) -> new_height_mm."""
     rh = full_table['row_heights']
 
     header_h = 0.0
@@ -1103,9 +1067,7 @@ def pad_parts_to_equal_height(full_table, ranges, header_rows,
 
 def compute_fit_shrink_factor(full_table, ranges, header_rows,
                               max_h_mm, scale=1.0):
-    """Return a single shrink factor <= 1.0 such that when all row
-    heights are multiplied by (scale * factor), no part exceeds
-    max_h_mm. If everything already fits, returns 1.0."""
+    """Return shrink factor <= 1.0 so no part exceeds max_h_mm."""
     worst = 0.0
     for (s, e) in ranges:
         h = measure_part_height(full_table, s, e,
@@ -1119,11 +1081,9 @@ def compute_fit_shrink_factor(full_table, ranges, header_rows,
 
 def build_part_table(full_table, part_start, part_end, header_rows,
                      row_h_override=None):
-    """Build a part-table.
+    """Build a part-table slice.
 
-    row_h_override: optional dict {source_row_idx: new_height_mm}
-    that overrides row heights in the returned table (applied ONLY
-    to rows that appear in the override map)."""
+    row_h_override: optional dict {source_row_idx: new_height_mm}."""
     src_data = full_table['data']
     src_styles = full_table['styles']
     src_merges = full_table['merges']
@@ -1717,7 +1677,10 @@ class TableGenWindow(forms.WPFWindow):
             forms.alert("Resize failed:\n{}".format(err))
 
     def _split_selected(self, sender, args):
-        """Split into N EXACT-equal parts by padding row heights."""
+        """Split into N EXACT-equal parts by padding row heights.
+
+        User specifies how many header rows to repeat on every part.
+        """
         try:
             picked = [e for chk, e in
                       getattr(self, 'history_rows', [])
@@ -1737,60 +1700,102 @@ class TableGenWindow(forms.WPFWindow):
                     .format(entry.get('name'), srcf))
                 return
 
+            # Retrieve previously-saved header-row count for this entry
+            prev_settings = entry.get('settings') or {}
+            prev_header = prev_settings.get(
+                'split_header', SPLIT_HEADER_ROWS)
+
             resp = forms.ask_for_string(
                 prompt=(
                     "Split '{}' into N EXACT-equal parts, "
                     "each MAX_HEIGHT_MM tall.\n\n"
-                    "Enter TWO values separated by a comma:\n"
-                    "   MAX_HEIGHT_MM , NUM_PARTS\n\n"
+                    "Enter THREE values separated by commas:\n"
+                    "   MAX_HEIGHT_MM , NUM_PARTS , HEADER_ROWS\n\n"
+                    "  MAX_HEIGHT_MM  = target height of every "
+                    "part (mm)\n"
+                    "  NUM_PARTS      = how many schedule sheets "
+                    "to make\n"
+                    "  HEADER_ROWS    = how many TOP rows to "
+                    "repeat as\n"
+                    "                   header on EVERY split "
+                    "part\n"
+                    "                   (current saved value: "
+                    "{})\n\n"
                     "Examples:\n"
-                    "   550, 2   -> 2 parts, each 550 mm tall.\n"
-                    "   600, 3   -> 3 parts, each 600 mm tall.\n\n"
+                    "   550, 2, 3   -> 2 parts, 550 mm each,\n"
+                    "                  top 3 rows repeat as "
+                    "header\n"
+                    "   600, 3, 1   -> 3 parts, 600 mm each,\n"
+                    "                  top 1 row repeats as "
+                    "header\n"
+                    "   400, 4, 4   -> 4 parts, 400 mm each,\n"
+                    "                  top 4 rows repeat as "
+                    "header\n"
+                    "   500, 2, 0   -> 2 parts, no header "
+                    "repeated\n\n"
                     "How it works:\n"
                     "  1. Content is split into NUM_PARTS "
                     "balanced chunks.\n"
                     "  2. ALL row heights (and image size) are "
-                    "scaled by ONE factor so the TALLEST part "
-                    "becomes MAX_HEIGHT_MM.\n"
-                    "  3. Shorter parts are PADDED (row heights "
-                    "increased) so every part becomes EXACTLY "
-                    "MAX_HEIGHT_MM tall.\n"
-                    "  4. Images stay UNIFORM across every part.\n\n"
+                    "scaled by\n"
+                    "     ONE factor so the TALLEST part = "
+                    "MAX_HEIGHT_MM.\n"
+                    "  3. Shorter parts are PADDED so every part "
+                    "becomes\n"
+                    "     EXACTLY MAX_HEIGHT_MM tall.\n"
+                    "  4. Images stay UNIFORM across every "
+                    "part.\n\n"
                     "Rules:\n"
-                    "  * First {} rows repeat as header.\n"
-                    "  * Blue category-headers start next part.\n"
+                    "  * The first HEADER_ROWS rows (whatever you "
+                    "type) repeat as header on every part.\n"
+                    "  * Blue category-headers start the next "
+                    "part.\n"
                     "  * Merged cells are never split."
-                    .format(entry.get('name'),
-                            SPLIT_HEADER_ROWS)),
+                    .format(entry.get('name'), prev_header)),
                 title="TableGen - Split & fit to titleblock",
-                default="550, 3")
+                default="550, 3, {}".format(prev_header))
             if not resp or not resp.strip():
                 return
 
+            # Parse: accept 2 or 3 comma-separated values
             try:
                 parts_txt = [p.strip() for p in resp.split(',')]
                 if len(parts_txt) < 2:
                     forms.alert(
-                        "Please enter TWO values separated by "
-                        "a comma: MAX_HEIGHT_MM, NUM_PARTS")
+                        "Please enter at least TWO values "
+                        "separated by commas:\n"
+                        "MAX_HEIGHT_MM, NUM_PARTS "
+                        "[, HEADER_ROWS]")
                     return
                 max_h = float(parts_txt[0])
                 num_parts = int(float(parts_txt[1]))
+                if len(parts_txt) >= 3 and parts_txt[2] != '':
+                    header_rows = int(float(parts_txt[2]))
+                else:
+                    header_rows = prev_header
+
                 if max_h <= 0 or num_parts < 2:
                     forms.alert(
                         "MAX_HEIGHT_MM must be > 0 and "
                         "NUM_PARTS must be >= 2.")
                     return
+                if header_rows < 0:
+                    forms.alert(
+                        "HEADER_ROWS must be >= 0 "
+                        "(0 means no repeated header).")
+                    return
             except Exception:
                 forms.alert(
-                    "Invalid input.\n\nUse format: "
-                    "HEIGHT_MM, NUM_PARTS (e.g. 550, 3)")
+                    "Invalid input.\n\nUse format:\n"
+                    "HEIGHT_MM, NUM_PARTS, HEADER_ROWS\n"
+                    "(e.g. 550, 3, 4)")
                 return
 
             self.result = {
                 'split_entry': entry,
                 'split_max_h_mm': max_h,
                 'split_num_parts': num_parts,
+                'split_header_rows': header_rows,
             }
             self.Close()
         except Exception as err:
@@ -2293,8 +2298,7 @@ def import_image(filepath):
 
 # --------------------------------------------- sheet placement helper
 def get_schedule_placements(name):
-    """Return [{'sheet_id':..., 'point':...}, ...] describing every
-    sheet placement of the schedule currently named `name`."""
+    """Return list of sheet placements for the schedule named `name`."""
     placements = []
     sched_id = None
     for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
@@ -2378,7 +2382,10 @@ def read_table_for(source_file, settings):
 
 
 def read_table_for_part(source_file, settings):
-    """Re-read source and slice out the correct part."""
+    """Re-read source and slice out the correct part.
+
+    Respects 'split_header' in settings (user-configured header rows).
+    """
     full = read_table_for(source_file, settings)
     if not full:
         return full
@@ -2386,7 +2393,10 @@ def read_table_for_part(source_file, settings):
     total = settings.get('split_total')
     if not part or not total or total < 2:
         return full
+
+    # Use saved header row count; fall back to global default
     header_rows = settings.get('split_header', SPLIT_HEADER_ROWS)
+
     nrows = len(full['data'])
     ncols = len(full['data'][0]) if nrows else 0
     cat_rows = detect_category_header_rows(
@@ -2411,7 +2421,6 @@ def read_table_for_part(source_file, settings):
                 (h * fit_factor) if h else h
                 for h in full['row_heights']]
 
-        # apply padding so this part is EXACTLY max_h mm
         pad_overrides = pad_parts_to_equal_height(
             full, ranges, header_rows, max_h, scale=1.0)
         part_idx = part - 1
@@ -2680,6 +2689,9 @@ try:
         entry = cfg['split_entry']
         max_h = cfg['split_max_h_mm']
         num_parts = cfg['split_num_parts']
+        # Use user-configured header row count
+        user_header_rows = cfg.get('split_header_rows',
+                                   SPLIT_HEADER_ROWS)
         srcf = entry.get('source')
         base_settings = dict(entry.get('settings') or {})
         base_name = entry.get('name', 'Table')
@@ -2699,14 +2711,24 @@ try:
             nrows_full = len(full_table['data'])
             ncols_full = (len(full_table['data'][0])
                           if nrows_full else 0)
+
+            # Guard: header_rows must not exceed total rows
+            if user_header_rows >= nrows_full:
+                user_header_rows = max(0, nrows_full - 1)
+                all_problems.append(
+                    "{}: HEADER_ROWS clamped to {} "
+                    "(table only has {} rows)"
+                    .format(base_name, user_header_rows,
+                            nrows_full))
+
             cat_rows = detect_category_header_rows(
                 nrows_full, ncols_full,
                 full_table['merges'], full_table['styles'])
             scale = base_settings.get('scale', 1.0)
 
-            # 1) Split into balanced chunks
+            # 1) Split into balanced chunks using user header rows
             ranges = compute_balanced_split(
-                nrows_full, SPLIT_HEADER_ROWS, num_parts,
+                nrows_full, user_header_rows, num_parts,
                 full_table['row_heights'],
                 full_table['merges'], cat_rows,
                 scale=scale)
@@ -2714,7 +2736,7 @@ try:
 
             # 2) Scale so tallest part <= max_h
             fit_factor = compute_fit_scale_factor(
-                full_table, SPLIT_HEADER_ROWS, actual_parts,
+                full_table, user_header_rows, actual_parts,
                 max_h, scale, ranges=ranges)
             if fit_factor and abs(fit_factor - 1.0) > 1e-9:
                 full_table['row_heights'] = [
@@ -2730,19 +2752,19 @@ try:
             # 4) PAD each part's data rows so every part becomes
             #    EXACTLY max_h tall.
             pad_overrides = pad_parts_to_equal_height(
-                full_table, ranges, SPLIT_HEADER_ROWS,
+                full_table, ranges, user_header_rows,
                 max_h, scale=1.0)
 
             # Compute final part heights (post-pad) for the log
             part_heights_after = []
             for i, (s, e) in enumerate(ranges):
                 h = 0.0
-                for r in range(SPLIT_HEADER_ROWS):
+                for r in range(user_header_rows):
                     if r < len(full_table['row_heights']) \
                             and full_table['row_heights'][r]:
                         h += full_table['row_heights'][r]
                 for r in range(s, e + 1):
-                    if r < SPLIT_HEADER_ROWS:
+                    if r < user_header_rows:
                         continue
                     if (i, r) in pad_overrides:
                         h += pad_overrides[(i, r)]
@@ -2755,11 +2777,13 @@ try:
                 all_problems.append(
                     "{}: scaled to {:.1f}% (images {:.1f} mm), "
                     "then padded to exactly {} mm each. "
+                    "Header rows repeated: {}. "
                     "Parts: {}"
                     .format(base_name,
                             fit_factor * 100.0,
                             new_img_size,
                             max_h,
+                            user_header_rows,
                             ", ".join(
                                 "S{:02d}={:.0f}mm".format(
                                     i + 1, h)
@@ -2772,7 +2796,7 @@ try:
                     "supports {} (not enough data rows)."
                     .format(base_name, num_parts, actual_parts))
 
-            # remove the original
+            # Remove the original schedule
             t = Transaction(
                 doc,
                 "TableGen: remove original for split")
@@ -2793,25 +2817,30 @@ try:
                 part_name = "{}_Sheet {:02d}".format(
                     base_name, part_num)
                 try:
-                    # extract this part's row-height overrides
+                    # Extract this part's row-height overrides
                     part_override = {
                         src_r: h
-                        for (pi, src_r), h in pad_overrides.items()
+                        for (pi, src_r), h
+                        in pad_overrides.items()
                         if pi == i
                     }
 
                     part_table = build_part_table(
                         full_table, r_start, r_end,
-                        SPLIT_HEADER_ROWS,
+                        user_header_rows,
                         row_h_override=part_override)
+
                     part_settings = dict(base_settings)
                     part_settings['img_size'] = new_img_size
                     part_settings['split_part'] = part_num
                     part_settings['split_total'] = actual_parts
+                    # Save user-chosen header rows so reload /
+                    # re-split uses same value automatically
                     part_settings['split_header'] = (
-                        SPLIT_HEADER_ROWS)
+                        user_header_rows)
                     part_settings['split_max_h'] = max_h
                     part_settings['split_num_parts'] = num_parts
+
                     view, img_log, placed = run_one(
                         part_name, part_table,
                         part_settings, srcf)
