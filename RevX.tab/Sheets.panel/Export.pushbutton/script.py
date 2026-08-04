@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Sheet Export - a ProSheets-style batch exporter for Revit.
+"""Sheet Expor .
 
 Selection -> Format -> Create workflow with custom file naming.
 Exports PDF / DWG / DGN / DWF / NWC / IFC / IMG.
@@ -7,7 +7,7 @@ Exports PDF / DWG / DGN / DWF / NWC / IFC / IMG.
 Compatible with Revit 2024, 2025, 2026, 2027 (IronPython 2.7, 3.x and CPython).
 """
 
-__title__ = "Sheet Export"
+__title__ = "Export"
 __author__ = "Jesto Joy"
 __doc__ = ("Batch export sheets and views to PDF, DWG, DGN, DWF, NWC, IFC and "
            "images with fully customisable file naming.")
