@@ -1,0 +1,12 @@
+title: Override Crop Region
+
+author: Jesto Joy
+
+tooltip: |
+  Change the crop region line style and lineweight for multiple views at once.
+
+  How to Use:
+  • Select the view types to modify.
+  • Choose a line pattern.
+  • Select a lineweight.
+  • Apply the overrides.

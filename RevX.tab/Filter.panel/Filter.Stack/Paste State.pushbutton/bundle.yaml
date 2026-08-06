@@ -1,0 +1,20 @@
+title: Paste State
+author: Jesto Joy
+tooltip: Paste saved view filter overrides to the current view/template — in the same project or another open project
+description: |
+  Paste State - Cross-Project View Filter Override Transfer (Template-aware)
+
+  Description
+  ----------
+  Restores a previously saved view filter state and applies it to the active view, view template, or another open Revit project within the same session.
+
+  The tool transfers full filter override settings including graphics, visibility, and filter control states.
+
+  How to Use
+  ----------
+  1. Run "Copy State" from the source view/project
+  2. Open the target project/view in the same Revit session
+  3. Activate the view where filters should be applied
+  4. Click "Paste State"
+  5. Choose the target (View or View Template)
+  6. Confirm to apply the saved filter overrides

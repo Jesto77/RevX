@@ -1,0 +1,24 @@
+title: Match Slope
+author: Jesto Joy
+tooltip: Transfer slab shape from source to target elements
+description: >
+  Match Slope transfers slab shape (Modify Sub Elements) geometry from
+  one or more source floors/roofs/ceilings to selected target elements.
+  It reconstructs the true slope plane from slab shape vertices and applies
+  it accurately using Revit SlabShapeEditor API.
+
+  The script supports multiple source/target selection, slope direction
+  options (Top-to-Top, Top-to-Base, Base-to-Top, Base-to-Base), and elevation
+  offsets. It automatically handles datum calculation (Level + Height Offset)
+  and ensures correct vertex modification using ModifySubElement.
+
+  It is compatible with Revit 2018–2026+ and works for floors, roofs,
+  and ceilings that use shape editing (not slope arrows).
+
+  How to Use:
+  1. Run the tool from pyRevit.
+  2. Select TARGET elements (floors/roofs/ceilings that will receive slope).
+  3. Select SOURCE elements (floors with correct slope to copy).
+  4. Choose match method: Top-to-Top, Top-to-Base, Base-to-Top, Base-to-Base.
+  5. Enter elevation offset in mm (0 = exact, + = raise, - = lower).
+  6. Confirm execution to apply slope transfer.

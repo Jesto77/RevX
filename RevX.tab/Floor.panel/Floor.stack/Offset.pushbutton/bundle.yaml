@@ -1,0 +1,12 @@
+title: Offset
+
+author: Jesto Joy
+
+tooltip: |
+  Resize Floors, Roofs, Ceilings, and Toposolids by applying an inward or outward boundary offset.
+
+  How to Use:
+  • Enter the offset distance in millimetres.
+  • Select the elements to resize.
+  • The tool creates new offset elements.
+  • Original elements are automatically replaced.

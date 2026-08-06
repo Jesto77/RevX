@@ -1,0 +1,6 @@
+title: Mound
+author: Jesto Joy
+description: >
+  This tool creates a Topography (or Toposolid in Revit 2024+) from selected
+  model contour lines and boundary curves. It extracts elevation points from
+  model curves, cleans duplicates, and builds a valid terrain surface.
