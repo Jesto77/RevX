@@ -1,0 +1,354 @@
+[
+  {
+    "ui_path": "RevX tab > RevX > ACC",
+    "button": "Material List",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > ACC",
+    "button": "Outlook",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "pyRevit pushbutton script: opens Outlook Web App inbox in Google Chrome.\nWorks across all Revit versions."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Convert",
+    "button": "Filled Region to Floor",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Convert selected Filled Regions <-> Floors in one click.\n\nSelect any mix of Filled Regions and Floors and run this tool - it\ninspects each selected element's type and converts it in the correct\ndirection automatically. No need for two separate buttons.\n\nImportant differences vs. a Floor<->Toposolid conversion:\n  - A Filled Region is a flat, VIEW-SPECIFIC detail element with no\n    Level of its own. Floor -> Filled Region needs an active view to\n    sketch into (ideally a plan/section/drafting view whose plane\n    matches the floor). Filled Region -> Floor needs a Level: if the\n    filled region's host view is a plan view, its associated level is\n    used automatically; otherwise you'll be asked to pick one.\n  - Filled Region boundaries are 2D loops on the view's sketch plane;\n    Floor boundaries are 3D loops on a Level plane. The curve geometry\n    transfers as-is, so double check the result if your view isn't\n    aligned with the target level's plane.\n\nNotes / assumptions:\n  - If more than one candidate Filled Region Type / Floor Type exists\n    in the project, you'll be asked which to convert to. With only one\n    available, it's used automatically. Floor Type choices exclude\n    Structural Foundation slabs.\n  - Only the boundary geometry transfers - line styles/hatch patterns\n    on the filled region and floor parameters (Comments, Mark, etc.)\n    are NOT copied automatically.\n  - Floor.Create(CurveLoop list) requires Revit 2022+. On older Revit\n    this script falls back to the legacy doc.Create.NewFloor() call."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Convert",
+    "button": "Filled Region to Toposolid",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Convert selected Filled Regions <-> Toposolids in one click.\n\nSelect any mix of Filled Regions and Toposolids and run this tool - it\ninspects each selected element's type and converts it in the correct\ndirection automatically. No need for two separate buttons.\n\nREQUIRES REVIT 2024 OR LATER.\nToposolid is a Revit API class introduced in Revit 2024. On older\nversions this script shows a clear message and exits instead of\ncrashing.\n\nImportant differences vs. a Floor<->Toposolid conversion:\n  - A Filled Region is a flat, VIEW-SPECIFIC detail element with no\n    Level or Height Offset parameter of its own. Toposolid -> Filled\n    Region needs an active view to sketch into (ideally a plan view\n    whose plane roughly matches the toposolid). Filled Region ->\n    Toposolid needs a Level: if the filled region's host view is a\n    plan view, its associated level is used automatically; otherwise\n    you'll be asked to pick one.\n  - A Filled Region's boundary curves do carry a real Z coordinate\n    (from the view's sketch plane), even though the region displays as\n    flat 2D. This script uses that Z, relative to the chosen Level, to\n    set the new Toposolid's Height Offset From Level - so it doesn't\n    silently land flat at the level's exact elevation.\n\nNotes / assumptions:\n  - If more than one candidate Toposolid Type / Filled Region Type\n    exists in the project, you'll be asked which to convert to. With\n    only one available, it's used automatically.\n  - Only the boundary geometry transfers - no slope/grading data (a\n    Filled Region has none to begin with), no line styles/hatch\n    patterns, no instance parameters (Comments, Mark, etc.)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Convert",
+    "button": "Floor to Toposolid",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Convert selected Floors <-> Toposolids in one click.\n\nSelect any mix of Floors and Toposolids and run this tool - it inspects\neach selected element's type and converts it in the correct direction\nautomatically (Floor -> Toposolid, Toposolid -> Floor). No need for two\nseparate buttons.\n\nREQUIRES REVIT 2024 OR LATER.\nToposolid is a Revit API class introduced in Revit 2024. It does not\nexist in Revit 2019-2023, so true bidirectional conversion is only\npossible on 2024+. On older versions this script shows a clear message\nand exits instead of crashing.\n\nNotes / assumptions (adjust to fit your project standards):\n  - If more than one target type exists in the project, you'll be asked\n    which Toposolid Type / Floor Type to convert to. If there's only\n    one available, it's used automatically with no prompt. Floor Type\n    choices exclude Structural Foundation slabs.\n  - Only the sketch boundary (footprint / shape) is transferred. Floor\n    parameters (Comments, Mark, etc.) are NOT copied automatically.\n  - Sloped/shape-edited floors: the boundary curves transfer, but\n    point-based sub-element slope edits are not - you'll likely need to\n    re-edit the surface on the new element for complex shapes.\n  - You choose (via a prompt) whether the original elements are deleted\n    after conversion, so you can review results before committing."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Detail Item",
+    "button": "Convert",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "One-click: take the selected element (as shown in the active view),\nexport it to a temporary CAD (DWG) file, bring that CAD file into a new\nDetail Item family as native detail lines, save the family, and load it\nback into the project at the original location.\n\nThe ONLY user-facing dialogs are:\n  1. Name the new family\n  2. Choose where to save the .rfa\n\nEverything else (temp CAD export path, family template lookup, CAD import,\nline conversion, load-back, cleanup) happens silently. Non-fatal problems\nare written to the pyRevit output console instead of a blocking popup."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Detail Item",
+    "button": "Line to Detail Item",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Convert a selected line/element's curve geometry into a new Detail Item\nfamily, let the user name it, and save it as an .rfa file.\n\nCompatible with Revit 2023, 2024, 2025, 2026 and 2027.\nThe Revit API calls used here (Transaction, CurveElement, NewDetailCurve,\nNewFamilyDocument, SaveAsOptions, LoadFamily) have been stable since well\nbefore 2023, so no version branching is needed for the API itself. The only\nthing that changes year-to-year is the folder name of the default family\ntemplates, which is handled below by trying several likely paths before\nfalling back to a manual file picker.\n\nWorks under both the IronPython2 engine (default on older pyRevit/Revit\ninstalls) and the CPython3 engine (used on newer pyRevit installs for\nRevit 2025+) - no engine-specific syntax is used."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Export > Cad",
+    "button": "Dwg",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "DWG Export - Pattern + Blocks merged into single file\nAuthor: Jesto Joy"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Export > Cad",
+    "button": "Irrigation",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "DWG Export - Pattern and Blocks as SEPARATE DWG files\nAuthor: Jesto Joy\n\nExports two DWG files per view:\n  - ViewName_PAT.dwg  (pattern categories only, shape-reset)\n  - ViewName_BLK.dwg  (all other categories + annotations)"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Family",
+    "button": "Category",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Pick a family instance in the active view, then choose a new\ncategory from an alphabetical list to re-assign the family to.\n\nWorkflow:\n  1. Click the button.\n  2. Pick a family instance (loadable family) in the open view.\n  3. A list of valid categories appears (alphabetical order).\n  4. Pick one, press 'Apply' -> the family is opened in the\n     background, its category changed, and reloaded into the project.\n\nCompatible with Revit 2018 through 2026+ (IronPython & CPython engines)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Family",
+    "button": "Name Changer",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Family Renamer.\n\n1. Choose a category.\n2. All loadable families of that category in the project are listed.\n3. Live-preview renaming: prefix, suffix, find/replace, case change -\n   with current -> new name shown side by side.\n4. 'Edit in Notepad' opens all checked names in Notepad, one per line:\n   edit them freely, save and close Notepad, and the edited names are\n   pulled back into the preview.\n5. Apply renames the checked families in one transaction (instant,\n   no family reload needed).\n\nCompatible with Revit 2018 through 2026+ (IronPython engines)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Family",
+    "button": "Server Families",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Family Browser – pick a Revit project, browse its loadable families by category,\n   select multiple families and load them into the current project.\n\n   Compatible: Revit 2022-2027 / pyRevit / IronPython 2.7 / CPython 3\n\n   FIXES vs original:\n   - 'Transform is not defined' error: removed broken ElementTransformUtils approach\n   - Family copy now uses the correct method: SaveAs temp .rfa + LoadFamily()\n     This is the only cross-document family transfer method that works reliably\n     in all Revit versions without needing RevitServices or Dynamo assemblies."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Filter > Filter.Stack",
+    "button": "Copy State",
+    "title": "Copy State",
+    "tooltip": "Copy filter visibility settings and graphic overrides from the active view for use in another view or view template.",
+    "description": null,
+    "doc": "Copy State - Debug color saving."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Filter > Filter.Stack",
+    "button": "Paste State",
+    "title": "Paste State",
+    "tooltip": "Paste saved view filter overrides to the current view/template — in the same project or another open project",
+    "description": "Paste State - Cross-Project View Filter Override Transfer (Template-aware)",
+    "doc": "Paste State - Apply ALL filter overrides to active view (Template‑aware)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Filter > Filter.Stack",
+    "button": "Transfer",
+    "title": "Transfer Filters",
+    "tooltip": "Copy view filter definitions (categories, rules, names) from one open project to another",
+    "description": "Transfer Filters - Cross-Project Parameter Filter Transfer",
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Floor",
+    "button": "Height offset",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Floor",
+    "button": "Offset",
+    "title": "Offset",
+    "tooltip": "Resize Floors, Roofs, Ceilings, and Toposolids by applying an inward or outward boundary offset.",
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Floor",
+    "button": "Reset Shape",
+    "title": "Reset Shape",
+    "tooltip": "Reset shape-edited floors back to their original flat condition by removing all slab shape modifications.",
+    "description": null,
+    "doc": "Reset shape of selected floors with detailed feedback"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Landscape > 01",
+    "button": "Get Blocks",
+    "title": "Get Blocks",
+    "tooltip": "Place families from AutoCAD POINT data",
+    "description": "Get Blocks - Place Families from AutoCAD POINT Data",
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Landscape > 01",
+    "button": "Object Outline",
+    "title": "Surface Pattern Region",
+    "tooltip": "Generate filled regions with material-based surface patterns",
+    "description": "Surface Pattern Region - Generate Filled Regions with Material-Based Surface Patterns",
+    "doc": "FloorToFilledRegion.py  (v7 - per-element transactions + arc tessellation)\n-------------------------------------------------------------------------------\nPyRevit Script: Creates filled regions from the topmost compound-structure\nlayer of Floors, Roofs, Ceilings, and Toposolids.\n\nFilledRegionType naming rule:\n  \"<ElementTypeName> (Layout)\"\n  e.g.  \"LA_Paving type-IF1\"  ->  \"LA_Paving type-IF1 (Layout)\"\n\nCompatible: Revit 2018-2027+  |  IronPython 2.7 (PyRevit)\n\nChanges in v7 (vs v6):\n  - Each element now processed in its OWN sub-transaction so a Revit\n    sketch-constraint failure on one floor cannot crash all others\n  - Arc/curve tessellation fallback: if a loop with arcs causes a\n    constraint error, arcs are converted to short line segments\n    (tessellate_loop_to_lines) and retried - fixes curved floors in Revit 2026\n  - Three-tier placement strategy per element:\n      Tier 1: all loops together with original curves\n      Tier 2: all loops together with arcs tessellated to lines\n      Tier 3: each loop individually (tessellated) as last resort"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Landscape > 02",
+    "button": "Match Slope",
+    "title": "Match Slope",
+    "tooltip": "Transfer slab shape from source to target elements",
+    "description": "Match Slope transfers slab shape (Modify Sub Elements) geometry from one or more source floors/roofs/ceilings to selected target elements. It reconstructs the true slope plane from slab shape vertices and applies it accurately using Revit SlabShapeEditor API.",
+    "doc": "Map each grid cell to list of triangle indices whose bbox overlaps it."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Landscape > 02",
+    "button": "Toposolid",
+    "title": "Organic Mound",
+    "tooltip": "Creates an organic terrain mound (Toposolid / TopographySurface) from selected boundary model lines with smooth natural grading.",
+    "description": "This tool generates a smooth, organic terrain mound inside a closed boundary using selected model lines.",
+    "doc": "OrganicMound.py\n---------------\nCreates a smooth organic toposolid/topography mound from selected\nboundary model lines.\n\nModes:\n  Slope Mode      - height derived from slope ratio (1:N)\n  Max Height Mode - user enters height in MILLIMETRES; converted to feet\n                    internally (Revit internal unit = feet)\n\nSmoothing uses a quintic smooth-step blended with a Gaussian falloff\nfor a natural real-world hill profile with no flat top, no centre spike,\nand a gentle zero-gradient landing at the boundary edge.\n\nCompatible: Revit 2018-2025+  |  IronPython 2.7 (PyRevit)"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Link",
+    "button": "Custom",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Copy RVT Link display overrides from one view to one or more views.\n\nCopies:\n- Link visibility type (Custom)\n- ALL category overrides (Model, Annotation, Analytical, Import)\n  including visibility, halftone, line weight, color, pattern, transparency\n- Category visibility (on/off)\n\nHandles views with or without view templates:\n- If target has no template (or template doesn't control RVT Links): writes to view\n- If target has a template controlling RVT Links: writes to the template directly\n\nRequires Revit 2018+ (View.GetLinkOverrides / SetLinkOverrides API)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Link",
+    "button": "Element ID",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Robust type name extractor for all Revit versions (2023–2026)"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Link",
+    "button": "Selection Box",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health",
+    "button": "Health",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health",
+    "button": "Pin",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health > Wipe",
+    "button": "Imported Cad",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Get all imported CAD files (not linked) in the project."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health > Wipe",
+    "button": "Line Pattern",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health > Wipe",
+    "button": "Unused View Filters",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Get all view filters that are not applied to any view."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health > Wipe",
+    "button": "Unused View Template",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Get all view templates that are not applied to any view."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Model Health > Wipe",
+    "button": "Views not on Sheets",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Get all view IDs that are placed on sheets."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Schedule",
+    "button": "Excel",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Export Revit Schedule to Excel - Match Schedule Exactly\n\nPreserves formatting, colors, images, borders, row/column sizes\nand merged cells from Revit schedules.\n\nCompatible: Revit 2024, 2025, 2026, 2027\nRequires: Microsoft Excel installed"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Schedule",
+    "button": "Table Gen",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "TableGen - Excel/CSV to native Revit Schedule."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Sheets",
+    "button": "Export",
+    "title": "Sheet Export",
+    "tooltip": "Batch export sheets and views to PDF, DWG, DGN, DWF, NWC, IFC and images with custom file naming rules, saved naming presets and export sets.",
+    "description": null,
+    "doc": "Sheet Expor .\n\nSelection -> Format -> Create workflow with custom file naming.\nExports PDF / DWG / DGN / DWF / NWC / IFC / IMG.\n\nCompatible with Revit 2024, 2025, 2026, 2027 (IronPython 2.7, 3.x and CPython)."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Sheets",
+    "button": "Parameters",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Edit Title Block Instance Parameters\nAuthor: Jesto Joy\n\nWorks on Revit 2024, 2025, 2026, 2027"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Tools",
+    "button": "Crop View",
+    "title": "Override Crop Region",
+    "tooltip": "Change the crop region line style and lineweight for multiple views at once.",
+    "description": null,
+    "doc": "Override Crop Region Line Pattern and Lineweight for Selected View Types.\n   Finds each view's crop viewer element and applies per-view element overrides."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Tools",
+    "button": "In-Place to Loadable",
+    "title": "In-Place to Loadable",
+    "tooltip": "Convert an in-place family into a loadable family while preserving its geometry, category, and placement.",
+    "description": null,
+    "doc": "Convert In-Place Family to Loadable Family\n========================================\nPicks an in-place family instance, builds a loadable .rfa from its geometry,\nsaves it to a temp folder, loads it back, and places it in the same location.\n\nUses FreeFormElement geometry extraction (Revit 2018+).\n\nCompatible: Revit 2018-2026+  |  IronPython 2.7 / CPython 3.x (pyRevit)\n\nChangelog vs prior version\n--------------------------\n* ElementId.IntegerValue  → version-safe get_element_id_value() helper\n  (IntegerValue removed / throws on 64-bit IDs in Revit 2024+/2026)\n* DisplayUnitSystem       → version-safe is_metric_project() with ForgeTypeId\n  fallback (DisplayUnitSystem deprecated Revit 2022, gone in some builds)\n* OpenDocumentFile(str)   → wrapped in try/except; ModelPath overload tried first\n* IFamilyLoadOptions      → extra guard added for CPython 3 / newer pyRevit\n* FamilyManager.Types     → safe iteration via list() conversion\n* ElementId(int)          → never constructed directly; all ids come from API\n* rename_family_type      → safe iteration + commit guard"
+  },
+  {
+    "ui_path": "RevX tab > RevX > Tools",
+    "button": "Para",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": "Parameter Manager - A comprehensive parameter management tool for Revit."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Toposolid",
+    "button": "Elevation",
+    "title": "Elevation",
+    "tooltip": null,
+    "description": "This tool elevates selected Revit model lines by a user-defined vertical offset.The tool is useful for quickly adjusting elevation of model lines without manual repositioning. It ensures unit-safe conversion and applies changes within a single transaction for consistency.",
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Toposolid",
+    "button": "Mound",
+    "title": "Mound",
+    "tooltip": null,
+    "description": "This tool creates a Topography (or Toposolid in Revit 2024+) from selected model contour lines and boundary curves. It extracts elevation points from model curves, cleans duplicates, and builds a valid terrain surface.",
+    "doc": "Extract geometry curve from any line‑type element."
+  },
+  {
+    "ui_path": "RevX tab > RevX > Warnings > Remove",
+    "button": "Highlighted walls are attached to, but miss, the highlighted targets",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Warnings > Remove",
+    "button": "Line in Sketch is slightly off axis and may cause inaccuracies",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  },
+  {
+    "ui_path": "RevX tab > RevX > Warnings > Remove",
+    "button": "Wall is slightly off axis and may cause inaccuracies",
+    "title": null,
+    "tooltip": null,
+    "description": null,
+    "doc": null
+  }
+]
