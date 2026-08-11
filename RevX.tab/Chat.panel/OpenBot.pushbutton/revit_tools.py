@@ -1148,3 +1148,56 @@ class RevitTools(object):
                 return False, "Error: {}".format(str(ex))
         except Exception as ex:
             return False, "Error: {}".format(str(ex))
+
+    # ─── COPY ELEMENTS BETWEEN VIEWS ────────────────────────────────────
+
+    def copy_elements_between_views(self, source_view_name=None, target_view_name=None):
+        try:
+            selected_ids = list(self.uidoc.Selection.GetElementIds())
+            
+            all_views = list(FilteredElementCollector(self.doc).OfClass(View))
+            non_templates = [v for v in all_views if not v.IsTemplate]
+            
+            target_view = None
+            if target_view_name:
+                for v in non_templates:
+                    if target_view_name.lower() in v.Name.lower():
+                        target_view = v
+                        break
+            
+            if not target_view:
+                return False, "Target view '{}' not found. Please specify a valid destination view (e.g. 'Level 2' or 'Section 1').".format(target_view_name or "")
+            
+            source_view = self.doc.ActiveView
+            if source_view_name:
+                for v in non_templates:
+                    if source_view_name.lower() in v.Name.lower():
+                        source_view = v
+                        break
+
+            if not selected_ids:
+                collector = FilteredElementCollector(self.doc, source_view.Id).WhereElementIsNotElementType()
+                selected_ids = [e.Id for e in collector if e.Category and e.Category.CategoryType == CategoryType.Model]
+            
+            if not selected_ids:
+                return False, "No elements found to copy in source view '{}'.".format(source_view.Name)
+            
+            ids_list = List[ElementId]()
+            for eid in selected_ids:
+                ids_list.Add(eid)
+            
+            t = Transaction(self.doc, "RevX Bot: Copy Elements to View")
+            t.Start()
+            try:
+                copied_ids = ElementTransformUtils.CopyElements(
+                    source_view, ids_list, target_view, Transform.Identity, CopyPasteOptions()
+                )
+                t.Commit()
+                self._refresh()
+                return True, "Successfully copied {} element(s) from '{}' to '{}'!".format(len(copied_ids), source_view.Name, target_view.Name)
+            except Exception as ex:
+                t.RollBack()
+                return False, "Error copying elements: {}".format(str(ex))
+        except Exception as ex:
+            return False, "Error: {}".format(str(ex))
+

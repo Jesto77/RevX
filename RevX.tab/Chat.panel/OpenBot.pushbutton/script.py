@@ -24,12 +24,72 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from revit_tools import RevitTools
-from chat_engine import ChatEngine
+
+try:
+    from chat_engine import (
+        ChatEngine, MODE_INFORMATIONS, MODE_TASKS, MODE_TOOLS,
+    )
+except ImportError as import_ex:
+    raise ImportError(
+        "RevitBot v2 needs the NEW chat_engine.py — copy the updated "
+        "chat_engine.py into this pushbutton folder next to script.py. "
+        "(original error: {})".format(import_ex)
+    )
+
+
+# ── Mode themes ────────────────────────────────────────────────────────
+# Each mode gets its own vibrant, high-contrast colour scheme.
+MODE_THEMES = {
+    MODE_INFORMATIONS: {
+        "accent": (0, 180, 216),      # vivid cyan
+        "on_accent": (14, 22, 30),
+        "header_bg": (13, 27, 42),
+        "form_bg": (30, 30, 46),
+        "chat_bg": (20, 20, 36),
+        "input_bg": (27, 40, 56),
+        "idle_bg": (24, 24, 38),
+        "announce": (
+            "INFORMATIONS mode (cyan) — ask me anything about THIS model: "
+            "revisions, sheets, warnings, counts, lists, links, rooms, phases...\n"
+            "I read live project data to answer. For actions or exports, "
+            "switch to Tasks or Tools."
+        ),
+    },
+    MODE_TASKS: {
+        "accent": (0, 200, 83),       # vivid green
+        "on_accent": (10, 26, 16),
+        "header_bg": (10, 36, 22),
+        "form_bg": (22, 40, 30),
+        "chat_bg": (15, 30, 22),
+        "input_bg": (18, 44, 30),
+        "idle_bg": (20, 34, 26),
+        "announce": (
+            "TASKS mode (green) — I can act on the model: create sheets / rooms / "
+            "levels / grids, rename or delete sheets and views, open views, "
+            "enable worksharing...\n"
+            "For lookups use Informations; for exports use Tools."
+        ),
+    },
+    MODE_TOOLS: {
+        "accent": (255, 138, 0),      # vivid orange
+        "on_accent": (30, 18, 6),
+        "header_bg": (40, 22, 8),
+        "form_bg": (44, 32, 24),
+        "chat_bg": (34, 25, 18),
+        "input_bg": (50, 34, 22),
+        "idle_bg": (38, 28, 20),
+        "announce": (
+            "TOOLS mode (orange) — project tools live here: export NWC / IFC / "
+            "DWG / PDF and save.\n"
+            "For model info use Informations; for model changes use Tasks."
+        ),
+    },
+}
 
 
 # ── API Key Setup Dialog ────────────────────────────────────────────────
-
 class ApiKeyDialog(WinForms.Form):
+
     def __init__(self, engine):
         self.engine = engine
         self.saved = False
@@ -172,14 +232,15 @@ class ApiKeyDialog(WinForms.Form):
 
 
 # ── Main Chat Form ─────────────────────────────────────────────────────
-
 class RevitBotForm(WinForms.Form):
+
     def __init__(self, doc, uidoc):
         self.doc = doc
         self.uidoc = uidoc
         self.tools = RevitTools(doc, uidoc)
         self.engine = ChatEngine(self.tools)
         self.is_busy = False
+        self.mode = None
         self._pending_view_id = None
 
         # Thread result fields
@@ -189,28 +250,29 @@ class RevitBotForm(WinForms.Form):
         self._poll_timer = None
 
         # ── Form setup ───────────────────────────────────────────────
-        self.Text = "RevitBot"
-        # Height reduced since quick buttons panel is removed
-        self.Size = Drawing.Size(480, 520)
+        self.Text = "RevitBot v2 — Modes"
+        # Taller to fit the Informations / Tasks / Tools mode bar
+        self.Size = Drawing.Size(480, 566)
         self.BackColor = Drawing.Color.FromArgb(30, 30, 46)
-        self.MaximizeBox = False
+        self.MaximizeBox = True
+        self.MinimumSize = Drawing.Size(420, 480)
         self.TopMost = True
         self.StartPosition = WinForms.FormStartPosition.CenterScreen
+        self.Resize += self._on_resize
 
         # ── Header ───────────────────────────────────────────────────
-        header = WinForms.Panel()
-        header.BackColor = Drawing.Color.FromArgb(13, 27, 42)
-        header.Size = Drawing.Size(480, 40)
-        header.Location = Drawing.Point(0, 0)
-        self.Controls.Add(header)
+        # Colours are applied by _apply_mode_theme() once a mode is set.
+        self.header = WinForms.Panel()
+        self.header.Size = Drawing.Size(480, 40)
+        self.header.Location = Drawing.Point(0, 0)
+        self.Controls.Add(self.header)
 
-        title_lbl = WinForms.Label()
-        title_lbl.Text = "RevitBot"
-        title_lbl.ForeColor = Drawing.Color.FromArgb(0, 180, 216)
-        title_lbl.Font = Drawing.Font("Segoe UI", 14.0, Drawing.FontStyle.Bold)
-        title_lbl.Location = Drawing.Point(12, 8)
-        title_lbl.AutoSize = True
-        header.Controls.Add(title_lbl)
+        self.title_lbl = WinForms.Label()
+        self.title_lbl.Text = "RevitBot"
+        self.title_lbl.Font = Drawing.Font("Segoe UI", 14.0, Drawing.FontStyle.Bold)
+        self.title_lbl.Location = Drawing.Point(12, 8)
+        self.title_lbl.AutoSize = True
+        self.header.Controls.Add(self.title_lbl)
 
         self.status_lbl = WinForms.Label()
         self.status_lbl.Text = "Ready"
@@ -218,31 +280,54 @@ class RevitBotForm(WinForms.Form):
         self.status_lbl.Font = Drawing.Font("Segoe UI", 9.0)
         self.status_lbl.Location = Drawing.Point(100, 16)
         self.status_lbl.AutoSize = True
-        header.Controls.Add(self.status_lbl)
+        self.header.Controls.Add(self.status_lbl)
 
         # Key button
-        key_btn = WinForms.Button()
-        key_btn.Text = "Key"
-        key_btn.Size = Drawing.Size(60, 28)
-        key_btn.Location = Drawing.Point(408, 6)
-        key_btn.BackColor = Drawing.Color.FromArgb(27, 40, 56)
-        key_btn.ForeColor = Drawing.Color.FromArgb(0, 180, 216)
-        key_btn.FlatStyle = WinForms.FlatStyle.Flat
-        key_btn.Font = Drawing.Font("Segoe UI", 9.0, Drawing.FontStyle.Bold)
-        key_btn.Click += self._on_key_btn
-        header.Controls.Add(key_btn)
+        self.key_btn = WinForms.Button()
+        self.key_btn.Text = "Key"
+        self.key_btn.Size = Drawing.Size(60, 28)
+        self.key_btn.Location = Drawing.Point(408, 6)
+        self.key_btn.FlatStyle = WinForms.FlatStyle.Flat
+        self.key_btn.Font = Drawing.Font("Segoe UI", 9.0, Drawing.FontStyle.Bold)
+        self.key_btn.Click += self._on_key_btn
+        self.header.Controls.Add(self.key_btn)
 
         # Clear button
-        clear_btn = WinForms.Button()
-        clear_btn.Text = "Clear"
-        clear_btn.Size = Drawing.Size(55, 28)
-        clear_btn.Location = Drawing.Point(348, 6)
-        clear_btn.BackColor = Drawing.Color.FromArgb(27, 40, 56)
-        clear_btn.ForeColor = Drawing.Color.FromArgb(180, 180, 180)
-        clear_btn.FlatStyle = WinForms.FlatStyle.Flat
-        clear_btn.Font = Drawing.Font("Segoe UI", 9.0)
-        clear_btn.Click += self._on_clear
-        header.Controls.Add(clear_btn)
+        self.clear_btn = WinForms.Button()
+        self.clear_btn.Text = "Clear"
+        self.clear_btn.Size = Drawing.Size(55, 28)
+        self.clear_btn.Location = Drawing.Point(348, 6)
+        self.clear_btn.BackColor = Drawing.Color.FromArgb(27, 40, 56)
+        self.clear_btn.ForeColor = Drawing.Color.FromArgb(180, 180, 180)
+        self.clear_btn.FlatStyle = WinForms.FlatStyle.Flat
+        self.clear_btn.Font = Drawing.Font("Segoe UI", 9.0)
+        self.clear_btn.Click += self._on_clear
+        self.header.Controls.Add(self.clear_btn)
+
+        # ── Category Bar (Informations / Tasks / Tools) ──────────────
+        self.info_btn = WinForms.Button()
+        self.info_btn.Text = "Informations"
+        self.info_btn.Size = Drawing.Size(150, 28)
+        self.info_btn.Location = Drawing.Point(8, 46)
+        self._style_cat_button(self.info_btn)
+        self.info_btn.Click += self._on_info_cat
+        self.Controls.Add(self.info_btn)
+
+        self.tasks_btn = WinForms.Button()
+        self.tasks_btn.Text = "Tasks"
+        self.tasks_btn.Size = Drawing.Size(150, 28)
+        self.tasks_btn.Location = Drawing.Point(164, 46)
+        self._style_cat_button(self.tasks_btn)
+        self.tasks_btn.Click += self._on_tasks_cat
+        self.Controls.Add(self.tasks_btn)
+
+        self.tools_btn = WinForms.Button()
+        self.tools_btn.Text = "Tools"
+        self.tools_btn.Size = Drawing.Size(150, 28)
+        self.tools_btn.Location = Drawing.Point(320, 46)
+        self._style_cat_button(self.tools_btn)
+        self.tools_btn.Click += self._on_tools_cat
+        self.Controls.Add(self.tools_btn)
 
         # ── Chat Display ─────────────────────────────────────────────
         # Taller now that quick buttons are removed — more space for chat
@@ -251,7 +336,7 @@ class RevitBotForm(WinForms.Form):
         self.chat_box.ForeColor = Drawing.Color.FromArgb(220, 220, 220)
         self.chat_box.Font = Drawing.Font("Segoe UI", 10.0)
         self.chat_box.Size = Drawing.Size(462, 390)
-        self.chat_box.Location = Drawing.Point(8, 48)
+        self.chat_box.Location = Drawing.Point(8, 88)
         self.chat_box.ReadOnly = True
         self.chat_box.BorderStyle = WinForms.BorderStyle.None
         self.chat_box.ScrollBars = WinForms.RichTextBoxScrollBars.Vertical
@@ -263,7 +348,7 @@ class RevitBotForm(WinForms.Form):
         self.thinking_lbl.Text = ""
         self.thinking_lbl.ForeColor = Drawing.Color.FromArgb(255, 193, 7)
         self.thinking_lbl.Font = Drawing.Font("Segoe UI", 9.0)
-        self.thinking_lbl.Location = Drawing.Point(8, 444)
+        self.thinking_lbl.Location = Drawing.Point(8, 484)
         self.thinking_lbl.AutoSize = True
         self.Controls.Add(self.thinking_lbl)
 
@@ -273,7 +358,7 @@ class RevitBotForm(WinForms.Form):
         self.input_box.ForeColor = Drawing.Color.FromArgb(224, 224, 224)
         self.input_box.Font = Drawing.Font("Segoe UI", 11.0)
         self.input_box.Size = Drawing.Size(360, 26)
-        self.input_box.Location = Drawing.Point(8, 466)
+        self.input_box.Location = Drawing.Point(8, 506)
         self.input_box.BorderStyle = WinForms.BorderStyle.FixedSingle
         self.Controls.Add(self.input_box)
 
@@ -281,7 +366,7 @@ class RevitBotForm(WinForms.Form):
         self.send_btn = WinForms.Button()
         self.send_btn.Text = "Send"
         self.send_btn.Size = Drawing.Size(100, 26)
-        self.send_btn.Location = Drawing.Point(372, 466)
+        self.send_btn.Location = Drawing.Point(372, 506)
         self.send_btn.BackColor = Drawing.Color.FromArgb(0, 119, 182)
         self.send_btn.ForeColor = Drawing.Color.White
         self.send_btn.FlatStyle = WinForms.FlatStyle.Flat
@@ -295,16 +380,24 @@ class RevitBotForm(WinForms.Form):
         # ── Welcome message ──────────────────────────────────────────
         self._add_msg(
             "Bot",
-            "Hey! I'm RevitBot.\n\n"
-            "I can run Revit commands or answer any question about Revit, BIM, and AEC.\n\n"
-            "Type 'help' to see available commands, or just ask me anything!\n\n"
+            "Hey! I'm RevitBot v2 (mode system active).\n\n"
+            "I work in three modes — click a button above to switch:\n"
+            "  Informations — model lookups, lists and doc info.\n"
+            "  Tasks — create, rename, delete, open views.\n"
+            "  Tools — exports (NWC / IFC / DWG / PDF) and save.\n\n"
+            "Type 'help' to see the commands for each mode, or ask me anything!\n\n"
             "To enable AI chat, click the Key button and add your free Groq API key."
         )
 
         self._update_status()
 
-    # ── Message Display ─────────────────────────────────────────────────
+        # Start in Informations mode — paint the theme and announce once
+        self._set_mode(MODE_INFORMATIONS, announce=True)
 
+        # Lay out controls relative to the actual client area
+        self._layout_controls()
+
+    # ── Message Display ─────────────────────────────────────────────────
     def _add_msg(self, sender, text):
         """Add a color-coded message to the RichTextBox."""
         self.chat_box.SelectionStart = self.chat_box.TextLength
@@ -345,7 +438,6 @@ class RevitBotForm(WinForms.Form):
         self.chat_box.ScrollToCaret()
 
     # ── Status ──────────────────────────────────────────────────────────
-
     def _update_status(self):
         if self.engine.has_api_key():
             self.status_lbl.Text = "AI Ready"
@@ -354,8 +446,116 @@ class RevitBotForm(WinForms.Form):
             self.status_lbl.Text = "No AI Key"
             self.status_lbl.ForeColor = Drawing.Color.FromArgb(255, 193, 7)
 
-    # ── Send ────────────────────────────────────────────────────────────
+    # ── Mode Bar (Informations / Tasks / Tools) ─────────────────────────
+    def _style_cat_button(self, btn):
+        """Static styling for a mode button (colours come from the theme)."""
+        btn.FlatStyle = WinForms.FlatStyle.Flat
+        btn.Font = Drawing.Font("Segoe UI", 9.0, Drawing.FontStyle.Bold)
 
+    def _rgb(self, triple):
+        return Drawing.Color.FromArgb(triple[0], triple[1], triple[2])
+
+    def _on_info_cat(self, sender, e):
+        self._set_mode(MODE_INFORMATIONS)
+
+    def _on_tasks_cat(self, sender, e):
+        self._set_mode(MODE_TASKS)
+
+    def _on_tools_cat(self, sender, e):
+        self._set_mode(MODE_TOOLS)
+
+    def _set_mode(self, mode, announce=False):
+        """Switch chat scope: informations / tasks / tools.
+
+        Silent by default — the whole window repaints in the mode's
+        colour, which is feedback enough. announce=True only at startup."""
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self.engine.set_mode(mode)
+        self._apply_mode_theme()
+        if announce:
+            self._add_msg("Bot", MODE_THEMES[mode]["announce"])
+        self.input_box.Focus()
+
+    def _apply_mode_theme(self):
+        """Repaint every themed control with the active mode's colours."""
+        theme = MODE_THEMES[self.mode]
+        accent = self._rgb(theme["accent"])
+
+        self.BackColor = self._rgb(theme["form_bg"])
+        self.header.BackColor = self._rgb(theme["header_bg"])
+        self.title_lbl.ForeColor = accent
+        self.chat_box.BackColor = self._rgb(theme["chat_bg"])
+        self.input_box.BackColor = self._rgb(theme["input_bg"])
+        self.send_btn.BackColor = accent
+        self.send_btn.ForeColor = self._rgb(theme["on_accent"])
+        self.key_btn.BackColor = self._rgb(theme["input_bg"])
+        self.key_btn.ForeColor = accent
+
+        # Active mode button is filled with its accent; idle ones are outlined
+        for m, btn in ((MODE_INFORMATIONS, self.info_btn),
+                       (MODE_TASKS, self.tasks_btn),
+                       (MODE_TOOLS, self.tools_btn)):
+            t = MODE_THEMES[m]
+            if m == self.mode:
+                btn.BackColor = self._rgb(t["accent"])
+                btn.ForeColor = self._rgb(t["on_accent"])
+            else:
+                btn.BackColor = self._rgb(t["idle_bg"])
+                btn.ForeColor = self._rgb(t["accent"])
+
+    # ── Layout (responsive resize) ──────────────────────────────────────
+    def _on_resize(self, sender, e):
+        self._layout_controls()
+
+    def _layout_controls(self):
+        """Stretch every control to fit the current window size.
+
+        Runs on resize/maximize so the header, chat area, input box and
+        Send button all grow with the window instead of staying fixed."""
+        # Guard: Resize can fire before all controls exist
+        if not hasattr(self, "chat_box"):
+            return
+
+        margin = 8
+        gap = 6
+        client_w = self.ClientSize.Width
+        client_h = self.ClientSize.Height
+
+        # Header spans the full width
+        self.header.Size = Drawing.Size(client_w, 40)
+
+        # Header buttons stay pinned to the right edge
+        self.key_btn.Location = Drawing.Point(client_w - margin - 60, 6)
+        self.clear_btn.Location = Drawing.Point(client_w - margin - 60 - 4 - 55, 6)
+
+        # Mode buttons: three equal columns across the window
+        btn_w = (client_w - 2 * margin - 2 * gap) // 3
+        self.info_btn.SetBounds(margin, 46, btn_w, 28)
+        self.tasks_btn.SetBounds(margin + btn_w + gap, 46, btn_w, 28)
+        tools_x = margin + 2 * (btn_w + gap)
+        self.tools_btn.SetBounds(tools_x, 46, client_w - margin - tools_x, 28)
+
+        # Chat stretches to fill all remaining vertical space
+        chat_top = 84
+        input_h = 26
+        input_y = client_h - margin - input_h
+        think_y = input_y - 22
+        chat_h = think_y - 6 - chat_top
+        if chat_h < 60:
+            chat_h = 60
+        self.chat_box.SetBounds(margin, chat_top, client_w - 2 * margin, chat_h)
+        self.thinking_lbl.Location = Drawing.Point(margin, think_y)
+
+        # Input stretches, Send stays pinned bottom-right
+        send_w = 100
+        self.input_box.SetBounds(
+            margin, input_y, client_w - 2 * margin - send_w - gap, input_h)
+        self.send_btn.SetBounds(
+            client_w - margin - send_w, input_y, send_w, input_h)
+
+    # ── Send ────────────────────────────────────────────────────────────
     def _send(self):
         if self.is_busy:
             return
@@ -414,11 +614,10 @@ class RevitBotForm(WinForms.Form):
         self._start_ai_query(msg)
 
     # ── Background AI Query ─────────────────────────────────────────────
-
     def _start_ai_query(self, message):
         """Run the AI HTTP call on a background thread.
-        A WinForms Timer polls for completion so the UI never blocks."""
 
+        A WinForms Timer polls for completion so the UI never blocks."""
         self.is_busy = True
         self.input_box.Enabled = False
         self.send_btn.Enabled = False
@@ -426,18 +625,18 @@ class RevitBotForm(WinForms.Form):
         self.status_lbl.Text = "Thinking..."
         self.status_lbl.ForeColor = Drawing.Color.FromArgb(255, 193, 7)
 
-        self._ai_done   = False
+        self._ai_done = False
         self._ai_result = None
-        self._ai_error  = None
+        self._ai_error = None
 
         def do_work():
             try:
                 result = self.engine.query_ai(message)
                 self._ai_result = result
-                self._ai_error  = None
+                self._ai_error = None
             except Exception as ex:
                 self._ai_result = None
-                self._ai_error  = str(ex)
+                self._ai_error = str(ex)
             self._ai_done = True
 
         thread = System.Threading.Thread(
@@ -480,7 +679,6 @@ class RevitBotForm(WinForms.Form):
         self.input_box.Focus()
 
     # ── Event Handlers ───────────────────────────────────────────────────
-
     def _on_send(self, sender, e):
         self._send()
 
@@ -503,11 +701,10 @@ class RevitBotForm(WinForms.Form):
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────
-
 try:
-    doc   = __revit__.ActiveUIDocument.Document
+    doc = __revit__.ActiveUIDocument.Document
     uidoc = __revit__.ActiveUIDocument
-    form  = RevitBotForm(doc, uidoc)
+    form = RevitBotForm(doc, uidoc)
     form.ShowDialog()
 
     # After dialog closes — activate pending view if any

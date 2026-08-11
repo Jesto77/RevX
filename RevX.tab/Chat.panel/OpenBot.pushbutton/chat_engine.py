@@ -130,6 +130,20 @@ def extract_delete_view_arg(message):
     return None
 
 
+def extract_sheet_revision_arg(message):
+    """Sheet number for 'sheet revisions A-101' style questions."""
+    match = re.search(r'sheet\s+revisions?\s+(\S+)', message, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip(".,!?")
+    match = re.search(r'sheet\s+(\S+)', message, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip(".,!?")
+    match = re.search(r'revisions?\s+(?:on|for|in)\s+(\S+)', message, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip(".,!?")
+    return None
+
+
 def extract_view_name(message):
     match = re.search(
         r'(?:open|activate|show|go\s+to|switch\s+to)\s+(?:view\s+)?(.+)',
@@ -153,9 +167,12 @@ def is_help_or_question(message):
     """True when the user wants guidance, not a RevitBot executable command."""
     if not message:
         return False
+
     msg = message.lower().strip()
+
     if msg.endswith("?"):
         return True
+
     patterns = (
         r"\bhow\s+(?:do|to|can|should)\b",
         r"\bwhat\s+(?:is|does|are|should)\b",
@@ -178,15 +195,14 @@ def is_explicit_command(message):
     """
     True only when user clearly intends to RUN a command right now —
     not just asking about it, mentioning it, or asking how to do it.
-    
     Must be a short direct imperative like:
-      'export pdf', 'save', 'create 3 sheets', 'delete sheet A-1'
-    
-    Phrases like 'how do I export', 'what is pdf export', 'tell me about
-    exporting' should return False so they go to AI instead.
+    'export pdf', 'save', 'create 3 sheets', 'delete sheet A-1'
+    Phrases like 'how do I export', 'what is pdf export',
+    'tell me about exporting' should return False so they go to AI instead.
     """
     if not message:
         return False
+
     msg = message.lower().strip()
 
     # If it looks like a question → NOT a command
@@ -221,98 +237,170 @@ except Exception:
         return False
 
 
+# Read-only live model queries for Informations mode
+try:
+    import info_queries
+except Exception:
+    info_queries = None
+
+
 # ── Command patterns ───────────────────────────────────────────────────
 # IMPORTANT: These only fire when is_explicit_command() returns True.
 # Removed: export_nwc, export_ifc, export_dwg, export_pdf, save_file,
-#          delete_selected (generic), delete_elements_by_category (generic)
+# delete_selected (generic), delete_elements_by_category (generic)
 # These now go to AI unless user types them as a very direct short command.
-
 COMMAND_PATTERNS = [
     # ── Sheet / View management ──────────────────────────────────────
-    (r".*\brenumber\s+sheet\b",                                          "rename_sheet_number"),
-    (r".*\brename\s+sheet\b",                                            "rename_sheet"),
-    (r".*\bchange\s+sheet\s+name\b",                                     "rename_sheet"),
-    (r".*\bdelete\s+sheet\s+\S+",                                        "delete_sheet"),
-    (r".*\bremove\s+sheet\s+\S+",                                        "delete_sheet"),
-    (r".*\bdelete\s+view\s+\S+",                                         "delete_view"),
-    (r".*\bremove\s+view\s+\S+",                                         "delete_view"),
+    (r".*\brenumber\s+sheet\b", "rename_sheet_number"),
+    (r".*\brename\s+sheet\b", "rename_sheet"),
+    (r".*\bchange\s+sheet\s+name\b", "rename_sheet"),
+    (r".*\bdelete\s+sheet\s+\S+", "delete_sheet"),
+    (r".*\bremove\s+sheet\s+\S+", "delete_sheet"),
+    (r".*\bdelete\s+view\s+\S+", "delete_view"),
+    (r".*\bremove\s+view\s+\S+", "delete_view"),
 
     # ── Navigation ──────────────────────────────────────────────────
-    (r".*\b(?:open|activate|switch\s+to|go\s+to)\s+(?:view\s+)\S+",     "open_view"),
-    (r".*\bzoom\s*(?:to\s+)?(?:fit|extents?)\b",                         "zoom_to_fit"),
+    (r".*\b(?:open|activate|switch\s+to|go\s+to)\s+(?:view\s+)\S+", "open_view"),
+    (r".*\bzoom\s*(?:to\s+)?(?:fit|extents?)\b", "zoom_to_fit"),
 
     # ── Export — only fires on very direct short commands ────────────
     # e.g. "export nwc", "export pdf", "export dwg", "export ifc"
     # NOT "how do I export", "tell me about nwc export"
-    (r"^export\s+(?:nwc|navisworks)$",                                   "export_nwc"),
-    (r"^export\s+ifc$",                                                   "export_ifc"),
-    (r"^export\s+(?:dwg|cad|autocad)$",                                  "export_dwg"),
-    (r"^export\s+pdf$",                                                   "export_pdf"),
-    (r"^(?:nwc|navisworks)$",                                             "export_nwc"),
-    (r"^(?:ifc)$",                                                        "export_ifc"),
-    (r"^(?:dwg|cad)$",                                                    "export_dwg"),
-    (r"^(?:pdf)$",                                                        "export_pdf"),
+    (r"^export\s+(?:nwc|navisworks)$", "export_nwc"),
+    (r"^export\s+ifc$", "export_ifc"),
+    (r"^export\s+(?:dwg|cad|autocad)$", "export_dwg"),
+    (r"^export\s+pdf$", "export_pdf"),
+    (r"^(?:nwc|navisworks)$", "export_nwc"),
+    (r"^(?:ifc)$", "export_ifc"),
+    (r"^(?:dwg|cad)$", "export_dwg"),
+    (r"^(?:pdf)$", "export_pdf"),
 
     # ── Save — only fires on direct "save" or "save file" ────────────
-    (r"^save(?:\s+file|\s+project|\s+model)?$",                          "save_file"),
+    (r"^save(?:\s+file|\s+project|\s+model)?$", "save_file"),
 
     # ── Create elements ──────────────────────────────────────────────
-    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?sheets?\b",             "create_sheet"),
-    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?rooms?\b",              "create_room"),
-    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?levels?\b",             "create_level"),
-    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?grids?\b",              "create_grid"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?section\b",               "create_section"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?callout\b",               "create_callout"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?dimension\b",             "create_dimension"),
-    (r".*\b(?:create|make|add|write|place)\s+(?:a\s+)?text\s*note\b",   "create_text_note"),
-    (r".*\bfilled\s+region\b.*\b(?:pick|lines)\b",                      "create_filled_region_pick"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?filled\s+region\b",       "create_filled_region"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?room\s*tag\b",            "create_room_tag"),
-    (r".*\btag\s+(?:the\s+)?rooms?\b",                                   "create_room_tag"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?workset\b",               "create_workset"),
-    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?view\s+filter\b",         "create_view_filter"),
+    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?sheets?\b", "create_sheet"),
+    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?rooms?\b", "create_room"),
+    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?levels?\b", "create_level"),
+    (r".*\b(?:create|make|add|new)\s+(?:\d+\s+)?grids?\b", "create_grid"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?section\b", "create_section"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?callout\b", "create_callout"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?dimension\b", "create_dimension"),
+    (r".*\b(?:create|make|add|write|place)\s+(?:a\s+)?text\s*note\b", "create_text_note"),
+    (r".*\bfilled\s+region\b.*\b(?:pick|lines)\b", "create_filled_region_pick"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?filled\s+region\b", "create_filled_region"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?room\s*tag\b", "create_room_tag"),
+    (r".*\btag\s+(?:the\s+)?rooms?\b", "create_room_tag"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?workset\b", "create_workset"),
+    (r".*\b(?:create|make|add|new)\s+(?:a\s+)?view\s+filter\b", "create_view_filter"),
 
     # ── Delete — only fires when specific target is named ────────────
     # e.g. "delete selected" or "delete the selected elements"
     (r"^(?:delete|remove|erase)\s+(?:the\s+)?selected(?:\s+elements?)?\s*$", "delete_selected"),
 
     # ── List / Info ──────────────────────────────────────────────────
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?views?\b",                "list_views"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?sheets?\b",               "list_sheets"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?levels?\b",               "list_levels"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?families?\b",             "list_families"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?worksets?\b",             "list_worksets"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?materials?\b",            "list_materials"),
-    (r".*\b(?:list|show|display)\s+(?:all\s+)?categor",                 "list_categories"),
-    (r".*\b(?:doc|project|file)\s*info\b",                              "doc_info"),
-    (r".*\benable\s+worksharing\b",                                     "enable_worksharing"),
+    # Revisions must come first — "revisions on sheet A-101" is more
+    # specific than the generic "list revisions" pattern.
+    (r".*\brevisions?\s+(?:on|for|in)\s+(?:sheet\s+)?\S+$", "sheet_revisions"),
+    (r".*\bsheet\s+revisions?\s+\S+", "sheet_revisions"),
+    (r".*\blist\b.*\brevisions?\b", "list_revisions"),
+    (r".*\brevisions?\b.*\blist\b", "list_revisions"),
+    (r"^revisions?$", "list_revisions"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?warnings?\b", "list_warnings"),
+    (r"^warnings?$", "list_warnings"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?(?:revit\s+)?links?\b", "list_links"),
+    (r"^links?$", "list_links"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?rooms?\b", "list_rooms"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?grids?\b", "list_grids"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?schedules?\b", "list_schedules"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?phases?\b", "list_phases"),
+    (r".*\b(?:model|project)\s+(?:stats|statistics|summary|overview)\b", "model_stats"),
+    (r"^(?:stats|statistics|summary|overview)$", "model_stats"),
+    (r".*\b(?:selected|selection)\s+(?:info|details?|elements?)\b", "selected_info"),
+    (r"^(?:selection|selected)\s*info$", "selected_info"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?views?\b", "list_views"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?sheets?\b", "list_sheets"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?levels?\b", "list_levels"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?families?\b", "list_families"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?worksets?\b", "list_worksets"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?materials?\b", "list_materials"),
+    (r".*\b(?:list|show|display)\s+(?:all\s+)?categor", "list_categories"),
+    (r".*\b(?:doc|project|file)\s*info\b", "doc_info"),
+    (r".*\benable\s+worksharing\b", "enable_worksharing"),
 ]
 
 
+# ── Modes ──────────────────────────────────────────────────────────────
+MODE_INFORMATIONS = "informations"
+MODE_TASKS = "tasks"
+MODE_TOOLS = "tools"
+
+MODE_LABELS = {
+    MODE_INFORMATIONS: "Informations",
+    MODE_TASKS: "Tasks",
+    MODE_TOOLS: "Tools",
+}
+
+# Which commands each mode is allowed to execute. The UI buttons switch
+# the engine between these scopes, so each mode stays focused and an
+# out-of-mode command is refused with a hint instead of running.
+MODE_COMMANDS = {
+    MODE_INFORMATIONS: (
+        "doc_info", "list_views", "list_sheets", "list_levels",
+        "list_families", "list_worksets", "list_materials", "list_categories",
+        "list_revisions", "sheet_revisions", "list_warnings", "list_links",
+        "list_rooms", "list_grids", "list_schedules", "list_phases",
+        "model_stats", "selected_info",
+    ),
+    MODE_TASKS: (
+        "create_sheet", "create_room", "create_level", "create_grid",
+        "create_section", "create_callout", "create_dimension",
+        "create_text_note", "create_filled_region", "create_filled_region_pick",
+        "create_room_tag", "create_workset", "create_view_filter",
+        "rename_sheet", "rename_sheet_number", "delete_sheet", "delete_view",
+        "delete_selected", "delete_elements_by_category",
+        "open_view", "zoom_to_fit", "enable_worksharing",
+    ),
+    MODE_TOOLS: (
+        "export_nwc", "export_ifc", "export_dwg", "export_pdf", "save_file",
+    ),
+}
+
+
+def command_mode(cmd_name):
+    """Return the mode a command belongs to, or None."""
+    for mode, names in MODE_COMMANDS.items():
+        if cmd_name in names:
+            return mode
+    return None
+
+
 class ChatEngine(object):
+
     GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
     MODEL = "llama-3.3-70b-versatile"
     MAX_HISTORY = 20
     TIMEOUT_MS = 60000
 
     # ── System prompt pieces ────────────────────────────────────────────
-
     REVITBOT_COMMAND_RULES = (
         "IMPORTANT RULES FOR REVITBOT COMMANDS (actions this chat can run directly):\n"
         "- Only suggest typing a command when the user clearly wants to RUN an action right now.\n"
         "- If the user is asking HOW to do something, explain it — do not just say 'type export pdf'.\n"
         "- Available direct commands the user can type:\n"
-        "    export nwc | export ifc | export dwg | export pdf\n"
-        "    save\n"
-        "    create [N] sheet(s) / room(s) / level(s) / grid(s)\n"
-        "    create section / callout / dimension / text note\n"
-        "    create filled region / room tag / workset / view filter\n"
-        "    rename sheet [number] to [name]\n"
-        "    renumber sheet [old] to [new]\n"
-        "    delete sheet [number] / delete view [name]\n"
-        "    open view [name] / zoom to fit\n"
-        "    list views / sheets / levels / families / worksets / materials / categories\n"
-        "    doc info / enable worksharing / delete selected\n"
+        "  export nwc | export ifc | export dwg | export pdf\n"
+        "  save\n"
+        "  create [N] sheet(s) / room(s) / level(s) / grid(s)\n"
+        "  create section / callout / dimension / text note\n"
+        "  create filled region / room tag / workset / view filter\n"
+        "  rename sheet [number] to [name]\n"
+        "  renumber sheet [old] to [new]\n"
+        "  delete sheet [number] / delete view [name]\n"
+        "  open view [name] / zoom to fit\n"
+        "  doc info / model stats\n"
+        "  list views / sheets / levels / grids / rooms / families / worksets / materials / categories\n"
+        "  list revisions / sheet revisions [num] / list links / schedules / phases / warnings\n"
+        "  selected info / enable worksharing / delete selected\n"
         "- For quantities say: 'create 5 sheets', 'create 10 rooms'\n"
         "- IMPORTANT: If RevX has a tool for an export/action and the user asks about it, "
         "explain the RevX tool way. If not, explain the native Revit way.\n"
@@ -346,12 +434,44 @@ class ChatEngine(object):
         "- If the tool is not in the knowledge base, say so clearly.\n"
     )
 
-    # ── System prompt builder ───────────────────────────────────────────
+    MODE_AI_RULES = {
+        MODE_INFORMATIONS: (
+            "CURRENT MODE: INFORMATIONS\n"
+            "- The user selected INFORMATIONS mode.\n"
+            "- Only discuss model/project information: views, sheets, levels, families, "
+            "worksets, materials, categories, revisions, warnings, links, rooms, grids, "
+            "schedules, phases, element data, counts, names, parameters.\n"
+            "- A LIVE MODEL SNAPSHOT with real data from the user's project is included "
+            "below when available — answer project questions from it, never guess.\n"
+            "- If asked for details beyond the snapshot, name the RevitBot command that "
+            "fetches them (e.g. 'list revisions', 'sheet revisions A-101', 'list warnings', "
+            "'model stats', 'selected info').\n"
+            "- Do NOT suggest creating, modifying, deleting, exporting or saving here.\n"
+            "- If the user asks for an action, say it belongs to Tasks or Tools mode "
+            "and they should click that button above the chat first.\n"
+        ),
+        MODE_TASKS: (
+            "CURRENT MODE: TASKS\n"
+            "- The user selected TASKS mode.\n"
+            "- Focus on model actions: creating sheets/rooms/levels/grids, renaming, "
+            "deleting, opening views, worksharing.\n"
+            "- Do NOT handle export or save requests — those belong to Tools mode.\n"
+            "- For pure information lookups, suggest switching to Informations mode.\n"
+        ),
+        MODE_TOOLS: (
+            "CURRENT MODE: TOOLS\n"
+            "- The user selected TOOLS mode.\n"
+            "- Focus on project tools: exporting NWC, IFC, DWG, PDF and saving the model.\n"
+            "- Explain export formats, settings and workflows when asked.\n"
+            "- For model edits or info lookups, suggest Tasks or Informations mode.\n"
+        ),
+    }
 
+    # ── System prompt builder ───────────────────────────────────────────
     def _build_system_prompt(self, include_revx=False):
         """
-        Build system prompt.
-        RevX knowledge is ONLY included when the user is asking about RevX.
+        Build system prompt. RevX knowledge is ONLY included when the user
+        is asking about RevX.
         """
         base = (
             "You are RevitBot, a helpful AI assistant built into Autodesk Revit via pyRevit. "
@@ -361,6 +481,22 @@ class ChatEngine(object):
             + "\n\n"
             + self.NO_REVX_RULES
         )
+
+        # Restrict the AI's scope to the currently selected mode
+        mode_rules = self.MODE_AI_RULES.get(self.mode)
+        if mode_rules:
+            base += "\n\n" + mode_rules
+
+        # Informations mode background check: give the AI a live snapshot
+        # of the open model so it answers with real project data.
+        if self.mode == MODE_INFORMATIONS and info_queries is not None:
+            try:
+                snapshot = info_queries.build_model_snapshot(self._get_doc())
+                if snapshot:
+                    base += ("\n\nLIVE MODEL SNAPSHOT (real data from the user's open "
+                             "project, refreshed for every question):\n" + snapshot)
+            except Exception:
+                pass
 
         if include_revx:
             base += "\n\n" + self.REVX_HELP_RULES
@@ -375,16 +511,15 @@ class ChatEngine(object):
         return base
 
     # ── Init ────────────────────────────────────────────────────────────
-
     def __init__(self, revit_tools):
         self.tools = revit_tools
         self.api_key = None
         self.conversation_history = []
         self._pending_view_id = None
+        self.mode = MODE_INFORMATIONS
         self._load_api_key()
 
     # ── API Key Management ──────────────────────────────────────────────
-
     def _key_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "groq_key.txt")
 
@@ -394,8 +529,8 @@ class ChatEngine(object):
             if os.path.exists(path):
                 with open(path, "r") as f:
                     key = f.read().strip()
-                    if key and len(key) > 10:
-                        self.api_key = key
+                if key and len(key) > 10:
+                    self.api_key = key
         except Exception:
             pass
 
@@ -414,8 +549,41 @@ class ChatEngine(object):
     def has_api_key(self):
         return self.api_key is not None and len(self.api_key) > 10
 
-    # ── Command Execution ───────────────────────────────────────────────
+    # ── Mode Management ─────────────────────────────────────────────────
+    def set_mode(self, mode):
+        """Restrict execution scope to one of: informations / tasks / tools."""
+        if mode in MODE_COMMANDS:
+            self.mode = mode
 
+    def get_mode(self):
+        return self.mode
+
+    # ── Document access / info-query execution ──────────────────────────
+    def _get_doc(self):
+        for attr in ("doc", "_doc", "document"):
+            doc = getattr(self.tools, attr, None)
+            if doc is not None:
+                return doc
+        return None
+
+    def _get_uidoc(self):
+        for attr in ("uidoc", "_uidoc", "ui_document"):
+            uidoc = getattr(self.tools, attr, None)
+            if uidoc is not None:
+                return uidoc
+        return None
+
+    def _exec_info(self, fn):
+        """Run a read-only info_queries function against the live model."""
+        if info_queries is None:
+            return ("info_queries.py is missing — copy it into this "
+                    "pushbutton folder next to script.py.", "error")
+        doc = self._get_doc()
+        if doc is None:
+            return ("Could not access the Revit document.", "error")
+        return self._exec(lambda: fn(doc, self._get_uidoc()))
+
+    # ── Command Execution ───────────────────────────────────────────────
     def _exec(self, func):
         try:
             result = func()
@@ -434,7 +602,7 @@ class ChatEngine(object):
 
     def _run_command(self, cmd_name, original_message):
         count = extract_number(original_message)
-        path  = extract_path(original_message)
+        path = extract_path(original_message)
 
         if cmd_name == "export_nwc":
             return self._exec(lambda: self.tools.export_nwc(path))
@@ -515,15 +683,39 @@ class ChatEngine(object):
             return self._exec(lambda: self.tools.get_document_info())
         elif cmd_name == "enable_worksharing":
             return self._exec(lambda: self.tools.enable_worksharing())
+        # ── Live read-only queries (Informations mode) ─────────────────
+        elif cmd_name == "list_revisions":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_revisions(doc))
+        elif cmd_name == "sheet_revisions":
+            sheet_no = extract_sheet_revision_arg(original_message)
+            return self._exec_info(
+                lambda doc, uidoc: info_queries.sheet_revisions(doc, sheet_no))
+        elif cmd_name == "list_warnings":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_warnings(doc))
+        elif cmd_name == "list_links":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_links(doc))
+        elif cmd_name == "list_rooms":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_rooms(doc))
+        elif cmd_name == "list_grids":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_grids(doc))
+        elif cmd_name == "list_schedules":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_schedules(doc))
+        elif cmd_name == "list_phases":
+            return self._exec_info(lambda doc, uidoc: info_queries.list_phases(doc))
+        elif cmd_name == "model_stats":
+            return self._exec_info(lambda doc, uidoc: info_queries.model_stats(doc))
+        elif cmd_name == "selected_info":
+            return self._exec_info(
+                lambda doc, uidoc: info_queries.selected_info(doc, uidoc))
         else:
             return ("Unknown command: {}".format(cmd_name), "error")
 
     # ── Message Processing ──────────────────────────────────────────────
-
     def process_message(self, message):
         message = message.strip()
         if not message:
             return [("Type something!", "bot")]
+
         msg = message.lower()
 
         # ── Static responses ─────────────────────────────────────────
@@ -541,47 +733,38 @@ class ChatEngine(object):
 
         if re.match(r"^(help|commands?|what\s+can\s+you\s+do)\b", msg):
             return [(
-                "RevitBot direct commands (type exactly):\n\n"
-                "EXPORT:\n"
+                "RevitBot works in three modes — the buttons above switch "
+                "between them, and commands only run in their own mode.\n\n"
+                "INFORMATIONS mode (cyan) — live model queries:\n"
+                "  doc info\n"
+                "  model stats\n"
+                "  list views / sheets / levels / grids / rooms\n"
+                "  list families / worksets / materials / categories\n"
+                "  list revisions\n"
+                "  sheet revisions [A-101]\n"
+                "  list links\n"
+                "  list schedules\n"
+                "  list phases\n"
+                "  list warnings\n"
+                "  selected info\n\n"
+                "TASKS mode (green):\n"
+                "  create [N] sheets / rooms / levels / grids\n"
+                "  create section / callout / dimension / text note\n"
+                "  create filled region / room tag / workset / view filter\n"
+                "  rename sheet [A-1] to [Floor Plan]\n"
+                "  renumber sheet [A-1] to [A-2]\n"
+                "  delete sheet [A-1]\n"
+                "  delete view [view name]\n"
+                "  delete selected\n"
+                "  open view [view name]\n"
+                "  zoom to fit\n"
+                "  enable worksharing\n\n"
+                "TOOLS mode (orange):\n"
                 "  export nwc\n"
                 "  export ifc\n"
                 "  export dwg\n"
-                "  export pdf\n\n"
-                "SAVE:\n"
+                "  export pdf\n"
                 "  save\n\n"
-                "CREATE:\n"
-                "  create [N] sheets\n"
-                "  create [N] rooms\n"
-                "  create [N] levels\n"
-                "  create [N] grids\n"
-                "  create section\n"
-                "  create callout\n"
-                "  create dimension\n"
-                "  create text note\n"
-                "  create filled region\n"
-                "  create room tag\n"
-                "  create workset\n"
-                "  create view filter\n\n"
-                "SHEETS:\n"
-                "  rename sheet [A-1] to [Floor Plan]\n"
-                "  renumber sheet [A-1] to [A-2]\n"
-                "  delete sheet [A-1]\n\n"
-                "VIEWS:\n"
-                "  delete view [view name]\n"
-                "  open view [view name]\n"
-                "  zoom to fit\n\n"
-                "LIST:\n"
-                "  list views\n"
-                "  list sheets\n"
-                "  list levels\n"
-                "  list families\n"
-                "  list worksets\n"
-                "  list materials\n"
-                "  list categories\n\n"
-                "OTHER:\n"
-                "  doc info\n"
-                "  enable worksharing\n"
-                "  delete selected\n\n"
                 "You can also ask me anything about Revit, BIM, or RevX tools!",
                 "bot"
             )]
@@ -597,13 +780,23 @@ class ChatEngine(object):
         if is_explicit_command(message):
             for pattern, cmd_name in COMMAND_PATTERNS:
                 if re.match(pattern, msg):
+                    # Mode gate — refuse out-of-mode commands with a hint
+                    needed_mode = command_mode(cmd_name)
+                    if needed_mode is not None and needed_mode != self.mode:
+                        return [(
+                            "That's a {} command, and you're in {} mode.\n"
+                            "Click the {} button above to switch.".format(
+                                MODE_LABELS.get(needed_mode, needed_mode),
+                                MODE_LABELS.get(self.mode, self.mode),
+                                MODE_LABELS.get(needed_mode, needed_mode)),
+                            "bot"
+                        )]
                     return [self._run_command(cmd_name, message)]
 
         # ── Anything else → AI ───────────────────────────────────────
         return None
 
     # ── Groq AI Query ───────────────────────────────────────────────────
-
     def query_ai(self, message):
         if not self.has_api_key():
             raise Exception(
@@ -634,7 +827,6 @@ class ChatEngine(object):
 
         # RevX answers need more tokens; general answers stay short
         max_tokens = 2048 if include_revx else 1024
-
         body = {
             "model": self.MODEL,
             "messages": messages,
@@ -642,7 +834,6 @@ class ChatEngine(object):
             "max_tokens": max_tokens,
             "top_p": 0.9,
         }
-
         json_body = dict_to_json(body)
 
         request = System.Net.WebRequest.Create(self.GROQ_URL)
@@ -653,6 +844,7 @@ class ChatEngine(object):
 
         body_bytes = System.Text.Encoding.UTF8.GetBytes(json_body)
         request.ContentLength = body_bytes.Length
+
         stream = request.GetRequestStream()
         stream.Write(body_bytes, 0, body_bytes.Length)
         stream.Close()
