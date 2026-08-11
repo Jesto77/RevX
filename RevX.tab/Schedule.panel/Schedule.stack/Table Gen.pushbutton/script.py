@@ -1180,9 +1180,17 @@ def load_history():
 
 
 def save_history_entry(name, source_file, nrows, ncols, nimgs,
-                       settings=None):
+                       settings=None, view_id=None):
     entries = load_history()
-    entries = [e for e in entries if e.get('name') != name]
+
+    def _matches(e):
+        if e.get('name') == name:
+            return True
+        if view_id is not None and e.get('view_id') == view_id:
+            return True
+        return False
+
+    entries = [e for e in entries if not _matches(e)]
     entries.insert(0, {
         'name': name,
         'date': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -1190,6 +1198,7 @@ def save_history_entry(name, source_file, nrows, ncols, nimgs,
         'size': '{}x{}'.format(nrows, ncols),
         'images': nimgs,
         'settings': settings or {},
+        'view_id': view_id,
     })
     entries = entries[:200]
     try:
@@ -1219,11 +1228,51 @@ def project_schedule_names():
     return names
 
 
+def project_schedule_id_name_map():
+    """{view ElementId (int) -> current view Name} for every
+    ViewSchedule in the project right now."""
+    m = {}
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
+        try:
+            m[int(get_id_value(vs.Id))] = vs.Name
+        except Exception:
+            continue
+    return m
+
+
 def prune_history():
+    """Drop history entries whose schedule no longer exists in the
+    project, and re-sync any entry's stored name to the schedule's
+    CURRENT Revit name (so a rename in Revit is reflected in the
+    table instead of making the row vanish or reload under a stale
+    name)."""
     entries = load_history()
-    existing = project_schedule_names()
-    kept = [e for e in entries if e.get('name') in existing]
-    if len(kept) != len(entries):
+    id_map = project_schedule_id_name_map()
+    existing_names = project_schedule_names()
+    kept = []
+    changed = False
+    for e in entries:
+        vid = e.get('view_id')
+        if vid is not None:
+            # Preferred path: matched by stable ElementId, so
+            # renames are picked up automatically.
+            current_name = id_map.get(vid)
+            if current_name is None:
+                # Schedule truly gone from the project - drop it.
+                changed = True
+                continue
+            if e.get('name') != current_name:
+                e['name'] = current_name
+                changed = True
+            kept.append(e)
+        else:
+            # Legacy entry saved before view_id was tracked - fall
+            # back to matching by name (old behavior).
+            if e.get('name') in existing_names:
+                kept.append(e)
+            else:
+                changed = True
+    if changed or len(kept) != len(entries):
         save_history(kept)
     return kept
 
@@ -2487,7 +2536,8 @@ def run_one(name, table, settings, source_file):
     save_history_entry(
         name, source_file,
         len(table['data']), len(table['data'][0]),
-        placed, settings)
+        placed, settings,
+        view_id=int(get_id_value(new_view.Id)))
     return new_view, img_log, placed
 
 
@@ -2648,7 +2698,8 @@ try:
                     srcf or '(clipboard paste)',
                     orig_nrows, orig_ncols,
                     int(orig_entry.get('images', 0)),
-                    settings)
+                    settings,
+                    view_id=int(get_id_value(new_vs.Id)))
             except Exception as err:
                 all_problems.append(
                     "{}: duplicate (fallback) failed - {}"
