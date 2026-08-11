@@ -1,12 +1,12 @@
 # -- coding: utf-8 --
-"""DrawingRegister - create/update Sheets from an office
+"""DrawingRegisterSync - create/update Sheets from an office
 Drawing Register Excel, and tag every sheet with a 'Series Range'
 project parameter taken from the register's section headers."""
 
-title = "Drawing Register"
+title = "Drawing\nRegister Sync"
 author = "Jesto Joy"
 
-SCRIPT_VERSION = "v9 (2026-08-11) no console output window"
+SCRIPT_VERSION = "v8 (2026-08-11) no popup results, console output only"
 
 import os
 import re
@@ -40,6 +40,7 @@ from Autodesk.Revit.DB import (
 )
 
 logger = script.get_logger()
+output = script.get_output()
 doc    = revit.doc
 app    = doc.Application
 
@@ -51,6 +52,7 @@ SERIES_PARAM_NAME = "Series Range"
 NOT_USED_SERIES   = "NOT USED"
 
 
+# ─────────────────────────────────────────────────────────── tiny helpers ─────
 def get_id_value(element_id):
     try:
         return element_id.Value
@@ -65,6 +67,7 @@ def col_letters_to_index(letters):
     return idx - 1
 
 
+# ────────────────────────────────────────────────────────────── xlsx reading ──
 def _shared_strings(z):
     shared = []
     if 'xl/sharedStrings.xml' not in z.namelist():
@@ -160,6 +163,7 @@ def cell(row, idx):
     return None
 
 
+# ──────────────────────────────────────────────────────── number extraction ───
 def extract_sheet_number(drawing_number):
     if not drawing_number:
         return None
@@ -178,6 +182,7 @@ def extract_sheet_number(drawing_number):
     return None
 
 
+# ─────────────────────────────────────────────────────── register parsing ─────
 def parse_register(path):
     rows     = read_grid(path)
     problems = []
@@ -232,16 +237,19 @@ def parse_register(path):
             series_counter += 1
             current_series  = "{:02d} - {}".format(
                 series_counter, a.strip())
+            print("  Series header found: '{}'".format(current_series))
 
     return entries, problems
 
 
+# ──────────────────────────── verify the parameter exists in the project ──────
 def verify_series_parameter():
     iterator = doc.ParameterBindings.ForwardIterator()
     iterator.Reset()
     while iterator.MoveNext():
         if iterator.Key.Name == SERIES_PARAM_NAME:
             return True
+
     sheets = list(
         FilteredElementCollector(doc)
         .OfCategory(BuiltInCategory.OST_Sheets)
@@ -251,6 +259,7 @@ def verify_series_parameter():
         p = sheets[0].LookupParameter(SERIES_PARAM_NAME)
         if p is not None:
             return True
+
     return False
 
 
@@ -267,6 +276,7 @@ def set_series(sheet, value):
         return False
 
 
+# ──────────────────────────────────────────────────────── titleblock picker ───
 def pick_titleblock():
     symbols = list(
         FilteredElementCollector(doc)
@@ -295,6 +305,7 @@ def pick_titleblock():
     return label_map.get(choice) if choice else None
 
 
+# ─────────────────────────────────────── series selection with sheet count ────
 def pick_series_to_process(entries):
     series_counts = {}
     series_order  = []
@@ -333,8 +344,10 @@ def pick_series_to_process(entries):
 
 
 # ══════════════════════════════════════════════════════════════════════ MAIN ══
+output.print_md("# DrawingRegisterSync {}".format(SCRIPT_VERSION))
+print("Target parameter : '{}'".format(SERIES_PARAM_NAME))
 
-# ── 1. pick file ──────────────────────────────────────────────────────────────
+# ── 1. pick the Excel / CSV file ──────────────────────────────────────────────
 excel_path = forms.pick_file(
     files_filter='Excel & CSV files|*.xlsx;*.csv')
 
@@ -343,46 +356,64 @@ if not excel_path:
 if isinstance(excel_path, (list, tuple)):
     excel_path = excel_path[0]
 excel_path = str(excel_path)
+print("File selected: {}".format(excel_path))
 _flush_pending_input()
 
-# ── 2. parse ──────────────────────────────────────────────────────────────────
+# ── 2. parse the register ──────────────────────────────────────────────────────
 entries, parse_problems = parse_register(excel_path)
 if not entries:
-    forms.alert(
-        "No drawing rows could be read from this file.",
-        title="DrawingRegisterSync")
+    print("\nERROR: No drawing rows could be read from this file.")
+    for p in parse_problems[:15]:
+        print("  - {}".format(p))
     script.exit()
 
-# ── 3. verify parameter ──────────────────────────────────────────────────────
+print("\n{} drawing entries read from file.".format(len(entries)))
+
+# ── 3. verify parameter exists in project ─────────────────────────────────────
 if not verify_series_parameter():
-    forms.alert(
-        "Parameter '{}' not found in this project.\n\n"
-        "Please create it manually:\n"
-        "  Manage > Project Parameters > Add\n"
-        "  Name: {}\n"
-        "  Type: Text, Instance, Category: Sheets\n\n"
-        "Then re-run this script."
-        .format(SERIES_PARAM_NAME, SERIES_PARAM_NAME),
-        title="DrawingRegisterSync")
+    output.print_md("## ERROR: Parameter '{}' not found".format(
+        SERIES_PARAM_NAME))
+    print("\nPlease create it manually:")
+    print("  Manage -> Project Parameters -> Add")
+    print("  Name        : {}".format(SERIES_PARAM_NAME))
+    print("  Discipline  : Common")
+    print("  Type        : Text")
+    print("  Instance parameter")
+    print("  Category    : Sheets")
+    print("\nThen re-run this script.")
     script.exit()
+print("Parameter '{}' found.".format(SERIES_PARAM_NAME))
 
-# ── 4. pick series ────────────────────────────────────────────────────────────
+# ── 4. let user pick which series to process ──────────────────────────────────
 selected_series = pick_series_to_process(entries)
 if selected_series is None:
+    print("\nUser cancelled series selection.")
     script.exit()
 
-# ── 5. filter entries ─────────────────────────────────────────────────────────
+print("\nUser selected {} series:".format(len(selected_series)))
+for s in sorted(selected_series):
+    print("  '{}'".format(s))
+
+# ── 5. filter entries to only the selected series ─────────────────────────────
 entries = [e for e in entries if e['series'] in selected_series]
+print("\n{} sheets after series filter.".format(len(entries)))
+
 if not entries:
+    print("No sheets to process after filtering.")
     script.exit()
 
-# ── 6. de-dupe ────────────────────────────────────────────────────────────────
-by_number = {}
+# ── 6. de-dupe by sheet number ────────────────────────────────────────────────
+by_number     = {}
+dupe_problems = []
 for e in entries:
-    if e['number'] not in by_number:
-        by_number[e['number']] = e
+    if e['number'] in by_number:
+        dupe_problems.append(
+            "Duplicate sheet number '{}' ({}) - only first kept."
+            .format(e['number'], e['name']))
+        continue
+    by_number[e['number']] = e
 
-# ── 7. existing sheets ───────────────────────────────────────────────────────
+# ── 7. collect existing sheets ────────────────────────────────────────────────
 existing_sheets    = list(
     FilteredElementCollector(doc)
     .OfCategory(BuiltInCategory.OST_Sheets)
@@ -408,15 +439,20 @@ all_numbers_in_register = set(
 to_mark_not_used = [sh for num, sh in existing_by_number.items()
                     if num not in all_numbers_in_register]
 
-# ── 8. titleblock ─────────────────────────────────────────────────────────────
+print("\n{} to update  |  {} to create  |  {} to mark NOT USED".format(
+    len(to_update), len(to_create), len(to_mark_not_used)))
+
+# ── 8. pick titleblock if new sheets are needed ───────────────────────────────
 titleblock_symbol = None
 if to_create:
     titleblock_symbol = pick_titleblock()
     _flush_pending_input()
     if titleblock_symbol is None:
-        to_create = []
+        print("\nNo titleblock selected - new sheets will NOT be created.")
+        print("Existing sheets will still be synced.")
 
 # ── 9. transaction ────────────────────────────────────────────────────────────
+problems = list(parse_problems) + list(dupe_problems)
 created, updated, marked = [], [], []
 
 t = Transaction(doc, "DrawingRegisterSync - Series Range")
@@ -429,8 +465,13 @@ try:
                 sh.Name = e['name']
             if set_series(sh, e['series']):
                 updated.append(e['number'])
-        except Exception:
-            pass
+            else:
+                problems.append(
+                    "{}: could not write Series Range '{}'."
+                    .format(e['number'], e['series']))
+        except Exception as err:
+            problems.append(
+                "{}: update failed - {}".format(e['number'], err))
 
     if titleblock_symbol is not None:
         if not titleblock_symbol.IsActive:
@@ -442,15 +483,25 @@ try:
                 ns.Name        = e['name']
                 if set_series(ns, e['series']):
                     created.append(e['number'])
-            except Exception:
-                pass
+                else:
+                    problems.append(
+                        "{}: sheet created but Series Range '{}' "
+                        "could not be set."
+                        .format(e['number'], e['series']))
+            except Exception as err:
+                problems.append(
+                    "{}: create failed - {}".format(e['number'], err))
 
     for sh in to_mark_not_used:
         try:
             if set_series(sh, NOT_USED_SERIES):
                 marked.append(sh.SheetNumber)
-        except Exception:
-            pass
+            else:
+                problems.append(
+                    "{}: could not mark NOT USED.".format(sh.SheetNumber))
+        except Exception as err:
+            problems.append(
+                "{}: NOT USED failed - {}".format(sh.SheetNumber, err))
 
     t.Commit()
 
@@ -458,10 +509,37 @@ except Exception:
     if t.HasStarted():
         t.RollBack()
     import traceback
-    forms.alert(
-        "Error - transaction rolled back:\n\n{}"
-        .format(traceback.format_exc()),
-        title="DrawingRegisterSync")
+    output.print_md("## ERROR - Transaction rolled back")
+    print(traceback.format_exc())
     script.exit()
 
-# ── 10. done - no popup, no console ──────────────────────────────────────────
+# ── 10. console report ────────────────────────────────────────────────────────
+output.print_md("---")
+output.print_md("## Results")
+print("{} updated  |  {} created  |  {} marked NOT USED".format(
+    len(updated), len(created), len(marked)))
+
+if updated:
+    output.print_md("### Updated Sheets")
+    for num in sorted(updated):
+        e = by_number[num]
+        print("  {} - {} [{}]".format(num, e['name'], e['series']))
+
+if created:
+    output.print_md("### Created Sheets")
+    for num in sorted(created):
+        e = by_number[num]
+        print("  {} - {} [{}]".format(num, e['name'], e['series']))
+
+if marked:
+    output.print_md("### Marked NOT USED")
+    for num in sorted(marked):
+        print("  {}".format(num))
+
+if problems:
+    output.print_md("### Issues")
+    for p in problems:
+        print("  - {}".format(p))
+
+output.print_md("---")
+print("Done.")
