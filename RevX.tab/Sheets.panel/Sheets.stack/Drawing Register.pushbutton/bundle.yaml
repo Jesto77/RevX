@@ -1,5 +1,0 @@
-title: Drawing Register
-tooltip: >
-  Sync Sheets from a Drawing Register excel: creates missing sheets,
-  renames/re-tags existing ones, and marks sheets not in the excel
-  as Series = NOT USED.
