@@ -2,7 +2,7 @@
 """CopyScheduleToSheets - pick a schedule instance on a sheet,
 then copy it to all sheets in the selected series at the same position."""
 
-title = "Copy Schedule\nTo Sheets"
+title = "Clone"
 author = "Jesto Joy"
 
 SCRIPT_VERSION = "v2 (2026-08-11)"
