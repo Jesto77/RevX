@@ -252,6 +252,9 @@
                             <Button x:Name="BtnSaveVSSet" Style="{StaticResource FlatButton}"
                                     Content="Save V/S Set" Margin="8,0,0,0" Height="24"
                                     ToolTip="Save current selection as a Revit View/Sheet Set"/>
+                            <CheckBox x:Name="ChkGroupSeries" Content="Group by Series Range"
+                                      VerticalAlignment="Center" Margin="16,0,0,0"
+                                      ToolTip="Organise the grid into groups using the sheet's 'Series Range' parameter, same as the Project Browser"/>
                         </StackPanel>
 
                         <Grid Grid.Column="2" Width="230">
@@ -298,6 +301,91 @@
                               VirtualizingPanel.VirtualizationMode="Recycling"
                               ScrollViewer.CanContentScroll="True"
                               ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <DataGrid.GroupStyle>
+                            <GroupStyle>
+                                <GroupStyle.ContainerStyle>
+                                    <Style TargetType="{x:Type GroupItem}">
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="{x:Type GroupItem}">
+                                                    <!-- Fully custom template: the stock Expander chrome drew its
+                                                         own arrow glyph UNDER our header band (the negative Margin
+                                                         pulled the band left, straight under it), which is what
+                                                         caused the visual clash. Everything below is laid out in
+                                                         one Grid so nothing overlaps, and the arrow + tick box are
+                                                         real, separate hit targets. -->
+                                                    <Expander IsExpanded="True" BorderThickness="0" Background="Transparent">
+                                                        <Expander.Template>
+                                                            <ControlTemplate TargetType="{x:Type Expander}">
+                                                                <DockPanel>
+                                                                    <Border DockPanel.Dock="Top" Background="#FFE0ECF7"
+                                                                            BorderBrush="{StaticResource LineBrush}"
+                                                                            BorderThickness="0,0,0,1" Padding="4,4" Margin="-6,0,0,0">
+                                                                        <Grid>
+                                                                            <Grid.ColumnDefinitions>
+                                                                                <ColumnDefinition Width="22"/>
+                                                                                <ColumnDefinition Width="34"/>
+                                                                                <ColumnDefinition Width="*"/>
+                                                                            </Grid.ColumnDefinitions>
+
+                                                                            <!-- expand / collapse arrow -->
+                                                                            <ToggleButton Grid.Column="0"
+                                                                                          IsChecked="{Binding IsExpanded, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}"
+                                                                                          Focusable="False" Width="16" Height="16"
+                                                                                          HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                                          ToolTip="Expand / collapse this series">
+                                                                                <ToggleButton.Template>
+                                                                                    <ControlTemplate TargetType="{x:Type ToggleButton}">
+                                                                                        <Border Background="Transparent">
+                                                                                            <Path x:Name="Arrow" Fill="#FF1B3B61" Stretch="Uniform"
+                                                                                                  Width="9" Height="9" HorizontalAlignment="Center"
+                                                                                                  VerticalAlignment="Center"
+                                                                                                  Data="M 0 0 L 8 4 L 0 8 Z"/>
+                                                                                        </Border>
+                                                                                        <ControlTemplate.Triggers>
+                                                                                            <Trigger Property="IsChecked" Value="True">
+                                                                                                <Setter TargetName="Arrow" Property="Data" Value="M 0 0 L 8 0 L 4 8 Z"/>
+                                                                                            </Trigger>
+                                                                                        </ControlTemplate.Triggers>
+                                                                                    </ControlTemplate>
+                                                                                </ToggleButton.Template>
+                                                                            </ToggleButton>
+
+                                                                            <!-- select / clear every sheet in this series -->
+                                                                            <CheckBox Grid.Column="1" x:Name="ChkSeriesAll"
+                                                                                      Tag="{Binding}" IsThreeState="True"
+                                                                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                                      ToolTip="Select / clear every sheet in this series"/>
+
+                                                                            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                                                                                <TextBlock Text="Series: " FontWeight="SemiBold" Foreground="#FF1B3B61"/>
+                                                                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#FF1B3B61"/>
+                                                                                <TextBlock Text=" (" Foreground="#FF1B3B61" Margin="4,0,0,0"/>
+                                                                                <TextBlock Text="{Binding ItemCount}" Foreground="#FF1B3B61"/>
+                                                                                <TextBlock Text=" items)" Foreground="#FF1B3B61"/>
+                                                                            </StackPanel>
+                                                                        </Grid>
+                                                                    </Border>
+                                                                    <ContentPresenter x:Name="SeriesContent" DockPanel.Dock="Bottom"/>
+                                                                </DockPanel>
+                                                                <ControlTemplate.Triggers>
+                                                                    <Trigger Property="IsExpanded" Value="False">
+                                                                        <Setter TargetName="SeriesContent" Property="Visibility" Value="Collapsed"/>
+                                                                    </Trigger>
+                                                                </ControlTemplate.Triggers>
+                                                            </ControlTemplate>
+                                                        </Expander.Template>
+                                                        <Expander.Content>
+                                                            <ItemsPresenter/>
+                                                        </Expander.Content>
+                                                    </Expander>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </GroupStyle.ContainerStyle>
+                            </GroupStyle>
+                        </DataGrid.GroupStyle>
                         <DataGrid.Columns>
                             <DataGridTemplateColumn Width="40" CanUserSort="False">
                                 <DataGridTemplateColumn.Header>
@@ -816,6 +904,9 @@
                                       Content="Create a sub-folder per format (PDF / DWG / ...)" IsChecked="True"/>
                             <CheckBox x:Name="ChkSubfolderDate" Style="{StaticResource Row}"
                                       Content="Create a sub-folder with today's date"/>
+                            <CheckBox x:Name="ChkSubfolderPerSeries" Style="{StaticResource Row}"
+                                      Content="Create a sub-folder per series (from the Series Range)"
+                                      ToolTip="Each sheet is exported into &lt;output&gt;\...\&lt;Series Range&gt;\ instead of one flat folder. Only applies to sheets, and has no effect on Combined PDF / Merged DWF, since those produce a single file."/>
                             <CheckBox x:Name="ChkOverwrite" Style="{StaticResource Row}"
                                       Content="Overwrite existing files" IsChecked="True"/>
                             <CheckBox x:Name="ChkOpenWhenDone" Style="{StaticResource Row}"
