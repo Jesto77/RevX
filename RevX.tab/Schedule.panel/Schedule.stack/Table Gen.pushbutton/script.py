@@ -5,7 +5,7 @@ __title__ = "TableGen"
 __author__ = "Jesto Joy"
 __doc__ = "Import Excel/CSV tables into Revit as native schedules."
 
-SCRIPT_VERSION = "v32 (2026-07-16) configurable header rows in split"
+SCRIPT_VERSION = "v33 (2026-08-13) labeled-fields dialog for split"
 
 import os
 import re
@@ -38,10 +38,12 @@ from Autodesk.Revit.DB import Color as RevitColor
 from System.Windows import (
     GridLength, GridUnitType, Thickness, VerticalAlignment,
     HorizontalAlignment, FontWeights, Clipboard, TextTrimming,
+    Window, SizeToContent, ResizeMode, WindowStartupLocation,
+    TextWrapping,
 )
 from System.Windows.Controls import (
     Grid, ColumnDefinition, RowDefinition, TextBlock, CheckBox,
-    Border as WBorder,
+    Border as WBorder, StackPanel, TextBox, Button, Orientation,
 )
 from System.Windows.Media import SolidColorBrush, Color
 
@@ -1277,6 +1279,109 @@ def prune_history():
     return kept
 
 
+def _ask_split_params(entry_name, prev_header):
+    """Small labeled-fields dialog for the 'Split into parts...'
+    action - replaces the old single comma-separated text prompt
+    with three clearly labeled boxes: Sheet Height, Split into,
+    Copy rows.
+
+    Returns (height_text, parts_text, header_text) as typed by
+    the user, or None if the dialog was cancelled.
+    """
+    win = Window()
+    win.Title = "TableGen - Split & fit to titleblock"
+    win.Width = 400
+    win.SizeToContent = SizeToContent.Height
+    win.ResizeMode = ResizeMode.NoResize
+    win.WindowStartupLocation = WindowStartupLocation.CenterScreen
+
+    root = StackPanel()
+    root.Margin = Thickness(18)
+    win.Content = root
+
+    intro = TextBlock()
+    intro.Text = (
+        "Split '{}' into N EXACT-equal parts, each part scaled "
+        "and padded to the same height.".format(entry_name))
+    intro.TextWrapping = TextWrapping.Wrap
+    intro.Margin = Thickness(0, 0, 0, 14)
+    root.Children.Add(intro)
+
+    def add_label(text):
+        lbl = TextBlock()
+        lbl.Text = text
+        lbl.FontWeight = FontWeights.SemiBold
+        lbl.Margin = Thickness(0, 8, 0, 3)
+        root.Children.Add(lbl)
+
+    def add_box(default_text):
+        box = TextBox()
+        box.Text = default_text
+        box.Padding = Thickness(4)
+        root.Children.Add(box)
+        return box
+
+    add_label("Sheet Height (mm)")
+    height_box = add_box("550")
+
+    add_label("Split into")
+    parts_box = add_box("3")
+
+    add_label("Copy rows")
+    header_box = add_box(str(prev_header))
+
+    notes = TextBlock()
+    notes.Text = (
+        "Sheet Height = target height of every part (mm)   "
+        "Split into = how many schedule sheets to make   "
+        "Copy rows = how many TOP rows repeat as header on "
+        "EVERY part.\n\n"
+        "Blue category-headers always start the next part. "
+        "Merged cells are never split.")
+    notes.TextWrapping = TextWrapping.Wrap
+    notes.FontSize = 11
+    notes.Foreground = brush((120, 120, 120))
+    notes.Margin = Thickness(0, 14, 0, 0)
+    root.Children.Add(notes)
+
+    btn_panel = StackPanel()
+    btn_panel.Orientation = Orientation.Horizontal
+    btn_panel.HorizontalAlignment = HorizontalAlignment.Right
+    btn_panel.Margin = Thickness(0, 16, 0, 0)
+    root.Children.Add(btn_panel)
+
+    result = {'ok': False}
+
+    def on_split(sender, args):
+        result['ok'] = True
+        win.Close()
+
+    def on_cancel(sender, args):
+        result['ok'] = False
+        win.Close()
+
+    cancel_btn = Button()
+    cancel_btn.Content = "Cancel"
+    cancel_btn.Padding = Thickness(14, 4, 14, 4)
+    cancel_btn.Margin = Thickness(0, 0, 8, 0)
+    cancel_btn.IsCancel = True
+    cancel_btn.Click += on_cancel
+    btn_panel.Children.Add(cancel_btn)
+
+    split_btn = Button()
+    split_btn.Content = "Split"
+    split_btn.Padding = Thickness(14, 4, 14, 4)
+    split_btn.IsDefault = True
+    split_btn.Click += on_split
+    btn_panel.Children.Add(split_btn)
+
+    win.ShowDialog()
+
+    if not result['ok']:
+        return None
+    return (height_box.Text, parts_box.Text, header_box.Text)
+
+
 # ------------------------------------------------------------ main window
 class TableGenWindow(forms.WPFWindow):
 
@@ -1754,90 +1859,37 @@ class TableGenWindow(forms.WPFWindow):
             prev_header = prev_settings.get(
                 'split_header', SPLIT_HEADER_ROWS)
 
-            resp = forms.ask_for_string(
-                prompt=(
-                    "Split '{}' into N EXACT-equal parts, "
-                    "each MAX_HEIGHT_MM tall.\n\n"
-                    "Enter THREE values separated by commas:\n"
-                    "   MAX_HEIGHT_MM , NUM_PARTS , HEADER_ROWS\n\n"
-                    "  MAX_HEIGHT_MM  = target height of every "
-                    "part (mm)\n"
-                    "  NUM_PARTS      = how many schedule sheets "
-                    "to make\n"
-                    "  HEADER_ROWS    = how many TOP rows to "
-                    "repeat as\n"
-                    "                   header on EVERY split "
-                    "part\n"
-                    "                   (current saved value: "
-                    "{})\n\n"
-                    "Examples:\n"
-                    "   550, 2, 3   -> 2 parts, 550 mm each,\n"
-                    "                  top 3 rows repeat as "
-                    "header\n"
-                    "   600, 3, 1   -> 3 parts, 600 mm each,\n"
-                    "                  top 1 row repeats as "
-                    "header\n"
-                    "   400, 4, 4   -> 4 parts, 400 mm each,\n"
-                    "                  top 4 rows repeat as "
-                    "header\n"
-                    "   500, 2, 0   -> 2 parts, no header "
-                    "repeated\n\n"
-                    "How it works:\n"
-                    "  1. Content is split into NUM_PARTS "
-                    "balanced chunks.\n"
-                    "  2. ALL row heights (and image size) are "
-                    "scaled by\n"
-                    "     ONE factor so the TALLEST part = "
-                    "MAX_HEIGHT_MM.\n"
-                    "  3. Shorter parts are PADDED so every part "
-                    "becomes\n"
-                    "     EXACTLY MAX_HEIGHT_MM tall.\n"
-                    "  4. Images stay UNIFORM across every "
-                    "part.\n\n"
-                    "Rules:\n"
-                    "  * The first HEADER_ROWS rows (whatever you "
-                    "type) repeat as header on every part.\n"
-                    "  * Blue category-headers start the next "
-                    "part.\n"
-                    "  * Merged cells are never split."
-                    .format(entry.get('name'), prev_header)),
-                title="TableGen - Split & fit to titleblock",
-                default="550, 3, {}".format(prev_header))
-            if not resp or not resp.strip():
+            resp = _ask_split_params(entry.get('name'), prev_header)
+            if not resp:
                 return
+            resp_height, resp_parts, resp_header = resp
 
-            # Parse: accept 2 or 3 comma-separated values
+            # Parse the three fields (same validation as before)
             try:
-                parts_txt = [p.strip() for p in resp.split(',')]
-                if len(parts_txt) < 2:
-                    forms.alert(
-                        "Please enter at least TWO values "
-                        "separated by commas:\n"
-                        "MAX_HEIGHT_MM, NUM_PARTS "
-                        "[, HEADER_ROWS]")
-                    return
-                max_h = float(parts_txt[0])
-                num_parts = int(float(parts_txt[1]))
-                if len(parts_txt) >= 3 and parts_txt[2] != '':
-                    header_rows = int(float(parts_txt[2]))
+                max_h = float(resp_height.strip())
+                num_parts = int(float(resp_parts.strip()))
+                resp_header = resp_header.strip()
+                if resp_header != '':
+                    header_rows = int(float(resp_header))
                 else:
                     header_rows = prev_header
 
                 if max_h <= 0 or num_parts < 2:
                     forms.alert(
-                        "MAX_HEIGHT_MM must be > 0 and "
-                        "NUM_PARTS must be >= 2.")
+                        "Sheet Height must be > 0 and "
+                        "Split into must be >= 2.")
                     return
                 if header_rows < 0:
                     forms.alert(
-                        "HEADER_ROWS must be >= 0 "
+                        "Copy rows must be >= 0 "
                         "(0 means no repeated header).")
                     return
             except Exception:
                 forms.alert(
-                    "Invalid input.\n\nUse format:\n"
-                    "HEIGHT_MM, NUM_PARTS, HEADER_ROWS\n"
-                    "(e.g. 550, 3, 4)")
+                    "Invalid input.\n\nEnter numeric values for:\n"
+                    "  Sheet Height (mm)\n"
+                    "  Split into (number of parts)\n"
+                    "  Copy rows (header rows)")
                 return
 
             self.result = {
