@@ -45,15 +45,45 @@ def fix_sketch_lines(sketch):
     """Force nearly-horizontal/vertical lines in this sketch onto
     the true axis WITHOUT breaking the loop.
 
-    The old approach moved a line's endpoint on its own, but sketch
-    lines share endpoints with their neighbors - moving one line's
-    endpoint without moving the connected neighbor's matching
-    endpoint opens a gap, which is exactly why the edit scope
-    commit failed ("Failed to commit the edit scope"). This builds
-    a small vertex graph for the whole sketch first, so a moved
-    endpoint drags its connected neighbor(s) along with it and the
-    loop stays closed.
+    Two things this has to get right:
+
+    1. Sketch lines share endpoints with their neighbors, so moving
+       one line's endpoint without moving the connected neighbor's
+       matching endpoint opens a gap in the loop (this is why the
+       edit scope commit used to fail). We build a small vertex
+       graph for the whole sketch first, so a moved endpoint drags
+       its connected neighbor(s) along with it.
+
+    2. "Horizontal/vertical" only means "constant global X or Y" for
+       a sketch that lies flat on the ground plane. For a sketch on
+       any other plane (a roof, a sloped/vertical family profile, a
+       wall sweep, etc.) the relevant axes are the SKETCH PLANE's
+       own local U/V directions, not global X/Y - so all the axis
+       math below is done in the plane's local (u, v) coordinates,
+       then converted back to global XYZ.
     """
+
+    try:
+        plane  = sketch.SketchPlane.GetPlane()
+        origin = plane.Origin
+        ux     = plane.XVec
+        uy     = plane.YVec
+        nz     = plane.Normal
+    except Exception:
+        print("SKETCH PLANE UNAVAILABLE for sketch {} - skipped"
+              .format(get_id_value(sketch.Id)))
+        return 0
+
+    def to_uvw(p):
+        rel = p - origin
+        return (rel.DotProduct(ux), rel.DotProduct(uy),
+                rel.DotProduct(nz))
+
+    def from_uvw(u, v, w):
+        return (origin
+                .Add(ux.Multiply(u))
+                .Add(uy.Multiply(v))
+                .Add(nz.Multiply(w)))
 
     curve_infos   = []
     endpoint_key  = {}
@@ -98,7 +128,7 @@ def fix_sketch_lines(sketch):
             endpoint_key[(idx, end_idx)] = k
             if k not in vertices:
                 vertices[k] = {
-                    'pt': XYZ(p.X, p.Y, p.Z),
+                    'uvw': to_uvw(p),
                     'line_refs': 0,
                     'has_arc': False,
                 }
@@ -120,16 +150,16 @@ def fix_sketch_lines(sketch):
             k1 = endpoint_key[(idx, 1)]
             v0 = vertices[k0]
             v1 = vertices[k1]
-            p0 = v0['pt']
-            p1 = v1['pt']
+            u0, vv0, w0 = v0['uvw']
+            u1, vv1, w1 = v1['uvw']
 
-            dx = p1.X - p0.X
-            dy = p1.Y - p0.Y
+            du = u1 - u0
+            dv = vv1 - vv0
 
-            if abs(dx) < VERY_SMALL or abs(dy) < VERY_SMALL:
+            if abs(du) < VERY_SMALL or abs(dv) < VERY_SMALL:
                 continue  # already axis-aligned (or degenerate)
 
-            horizontal = abs(dx) > abs(dy)
+            horizontal = abs(du) > abs(dv)  # dominant along local u
 
             # Prefer moving whichever end does NOT touch an arc.
             # If both (or neither) touch an arc, fall back to
@@ -149,14 +179,14 @@ def fix_sketch_lines(sketch):
 
             if move1:
                 if horizontal:
-                    v1['pt'] = XYZ(p1.X, p0.Y, p1.Z)
+                    v1['uvw'] = (u1, vv0, w1)
                 else:
-                    v1['pt'] = XYZ(p0.X, p1.Y, p1.Z)
+                    v1['uvw'] = (u0, vv1, w1)
             else:
                 if horizontal:
-                    v0['pt'] = XYZ(p0.X, p1.Y, p0.Z)
+                    v0['uvw'] = (u0, vv1, w0)
                 else:
-                    v0['pt'] = XYZ(p1.X, p0.Y, p0.Z)
+                    v0['uvw'] = (u1, vv0, w0)
 
     # apply the resolved vertex positions back onto the actual
     # curves - lines get re-created straight between the new
@@ -168,8 +198,8 @@ def fix_sketch_lines(sketch):
 
         k0 = endpoint_key[(idx, 0)]
         k1 = endpoint_key[(idx, 1)]
-        new_p0 = vertices[k0]['pt']
-        new_p1 = vertices[k1]['pt']
+        new_p0 = from_uvw(*vertices[k0]['uvw'])
+        new_p1 = from_uvw(*vertices[k1]['uvw'])
         old_p0 = info['orig_p0']
         old_p1 = info['orig_p1']
 
@@ -340,6 +370,7 @@ for sid_int in sketch_ids:
 # ==========================================================
 
 remaining = 0
+remaining_warnings = []
 
 for w in doc.GetWarnings():
 
@@ -353,6 +384,7 @@ for w in doc.GetWarnings():
         ):
 
             remaining += 1
+            remaining_warnings.append(w)
 
     except:
         pass
@@ -362,5 +394,107 @@ print("===================================")
 print("LINES FORCED TO AXIS : {}".format(fixed))
 print("REMAINING WARNINGS   : {}".format(remaining))
 print("===================================")
+print("")
+
+# ==========================================================
+# DIAGNOSTICS FOR ANY STILL-FAILING SKETCHES
+# ==========================================================
+# For anything still flagged after the fix pass, dump exactly what
+# each of its lines looks like in the sketch plane's local (u, v)
+# coordinates, so we can see actual numbers instead of guessing.
+
+if remaining_warnings:
+
+    remaining_sketch_ids = set()
+
+    for w in remaining_warnings:
+        try:
+            ids = w.GetFailingElements()
+        except:
+            continue
+        for eid in ids:
+            iv = get_id_value(eid)
+            if iv in curve_id_to_sketch_id:
+                remaining_sketch_ids.add(
+                    get_id_value(curve_id_to_sketch_id[iv]))
+                continue
+            elem = doc.GetElement(eid)
+            if elem is not None and isinstance(elem, Sketch):
+                remaining_sketch_ids.add(iv)
+                continue
+            try:
+                sid = elem.SketchId
+                if sid and sid != ElementId.InvalidElementId:
+                    remaining_sketch_ids.add(get_id_value(sid))
+            except:
+                pass
+
+    print("=========== DIAGNOSTICS: STILL-FAILING SKETCHES ===========")
+
+    for sid_int in remaining_sketch_ids:
+
+        sid = ElementId(sid_int)
+        sketch = doc.GetElement(sid)
+
+        print("")
+        print("SKETCH {} :".format(sid_int))
+
+        if not sketch:
+            print("  (sketch element not found)")
+            continue
+
+        try:
+            plane  = sketch.SketchPlane.GetPlane()
+            origin = plane.Origin
+            ux     = plane.XVec
+            uy     = plane.YVec
+        except Exception as ex:
+            print("  could not read sketch plane: {}".format(ex))
+            continue
+
+        print("  plane origin=({:.4f},{:.4f},{:.4f})  "
+              "ux=({:.4f},{:.4f},{:.4f})  uy=({:.4f},{:.4f},{:.4f})"
+              .format(origin.X, origin.Y, origin.Z,
+                      ux.X, ux.Y, ux.Z, uy.X, uy.Y, uy.Z))
+
+        for eid in sketch.GetAllElements():
+
+            elem = doc.GetElement(eid)
+
+            if not isinstance(elem, ModelCurve):
+                continue
+
+            curve = elem.GeometryCurve
+
+            if curve is None:
+                continue
+
+            p0 = curve.GetEndPoint(0)
+            p1 = curve.GetEndPoint(1)
+            rel = p1 - p0
+            du = rel.DotProduct(ux)
+            dv = rel.DotProduct(uy)
+
+            try:
+                length = curve.Length
+            except Exception:
+                length = -1
+
+            try:
+                angle_deg = math.degrees(math.atan2(dv, du))
+            except Exception:
+                angle_deg = None
+
+            kind = "Line" if isinstance(curve, Line) else \
+                type(curve).__name__
+
+            print("  {} {} : length={:.6f}  du={:.9f}  dv={:.9f}  "
+                  "angle_deg={}"
+                  .format(kind, get_id_value(elem.Id), length,
+                          du, dv, angle_deg))
+
+    print("")
+    print("=============================================================")
+
 print("")
 print("DONE")
