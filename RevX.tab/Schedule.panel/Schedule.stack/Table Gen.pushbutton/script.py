@@ -5,7 +5,7 @@ __title__ = "TableGen"
 __author__ = "Jesto Joy"
 __doc__ = "Import Excel/CSV tables into Revit as native schedules."
 
-SCRIPT_VERSION = "v33 (2026-08-13) labeled-fields dialog for split"
+SCRIPT_VERSION = "v34 (2026-08-14) metadata-sync fix"
 
 import os
 import re
@@ -15,6 +15,9 @@ import zipfile
 import tempfile
 from datetime import datetime
 import xml.etree.ElementTree as ET
+
+import System
+from System import Guid, String, Int32
 
 from pyrevit import revit, forms, script
 
@@ -32,6 +35,9 @@ from Autodesk.Revit.DB import (
     HorizontalAlignmentStyle,
     VerticalAlignmentStyle,
     XYZ,
+)
+from Autodesk.Revit.DB.ExtensibleStorage import (
+    Schema, SchemaBuilder, AccessLevel, Entity,
 )
 from Autodesk.Revit.DB import Color as RevitColor
 
@@ -64,6 +70,10 @@ CANVAS_CAP_PX = 2000
 # Default header rows - used as fallback only; user can override per-split
 SPLIT_HEADER_ROWS = 3
 CATEGORY_MERGE_MIN_FRACTION = 0.6
+
+# Extensible Storage Constants
+TABLEGEN_SCHEMA_GUID = Guid("7D9B4B91-7C1A-4FA2-9E3D-5A6E8F2C1147")
+TABLEGEN_VENDOR_ID = "JJOY"
 
 INDEXED_COLORS = {
     0: (0, 0, 0), 1: (255, 255, 255), 2: (255, 0, 0), 3: (0, 255, 0),
@@ -726,6 +736,107 @@ def plain_table(rows, max_rows=1000, max_cols=60):
     }
 
 
+# ----------------------------------------------------------- extensible storage
+def get_tablegen_schema():
+    schema = Schema.Lookup(TABLEGEN_SCHEMA_GUID)
+    if schema:
+        return schema
+    sb = SchemaBuilder(TABLEGEN_SCHEMA_GUID)
+    sb.SetSchemaName("TableGenScheduleLink")
+    sb.SetReadAccessLevel(AccessLevel.Public)
+    sb.SetWriteAccessLevel(AccessLevel.Public)
+    try:
+        sb.SetVendorId(TABLEGEN_VENDOR_ID)
+    except Exception:
+        pass
+    sb.AddSimpleField("SourceFile", String)
+    sb.AddSimpleField("ImportedOn", String)
+    sb.AddSimpleField("SettingsJson", String)
+    sb.AddSimpleField("RowCount", Int32)
+    sb.AddSimpleField("ColCount", Int32)
+    sb.AddSimpleField("ImageCount", Int32)
+    sb.AddSimpleField("Version", String)
+    return sb.Finish()
+
+
+def tag_schedule_metadata(vs, source_file, nrows, ncols, nimgs, settings=None):
+    try:
+        schema = get_tablegen_schema()
+        ent = Entity(schema)
+        ent.Set[String](schema.GetField("SourceFile"),
+                        source_file or "(clipboard paste)")
+        ent.Set[String](schema.GetField("ImportedOn"),
+                        datetime.now().strftime('%Y-%m-%d %H:%M'))
+        ent.Set[String](schema.GetField("SettingsJson"),
+                        json.dumps(settings or {}))
+        ent.Set[Int32](schema.GetField("RowCount"), int(nrows or 0))
+        ent.Set[Int32](schema.GetField("ColCount"), int(ncols or 0))
+        ent.Set[Int32](schema.GetField("ImageCount"), int(nimgs or 0))
+        ent.Set[String](schema.GetField("Version"), SCRIPT_VERSION)
+        vs.SetEntity(ent)
+        return True
+    except Exception as ex:
+        logger.debug("TableGen metadata write failed for '{}': {}".format(
+            getattr(vs, 'Name', '?'), ex))
+        return False
+
+
+def read_schedule_metadata(vs):
+    schema = Schema.Lookup(TABLEGEN_SCHEMA_GUID)
+    if schema is None:
+        return None
+    try:
+        ent = vs.GetEntity(schema)
+        if ent is None or not ent.IsValid():
+            return None
+    except Exception:
+        return None
+
+    def _gets(field_name, default=""):
+        try:
+            fld = schema.GetField(field_name)
+            if fld is None: return default
+            val = ent.Get[String](fld)
+            return val if val is not None else default
+        except Exception: return default
+
+    def _geti(field_name, default=0):
+        try:
+            fld = schema.GetField(field_name)
+            if fld is None: return default
+            return int(ent.Get[Int32](fld))
+        except Exception: return default
+
+    settings_json = _gets("SettingsJson", "{}")
+    try:
+        settings = json.loads(settings_json) if settings_json else {}
+    except Exception:
+        settings = {}
+
+    return {
+        'name': vs.Name,
+        'date': _gets("ImportedOn", ""),
+        'source': _gets("SourceFile", "(clipboard paste)"),
+        'size': '{}x{}'.format(_geti("RowCount", 0), _geti("ColCount", 0)),
+        'images': _geti("ImageCount", 0),
+        'settings': settings,
+        'view_id': int(get_id_value(vs.Id)),
+    }
+
+
+def model_history_entries():
+    out = []
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
+        try:
+            meta = read_schedule_metadata(vs)
+            if meta:
+                out.append(meta)
+        except Exception:
+            continue
+    out.sort(key=lambda x: x.get('date', ''), reverse=True)
+    return out
+
+
 # ---------------------------------------------------- SPLIT into parts
 def detect_category_header_rows(nrows, ncols, merges, styles):
     """Rows that are wide fill-merges introducing the group BELOW them."""
@@ -1159,7 +1270,7 @@ def build_part_table(full_table, part_start, part_end, header_rows,
     }
 
 
-# -------------------------------------------------------- import history
+# --------------------------------------------------------- import history
 def _history_path():
     try:
         return script.get_document_data_file(
@@ -1243,11 +1354,35 @@ def project_schedule_id_name_map():
 
 
 def prune_history():
-    """Drop history entries whose schedule no longer exists in the
-    project, and re-sync any entry's stored name to the schedule's
-    CURRENT Revit name (so a rename in Revit is reflected in the
-    table instead of making the row vanish or reload under a stale
-    name)."""
+    """Prefer schedule metadata stored in the model itself.
+    Fall back to legacy local JSON history if needed.
+    """
+    model_entries = model_history_entries()
+    if model_entries:
+        merged = {}
+        for e in model_entries:
+            merged[e.get('view_id')] = e
+
+        # merge any old JSON-only rows that still point to existing schedules
+        existing_ids = set(project_schedule_id_name_map().keys())
+        for e in load_history():
+            vid = e.get('view_id')
+            if vid is None:
+                continue
+            if vid in merged:
+                continue
+            if vid not in existing_ids:
+                continue
+            merged[vid] = e
+
+        kept = list(merged.values())
+        kept.sort(key=lambda x: x.get('date', ''), reverse=True)
+
+        # optional local cache refresh
+        save_history(kept)
+        return kept
+
+    # ---- legacy fallback ----
     entries = load_history()
     id_map = project_schedule_id_name_map()
     existing_names = project_schedule_names()
@@ -1256,11 +1391,8 @@ def prune_history():
     for e in entries:
         vid = e.get('view_id')
         if vid is not None:
-            # Preferred path: matched by stable ElementId, so
-            # renames are picked up automatically.
             current_name = id_map.get(vid)
             if current_name is None:
-                # Schedule truly gone from the project - drop it.
                 changed = True
                 continue
             if e.get('name') != current_name:
@@ -1268,8 +1400,6 @@ def prune_history():
                 changed = True
             kept.append(e)
         else:
-            # Legacy entry saved before view_id was tracked - fall
-            # back to matching by name (old behavior).
             if e.get('name') in existing_names:
                 kept.append(e)
             else:
@@ -2577,14 +2707,26 @@ def run_one(name, table, settings, source_file):
                     doc, p['sheet_id'], new_view.Id, p['point'])
             except Exception:
                 pass
+        
+        placed = len([1 for _, _, s in img_log
+                      if s.startswith('IN SCHEDULE CELL')])
+
+        # Store metadata inside the model
+        tag_schedule_metadata(
+            new_view,
+            source_file,
+            len(table['data']),
+            len(table['data'][0]) if table.get('data') else 0,
+            placed,
+            settings
+        )
 
         t.Commit()
     except Exception:
         if t.HasStarted():
             t.RollBack()
         raise
-    placed = len([1 for _, _, s in img_log
-                  if s.startswith('IN SCHEDULE CELL')])
+
     save_history_entry(
         name, source_file,
         len(table['data']), len(table['data'][0]),
@@ -2731,6 +2873,24 @@ try:
                         ViewDuplicateOption.Duplicate)
                     new_vs = doc.GetElement(new_id)
                     new_vs.Name = new_name
+                    
+                    size_str = orig_entry.get('size', '0x0')
+                    try:
+                        sz_parts = size_str.split('x')
+                        orig_nrows = int(sz_parts[0])
+                        orig_ncols = int(sz_parts[-1])
+                    except Exception:
+                        orig_nrows, orig_ncols = 0, 0
+                        
+                    # Tag duplicated view
+                    tag_schedule_metadata(
+                        new_vs,
+                        srcf or '(clipboard paste)',
+                        orig_nrows,
+                        orig_ncols,
+                        int(orig_entry.get('images', 0)),
+                        settings
+                    )
                     t.Commit()
                 except Exception:
                     if t.HasStarted():
@@ -2738,13 +2898,6 @@ try:
                     raise
                 last_view = new_vs
                 done_names.append(new_name)
-                size_str = orig_entry.get('size', '0x0')
-                try:
-                    sz_parts = size_str.split('x')
-                    orig_nrows = int(sz_parts[0])
-                    orig_ncols = int(sz_parts[-1])
-                except Exception:
-                    orig_nrows, orig_ncols = 0, 0
                 save_history_entry(
                     new_name,
                     srcf or '(clipboard paste)',
