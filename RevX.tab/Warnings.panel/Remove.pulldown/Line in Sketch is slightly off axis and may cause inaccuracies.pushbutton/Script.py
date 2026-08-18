@@ -1,13 +1,28 @@
 # -*- coding: utf-8 -*-
+# OFF-AXIS SKETCH LINE FIXER v5 - Revit 2026
+# - Snaps BOTH endpoints of flagged lines
+# - Rounds coordinates to eliminate floating-point drift
+# - Pulls adjacent curves to shared exact coordinates
+# - Skips spline rebuilds
+# - Two-pass strategy (batch then per-curve)
 
 from pyrevit import revit
 from Autodesk.Revit.DB import *
+import clr
 import math
 
+clr.AddReference("System")
+from System import Int64
+from System.Collections.Generic import List
+
 doc = revit.doc
+app = doc.Application
 
 VERY_SMALL               = 0.000000001
-SNAP_ANGLE_THRESHOLD_DEG = 0.5   # only fix lines within 0.5 degrees of axis
+SNAP_ANGLE_THRESHOLD_DEG = 0.5
+NEARBY_ENDPOINT_TOL      = 0.005      # ft (~1.5mm)
+LOOP_TOLERANCE           = 0.0005     # ft (~0.15mm)
+ROUND_DP                 = 5          # decimal places in ft (~3um)
 
 
 def get_id_value(element_id):
@@ -17,90 +32,599 @@ def get_id_value(element_id):
         return element_id.IntegerValue
 
 
+def make_eid(val):
+    if isinstance(val, ElementId):
+        return val
+    return ElementId(Int64(int(val)))
+
+
+def get_sketch_id(owner_elem):
+    try:
+        sid = owner_elem.SketchId
+        if sid is not None:
+            return sid
+    except Exception:
+        pass
+    try:
+        return owner_elem.get_SketchId()
+    except Exception:
+        pass
+    return None
+
+
 # ==========================================================
-# FAILURE PROCESSOR
+# BULLDOZER FAILURE PROCESSOR
 # ==========================================================
 
-class FailureProcessor(IFailuresPreprocessor):
+class BulldozerProc(IFailuresPreprocessor):
+    def __init__(self):
+        self.log    = []
+        self.errors = 0
+
     def PreprocessFailures(self, failuresAccessor):
-        needs_rollback = False
-        for f in failuresAccessor.GetFailureMessages():
+        for f in list(failuresAccessor.GetFailureMessages()):
             try:
-                severity = f.GetSeverity()
+                sev  = f.GetSeverity()
+                desc = f.GetDescriptionText()
+                desc_lower = desc.lower()
             except Exception:
-                severity = None
-            if severity == FailureSeverity.Warning:
+                continue
+
+            self.log.append("[{}] {}".format(sev, desc[:100]))
+
+            # Always delete off-axis warnings
+            if "off axis" in desc_lower or "off-axis" in desc_lower:
                 try:
                     failuresAccessor.DeleteWarning(f)
                 except Exception:
                     pass
-            else:
-                needs_rollback = True
-        if needs_rollback:
+                continue
+
+            # All other warnings - delete
+            if sev == FailureSeverity.Warning:
+                try:
+                    failuresAccessor.DeleteWarning(f)
+                except Exception:
+                    pass
+                continue
+
+            # Join errors - unjoin and resolve
+            try:
+                if "join" in desc_lower:
+                    ids = list(f.GetFailingElementIds())
+                    if len(ids) >= 2:
+                        e1 = doc.GetElement(ids[0])
+                        e2 = doc.GetElement(ids[1])
+                        if e1 and e2:
+                            try:
+                                if JoinGeometryUtils.AreElementsJoined(
+                                        doc, e1, e2):
+                                    JoinGeometryUtils.UnjoinGeometry(
+                                        doc, e1, e2)
+                            except Exception:
+                                pass
+                    try:
+                        failuresAccessor.ResolveFailure(f)
+                    except Exception:
+                        try:
+                            failuresAccessor.DeleteWarning(f)
+                        except Exception:
+                            pass
+                    continue
+            except Exception:
+                pass
+
+            # Constraint errors - delete offending elements
+            try:
+                if "constraint" in desc_lower:
+                    ids = f.GetFailingElementIds()
+                    id_list = List[ElementId]()
+                    for i in ids:
+                        id_list.Add(i)
+                    try:
+                        failuresAccessor.DeleteElements(id_list)
+                        continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Generic resolve
+            try:
+                failuresAccessor.ResolveFailure(f)
+                continue
+            except Exception:
+                pass
+
+            self.errors += 1
+
+        if self.errors > 0:
             return FailureProcessingResult.ProceedWithRollBack
         return FailureProcessingResult.Continue
 
 
 # ==========================================================
-# CLASSIFY LINE
+# GEOMETRY HELPERS
 # ==========================================================
 
 def classify_line(du, dv):
     length = math.sqrt(du * du + dv * dv)
     if length < VERY_SMALL:
         return None, False
-    angle_from_horiz = math.degrees(math.atan2(abs(dv), abs(du)))
-    if angle_from_horiz < SNAP_ANGLE_THRESHOLD_DEG:
+    angle = math.degrees(math.atan2(abs(dv), abs(du)))
+    if angle < SNAP_ANGLE_THRESHOLD_DEG:
         return 'horizontal', True
-    if angle_from_horiz > (90.0 - SNAP_ANGLE_THRESHOLD_DEG):
+    if angle > (90.0 - SNAP_ANGLE_THRESHOLD_DEG):
         return 'vertical', True
     return None, False
 
 
+def read_sketch_curves(sketch):
+    try:
+        plane  = sketch.SketchPlane.GetPlane()
+        origin = plane.Origin
+        ux     = plane.XVec
+        uy     = plane.YVec
+        nz     = plane.Normal
+    except Exception:
+        return None, None
+
+    curves = []
+    try:
+        for eid in sketch.GetAllElements():
+            elem = doc.GetElement(eid)
+            if not isinstance(elem, ModelCurve):
+                continue
+            curve = elem.GeometryCurve
+            if curve is None:
+                continue
+
+            p0 = curve.GetEndPoint(0)
+            p1 = curve.GetEndPoint(1)
+
+            if isinstance(curve, Line):
+                kind, mid = 'line', None
+            elif isinstance(curve, Arc):
+                kind = 'arc'
+                try:
+                    mid = curve.Evaluate(0.5, True)
+                except Exception:
+                    mid = None
+            elif isinstance(curve, HermiteSpline):
+                kind, mid = 'spline', None
+            else:
+                kind, mid = 'other', None
+
+            curves.append({
+                'id'    : get_id_value(eid),
+                'elem'  : elem,
+                'curve' : curve,
+                'kind'  : kind,
+                'p0'    : p0,
+                'p1'    : p1,
+                'mid'   : mid,
+            })
+    except Exception:
+        return None, None
+
+    plane_data = {'origin': origin, 'ux': ux, 'uy': uy, 'nz': nz}
+    return curves, plane_data
+
+
+def rebuild_curve(c, new_p0, new_p1):
+    """Returns None for splines to avoid breaking loop closure."""
+    kind = c['kind']
+    if new_p0.DistanceTo(new_p1) < app.ShortCurveTolerance:
+        return None
+    try:
+        if kind == 'line':
+            return Line.CreateBound(new_p0, new_p1)
+        if kind == 'arc' and c['mid'] is not None:
+            return Arc.Create(new_p0, new_p1, c['mid'])
+        # Splines are never rebuilt
+        if kind == 'spline':
+            return None
+    except Exception:
+        return None
+    return None
+
+
 # ==========================================================
-# SNAP A SINGLE LINE ABOUT ITS MIDPOINT
-#
-# Strategy: keep the midpoint fixed, extend both endpoints
-# symmetrically along the snapped axis.
-# This means BOTH endpoints move equally → minimum disruption
-# to adjacent curves → loop stays closed (approximately).
+# PLAN MOVES
+# Snaps both endpoints of each flagged line
+# to a rounded common coordinate.
+# Pulls adjacent curves to share the exact same value.
 # ==========================================================
 
-def snap_line_about_midpoint(p0, p1, direction):
+def plan_endpoint_moves(curves, plane_data, warning_elem_ids):
+    ux = plane_data['ux']
+    uy = plane_data['uy']
+
+    def _key(p):
+        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
+
+    # Identify endpoints that touch splines (never move these)
+    spline_endpoints = set()
+    for c in curves:
+        if c['kind'] == 'spline':
+            spline_endpoints.add(_key(c['p0']))
+            spline_endpoints.add(_key(c['p1']))
+
+    moves = {}   # _key(old_pt) -> new_pt
+
+    def _register(old_pt, new_pt):
+        k = _key(old_pt)
+        if k in spline_endpoints:
+            return
+        moves[k] = new_pt
+        # Pull nearby endpoints to identical coordinate
+        for c in curves:
+            for p in (c['p0'], c['p1']):
+                if p.DistanceTo(old_pt) < NEARBY_ENDPOINT_TOL:
+                    kp = _key(p)
+                    if kp in spline_endpoints:
+                        continue
+                    if kp not in moves:
+                        moves[kp] = new_pt
+
+    AXIS_TOL = 0.0001
+    ux_is_x = abs(abs(ux.X) - 1.0) < AXIS_TOL
+    ux_is_y = abs(abs(ux.Y) - 1.0) < AXIS_TOL
+    ux_is_z = abs(abs(ux.Z) - 1.0) < AXIS_TOL
+    uy_is_x = abs(abs(uy.X) - 1.0) < AXIS_TOL
+    uy_is_y = abs(abs(uy.Y) - 1.0) < AXIS_TOL
+    uy_is_z = abs(abs(uy.Z) - 1.0) < AXIS_TOL
+
+    plane_axis_aligned = (
+        (ux_is_x or ux_is_y or ux_is_z) and
+        (uy_is_x or uy_is_y or uy_is_z)
+    )
+
+    for c in curves:
+        if c['kind'] != 'line':
+            continue
+        if c['id'] not in warning_elem_ids:
+            continue
+
+        p0, p1 = c['p0'], c['p1']
+        rel = p1 - p0
+        du = rel.DotProduct(ux)
+        dv = rel.DotProduct(uy)
+
+        direction, should_snap = classify_line(du, dv)
+        if not should_snap:
+            continue
+
+        p0_spline = _key(p0) in spline_endpoints
+        p1_spline = _key(p1) in spline_endpoints
+        if p0_spline and p1_spline:
+            print("    curve {} : both ends on spline - skip"
+                  .format(c['id']))
+            continue
+
+        new_p0 = None
+        new_p1 = None
+
+        if plane_axis_aligned:
+            # Compute rounded common coordinate
+            if direction == 'horizontal':
+                if uy_is_y:
+                    common = round((p0.Y + p1.Y) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(p0.X, common, p0.Z)
+                    new_p1 = XYZ(p1.X, common, p1.Z)
+                elif uy_is_z:
+                    common = round((p0.Z + p1.Z) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(p0.X, p0.Y, common)
+                    new_p1 = XYZ(p1.X, p1.Y, common)
+                elif uy_is_x:
+                    common = round((p0.X + p1.X) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(common, p0.Y, p0.Z)
+                    new_p1 = XYZ(common, p1.Y, p1.Z)
+            else:  # vertical
+                if ux_is_x:
+                    common = round((p0.X + p1.X) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(common, p0.Y, p0.Z)
+                    new_p1 = XYZ(common, p1.Y, p1.Z)
+                elif ux_is_y:
+                    common = round((p0.Y + p1.Y) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(p0.X, common, p0.Z)
+                    new_p1 = XYZ(p1.X, common, p1.Z)
+                elif ux_is_z:
+                    common = round((p0.Z + p1.Z) / 2.0, ROUND_DP)
+                    new_p0 = XYZ(p0.X, p0.Y, common)
+                    new_p1 = XYZ(p1.X, p1.Y, common)
+        else:
+            # Tilted plane - UV-based snap
+            origin = plane_data['origin']
+
+            def to_uv(p):
+                rel_p = p - origin
+                return rel_p.DotProduct(ux), rel_p.DotProduct(uy)
+
+            def from_uv(u, v):
+                return origin.Add(
+                    ux.Multiply(u)).Add(uy.Multiply(v))
+
+            u0, v0 = to_uv(p0)
+            u1, v1 = to_uv(p1)
+
+            if direction == 'horizontal':
+                common_v = round((v0 + v1) / 2.0, ROUND_DP)
+                new_p0 = from_uv(u0, common_v)
+                new_p1 = from_uv(u1, common_v)
+            else:
+                common_u = round((u0 + u1) / 2.0, ROUND_DP)
+                new_p0 = from_uv(common_u, v0)
+                new_p1 = from_uv(common_u, v1)
+
+        if new_p0 is None or new_p1 is None:
+            continue
+
+        if new_p0.DistanceTo(new_p1) < app.ShortCurveTolerance:
+            continue
+
+        # Register both endpoint moves
+        if not p0_spline:
+            _register(p0, new_p0)
+        if not p1_spline:
+            _register(p1, new_p1)
+
+    return moves
+
+
+def add_gap_closure_moves(curves, moves):
     """
-    Returns (new_p0, new_p1) where the line is perfectly
-    horizontal or vertical, centred on the original midpoint.
-
-    direction = 'horizontal' → zero out Y difference (keep X span)
-    direction = 'vertical'   → zero out X difference (keep Y span)
+    Close any pre-existing tiny gaps between different curves'
+    endpoints (regardless of flag status).
     """
-    mx = (p0.X + p1.X) / 2.0
-    my = (p0.Y + p1.Y) / 2.0
-    mz = (p0.Z + p1.Z) / 2.0
+    def _key(p):
+        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
 
-    dx = p1.X - p0.X
-    dy = p1.Y - p0.Y
-    dz = p1.Z - p0.Z
+    spline_endpoints = set()
+    for c in curves:
+        if c['kind'] == 'spline':
+            spline_endpoints.add(_key(c['p0']))
+            spline_endpoints.add(_key(c['p1']))
 
-    if direction == 'horizontal':
-        # keep the X span, zero the Y deviation
-        # half_length along X axis only
-        half = abs(dx) / 2.0
-        sign = 1.0 if dx >= 0 else -1.0
-        new_p0 = XYZ(mx - sign * half, my, mz)
-        new_p1 = XYZ(mx + sign * half, my, mz)
-    else:
-        # keep the Y span, zero the X deviation
-        half = abs(dy) / 2.0
-        sign = 1.0 if dy >= 0 else -1.0
-        new_p0 = XYZ(mx, my - sign * half, mz - dz / 2.0)
-        new_p1 = XYZ(mx, my + sign * half, mz + dz / 2.0)
+    endpoint_list = []
+    for c in curves:
+        endpoint_list.append((c['id'], 0, c['p0']))
+        endpoint_list.append((c['id'], 1, c['p1']))
 
-    return new_p0, new_p1
+    for i in range(len(endpoint_list)):
+        cid1, ei1, p1 = endpoint_list[i]
+        for j in range(i + 1, len(endpoint_list)):
+            cid2, ei2, p2 = endpoint_list[j]
+            if cid1 == cid2:
+                continue
+            d = p1.DistanceTo(p2)
+            if VERY_SMALL < d < NEARBY_ENDPOINT_TOL:
+                k1 = _key(p1)
+                k2 = _key(p2)
+                k1_spline = k1 in spline_endpoints
+                k2_spline = k2 in spline_endpoints
+                if k1_spline and k2_spline:
+                    continue
+                if k1 in moves and k2 not in moves and not k2_spline:
+                    moves[k2] = moves[k1]
+                elif k2 in moves and k1 not in moves and not k1_spline:
+                    moves[k1] = moves[k2]
+                elif k1 not in moves and k2 not in moves:
+                    if k1_spline:
+                        moves[k2] = p1
+                    elif k2_spline:
+                        moves[k1] = p2
+                    else:
+                        # Merge to rounded midpoint
+                        mid = XYZ(
+                            round((p1.X + p2.X) / 2.0, ROUND_DP),
+                            round((p1.Y + p2.Y) / 2.0, ROUND_DP),
+                            round((p1.Z + p2.Z) / 2.0, ROUND_DP)
+                        )
+                        moves[k1] = mid
+                        moves[k2] = mid
+
+
+def apply_moves(curves, moves):
+    def _key(p):
+        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
+
+    pairs = []
+    for c in curves:
+        k0 = _key(c['p0'])
+        k1 = _key(c['p1'])
+        new_p0 = moves.get(k0, c['p0'])
+        new_p1 = moves.get(k1, c['p1'])
+        moved = (new_p0 is not c['p0'] or new_p1 is not c['p1'])
+        if not moved:
+            continue
+        new_curve = rebuild_curve(c, new_p0, new_p1)
+        if new_curve is None:
+            print("    SKIP curve {} ({}) : cannot rebuild"
+                  .format(c['id'], c['kind']))
+            continue
+        pairs.append((c['elem'], new_curve, c['id'], c['kind']))
+    return pairs
+
+
+def validate_loop_closure(curves, pairs):
+    new_endpoints = {}
+    for c in curves:
+        new_endpoints[c['id']] = (c['p0'], c['p1'])
+    for elem, new_curve, cid, _kind in pairs:
+        new_endpoints[cid] = (
+            new_curve.GetEndPoint(0),
+            new_curve.GetEndPoint(1)
+        )
+
+    def _key(p):
+        return (
+            round(p.X / LOOP_TOLERANCE) * LOOP_TOLERANCE,
+            round(p.Y / LOOP_TOLERANCE) * LOOP_TOLERANCE,
+            round(p.Z / LOOP_TOLERANCE) * LOOP_TOLERANCE,
+        )
+
+    counts = {}
+    for cid, (p0, p1) in new_endpoints.items():
+        for p in (p0, p1):
+            k = _key(p)
+            counts[k] = counts.get(k, 0) + 1
+
+    opens = []
+    for cid, (p0, p1) in new_endpoints.items():
+        for end_idx, p in ((0, p0), (1, p1)):
+            k = _key(p)
+            if counts.get(k, 0) < 2:
+                opens.append((cid, end_idx, p))
+
+    return (len(opens) == 0), opens
+
+
+def collect_sketch_dimensions(sketch):
+    dim_ids = []
+    try:
+        sketch_elem_ids = set(
+            get_id_value(eid)
+            for eid in sketch.GetAllElements()
+        )
+    except Exception:
+        return dim_ids
+
+    dims = (FilteredElementCollector(doc)
+            .OfClass(Dimension).ToElements())
+
+    for dim in dims:
+        try:
+            refs = dim.References
+            if not refs:
+                continue
+            for ref in refs:
+                if ref.ElementId is None:
+                    continue
+                if get_id_value(ref.ElementId) in sketch_elem_ids:
+                    dim_ids.append(dim.Id)
+                    break
+        except Exception:
+            continue
+    return dim_ids
+
+
+def find_joined_elements(elem):
+    joined = []
+    try:
+        joined_ids = JoinGeometryUtils.GetJoinedElements(doc, elem)
+        for jid in joined_ids:
+            joined.append(doc.GetElement(jid))
+    except Exception:
+        pass
+    return [j for j in joined if j is not None]
 
 
 # ==========================================================
-# FIND TARGET WARNINGS
+# WRITE FUNCTION
+# ==========================================================
+
+def try_write(sid_int, owner, pairs, dim_ids, joined, strategy):
+    ses = None
+    t   = None
+    tg  = None
+    scope_committed = False
+    tg_assimilated  = False
+
+    try:
+        tg = TransactionGroup(doc, "Fix Sketch {} [{}]".format(
+            sid_int, strategy))
+        tg.Start()
+
+        ses = SketchEditScope(doc, "Fix Sketch {}".format(sid_int))
+        ses.Start(make_eid(sid_int))
+
+        t = Transaction(doc,
+                        "Fix Curves {} [{}]".format(sid_int, strategy))
+        t.Start()
+
+        if strategy in ('unjoin', 'unjoin_del_dims'):
+            for j in joined:
+                try:
+                    if JoinGeometryUtils.AreElementsJoined(doc, owner, j):
+                        JoinGeometryUtils.UnjoinGeometry(doc, owner, j)
+                except Exception:
+                    pass
+
+        if strategy in ('del_dims', 'unjoin_del_dims') and dim_ids:
+            for did in dim_ids:
+                try:
+                    doc.Delete(did)
+                except Exception:
+                    pass
+
+        opts = t.GetFailureHandlingOptions()
+        proc = BulldozerProc()
+        opts.SetFailuresPreprocessor(proc)
+        opts.SetForcedModalHandling(False)
+        opts.SetClearAfterRollback(True)
+        opts.SetDelayedMiniWarnings(True)
+        t.SetFailureHandlingOptions(opts)
+
+        write_ok = True
+        for elem, new_curve, cid, kind in pairs:
+            try:
+                elem.SetGeometryCurve(new_curve, True)
+            except Exception as ex:
+                print("    elem {} ({}) write: {}".format(cid, kind, ex))
+                write_ok = False
+                break
+
+        if not write_ok:
+            try:
+                t.RollBack()
+            except Exception:
+                pass
+            return False
+
+        status = t.Commit()
+        if status != TransactionStatus.Committed:
+            return False
+
+        scope_proc = BulldozerProc()
+        try:
+            ses.Commit(scope_proc)
+            scope_committed = True
+        except Exception:
+            return False
+
+        try:
+            tg.Assimilate()
+            tg_assimilated = True
+        except Exception:
+            pass
+        return True
+
+    except Exception:
+        return False
+
+    finally:
+        if ses is not None and not scope_committed:
+            try:
+                if t and t.HasStarted() and not t.HasEnded():
+                    try:
+                        t.RollBack()
+                    except Exception:
+                        pass
+                ses.Dispose()
+            except Exception:
+                pass
+
+        if tg is not None and not tg_assimilated:
+            try:
+                if tg.HasStarted() and not tg.HasEnded():
+                    tg.RollBack()
+            except Exception:
+                pass
+
+
+# ==========================================================
+# MAIN
 # ==========================================================
 
 warnings_list = []
@@ -113,359 +637,190 @@ for w in doc.GetWarnings():
         pass
 
 print("")
+print("=" * 60)
+print("OFF-AXIS LINE FIXER v5 - Revit 2026")
+print("=" * 60)
 print("TARGET WARNINGS FOUND : {}".format(len(warnings_list)))
 print("")
 
-# ==========================================================
-# BUILD CURVE-ID -> SKETCH-ID LOOKUP
-# ==========================================================
-
 curve_id_to_sketch_id = {}
 all_sketches = (FilteredElementCollector(doc)
-                .OfClass(Sketch)
-                .ToElements())
-
+                .OfClass(Sketch).ToElements())
 for sk in all_sketches:
     try:
         for ceid in sk.GetAllElements():
-            curve_id_to_sketch_id[get_id_value(ceid)] = sk.Id
+            curve_id_to_sketch_id[get_id_value(ceid)] = get_id_value(sk.Id)
     except Exception:
         pass
 
-print("SKETCHES SCANNED : {}".format(len(all_sketches)))
-print("CURVE IDS MAPPED : {}".format(len(curve_id_to_sketch_id)))
-print("")
-
-# ==========================================================
-# COLLECT EXACTLY WHICH ELEMENTS ARE FLAGGED
-# ==========================================================
-
 warning_elem_ids = set()
 sketch_ids       = set()
-unmatched        = 0
 
 for w in warnings_list:
     try:
-        ids = w.GetFailingElements()
+        ids = list(w.GetFailingElements())
     except Exception:
         continue
     for eid in ids:
-        iv   = get_id_value(eid)
-        warning_elem_ids.add(iv)
-        elem = doc.GetElement(eid)
-        if iv in curve_id_to_sketch_id:
-            sketch_ids.add(get_id_value(curve_id_to_sketch_id[iv]))
-            continue
-        if elem is not None and isinstance(elem, Sketch):
-            sketch_ids.add(iv)
-            continue
-        try:
-            sid = elem.SketchId
-            if sid and sid != ElementId.InvalidElementId:
-                sketch_ids.add(get_id_value(sid))
-                continue
-        except Exception:
-            pass
-        unmatched += 1
-
-print("WARNING ELEMENT IDS : {}".format(sorted(warning_elem_ids)))
-print("")
-print("SKETCH IDS TO FIX                        : {}"
-      .format(len(sketch_ids)))
-print("FAILING ELEMENTS NOT MATCHED TO A SKETCH : {}"
-      .format(unmatched))
-print("")
-
-# ==========================================================
-# BUILD WORK LIST
-# Only process the EXACT flagged elements.
-# Use midpoint-rotation so the loop stays closed.
-# ==========================================================
-
-work_items = []   # list of (elem, new_curve, sid_int)
-skipped    = []
-
-for sid_int in sketch_ids:
-    sid    = ElementId(sid_int)
-    sketch = doc.GetElement(sid)
-
-    if not sketch:
-        print("SKETCH {} : not found - skipped".format(sid_int))
-        skipped.append(sid_int)
-        continue
-
-    try:
-        plane  = sketch.SketchPlane.GetPlane()
-        origin = plane.Origin
-        ux     = plane.XVec
-        uy     = plane.YVec
-        nz     = plane.Normal
-    except Exception as ex:
-        print("SKETCH {} : cannot read plane ({}) - skipped"
-              .format(sid_int, ex))
-        skipped.append(sid_int)
-        continue
-
-    try:
-        all_elem_ids = sketch.GetAllElements()
-    except Exception as ex:
-        print("SKETCH {} : cannot read elements ({}) - skipped"
-              .format(sid_int, ex))
-        skipped.append(sid_int)
-        continue
-
-    sketch_items = []
-
-    for eid in all_elem_ids:
         iv = get_id_value(eid)
-        if iv not in warning_elem_ids:
-            continue                          # only touch flagged lines
-
         elem = doc.GetElement(eid)
-        if elem is None or not isinstance(elem, ModelCurve):
-            continue
-        curve = elem.GeometryCurve
-        if curve is None or not isinstance(curve, Line):
-            continue
-
-        p0 = curve.GetEndPoint(0)
-        p1 = curve.GetEndPoint(1)
-
-        # project into sketch plane UV space
-        def to_uv(p):
-            rel = p - origin
-            return rel.DotProduct(ux), rel.DotProduct(uy)
-
-        u0, v0 = to_uv(p0)
-        u1, v1 = to_uv(p1)
-        du = u1 - u0
-        dv = v1 - v0
-
-        direction, should_snap = classify_line(du, dv)
-        if not should_snap:
-            print("  SKETCH {} elem {} : angle {:.4f}° - outside "
-                  "threshold, skipped"
-                  .format(sid_int, iv,
-                          math.degrees(math.atan2(abs(dv), abs(du)))))
-            continue
-
-        new_p0, new_p1 = snap_line_about_midpoint(p0, p1, direction)
-
-        # sanity: must not collapse
-        if new_p0.DistanceTo(new_p1) < VERY_SMALL:
-            print("  SKETCH {} elem {} : would collapse - skipped"
-                  .format(sid_int, iv))
-            continue
-
-        try:
-            new_curve = Line.CreateBound(new_p0, new_p1)
-        except Exception as ex:
-            print("  SKETCH {} elem {} : Line.CreateBound failed: {}"
-                  .format(sid_int, iv, ex))
-            continue
-
-        sketch_items.append((elem, new_curve))
-        print("  SKETCH {} elem {} : {} snap  "
-              "dv={:.9f} du={:.9f}  max_shift={:.9f} ft"
-              .format(sid_int, iv, direction,
-                      dv, du,
-                      max(p0.DistanceTo(new_p0),
-                          p1.DistanceTo(new_p1))))
-
-    if sketch_items:
-        work_items.append((sid_int, sketch_items))
-
-print("")
-print("SKETCHES WITH WORK : {}".format(len(work_items)))
-print("TOTAL CURVES TO FIX: {}".format(
-    sum(len(si) for _, si in work_items)))
-print("")
-
-# ==========================================================
-# WRITE  —  one Transaction per sketch, LocationCurve only
-# ==========================================================
-
-fixed       = 0
-write_fails = 0
-
-for sid_int, items in work_items:
-
-    t = None
-    try:
-        t = Transaction(doc,
-                        "Fix Off-Axis Lines {}".format(sid_int))
-        t.Start()
-
-        opts = t.GetFailureHandlingOptions()
-        opts.SetFailuresPreprocessor(FailureProcessor())
-        opts.SetForcedModalHandling(False)
-        t.SetFailureHandlingOptions(opts)
-
-        write_ok  = True
-        fix_count = 0
-
-        for elem, new_curve in items:
-            eid_str = get_id_value(elem.Id)
-            try:
-                loc = elem.Location
-                if loc is None or not isinstance(loc, LocationCurve):
-                    print("  SKETCH {} elem {} : no LocationCurve"
-                          .format(sid_int, eid_str))
-                    continue
-                loc.Curve = new_curve
-                fix_count += 1
-            except Exception as ex:
-                print("  SKETCH {} elem {} write error : {}"
-                      .format(sid_int, eid_str, ex))
-                write_ok = False
-                break
-
-        if write_ok:
-            status = t.Commit()
-            if status == TransactionStatus.Committed:
-                fixed += fix_count
-                print("SKETCH {} : {} curve(s) committed"
-                      .format(sid_int, fix_count))
-            else:
-                print("SKETCH {} : status={} rolling back"
-                      .format(sid_int, status))
-                try:
-                    t.RollBack()
-                except Exception:
-                    pass
-                write_fails += 1
+        if elem is not None and isinstance(elem, ModelCurve):
+            warning_elem_ids.add(iv)
+            if iv in curve_id_to_sketch_id:
+                sketch_ids.add(curve_id_to_sketch_id[iv])
+        elif elem is not None and isinstance(elem, Sketch):
+            sketch_ids.add(iv)
         else:
-            t.RollBack()
-            print("SKETCH {} : rolled back".format(sid_int))
-            write_fails += 1
+            try:
+                sid = get_sketch_id(elem)
+                if sid and sid != ElementId.InvalidElementId:
+                    sketch_ids.add(get_id_value(sid))
+            except Exception:
+                pass
 
-    except Exception as ex:
-        print("SKETCH {} : unexpected error : {}"
-              .format(sid_int, ex))
+print("SKETCH IDS : {}".format(sorted(sketch_ids)))
+print("")
+
+# ==========================================================
+# PROCESS EACH SKETCH
+# ==========================================================
+
+fixed_sketches = 0
+fixed_curves   = 0
+write_fails    = 0
+
+for sid_int in sorted(sketch_ids):
+    print("")
+    print("--- Sketch {} ---".format(sid_int))
+
+    sketch = doc.GetElement(make_eid(sid_int))
+    if not sketch:
+        print("  not found")
+        continue
+
+    try:
+        owner_elem   = doc.GetElement(sketch.OwnerId)
+        owner_class  = owner_elem.__class__.__name__
+    except Exception:
+        continue
+
+    curves, plane_data = read_sketch_curves(sketch)
+    if not curves:
+        continue
+
+    print("  Owner : {} ({})".format(
+        get_id_value(owner_elem.Id), owner_class))
+
+    dim_ids = []
+    joined_elems = []
+    if owner_class == 'Wall':
+        dim_ids = collect_sketch_dimensions(sketch)
+        joined_elems = find_joined_elements(owner_elem)
+
+    if owner_class == 'Wall':
+        strategies = ['normal', 'unjoin', 'unjoin_del_dims']
+    else:
+        strategies = ['normal', 'unjoin']
+
+    # PASS 1: batch
+    moves = plan_endpoint_moves(curves, plane_data, warning_elem_ids)
+    add_gap_closure_moves(curves, moves)
+    pairs = apply_moves(curves, moves)
+
+    if pairs:
+        ok, _ = validate_loop_closure(curves, pairs)
+        if ok:
+            print("  Pass 1 (batch): {} curves".format(len(pairs)))
+            success = False
+            for strategy in strategies:
+                if try_write(sid_int, owner_elem, pairs,
+                             dim_ids, joined_elems, strategy):
+                    success = True
+                    fixed_sketches += 1
+                    fixed_curves += len(pairs)
+                    print("  BATCH COMMITTED [{}]".format(strategy))
+                    break
+
+            if success:
+                continue
+
+    # PASS 2: per-curve
+    print("  Pass 2 (per-curve retry)")
+
+    per_curve_fixed = 0
+    for target_cid in list(warning_elem_ids):
+        # Refresh sketch state
+        curves, plane_data = read_sketch_curves(sketch)
+        if not curves:
+            break
+
+        found = False
+        for c in curves:
+            if c['id'] == target_cid and c['kind'] == 'line':
+                found = True
+                break
+        if not found:
+            continue
+
+        single_warning = set([target_cid])
+        moves = plan_endpoint_moves(curves, plane_data, single_warning)
+        pairs = apply_moves(curves, moves)
+
+        if not pairs:
+            continue
+
+        ok, _ = validate_loop_closure(curves, pairs)
+        if not ok:
+            print("    curve {} : loop closure fail - skip"
+                  .format(target_cid))
+            continue
+
+        for strategy in strategies:
+            if try_write(sid_int, owner_elem, pairs,
+                         dim_ids, joined_elems, strategy):
+                per_curve_fixed += 1
+                fixed_curves += len(pairs)
+                print("    curve {} FIXED [{}]".format(
+                    target_cid, strategy))
+                break
+        else:
+            print("    curve {} : all strategies failed"
+                  .format(target_cid))
+
+    if per_curve_fixed > 0:
+        fixed_sketches += 1
+        print("  Per-curve total: {}".format(per_curve_fixed))
+    else:
         write_fails += 1
-        try:
-            if t is not None and t.HasStarted() \
-                    and not t.HasEnded():
-                t.RollBack()
-        except Exception:
-            pass
 
 # ==========================================================
-# FINAL CHECK
+# FINAL COUNT
 # ==========================================================
 
-remaining          = 0
-remaining_warnings = []
-
+remaining_off_axis = 0
 for w in doc.GetWarnings():
     try:
         txt = w.GetDescriptionText().lower()
         if "line in sketch" in txt and "slightly off axis" in txt:
-            remaining += 1
-            remaining_warnings.append(w)
+            remaining_off_axis += 1
     except Exception:
         pass
 
 print("")
-print("==========================================")
-print("CURVES FIXED       : {}".format(fixed))
-print("SKETCHES SKIPPED   : {}".format(len(skipped)))
-print("WRITE FAILURES     : {}".format(write_fails))
-print("REMAINING WARNINGS : {}".format(remaining))
-print("==========================================")
-print("")
+print("=" * 60)
+print("SKETCHES FIXED       : {}".format(fixed_sketches))
+print("CURVES FIXED         : {}".format(fixed_curves))
+print("WRITE FAILURES       : {}".format(write_fails))
+print("OFF-AXIS REMAINING   : {}".format(remaining_off_axis))
+print("=" * 60)
 
-# ==========================================================
-# DIAGNOSTICS
-# ==========================================================
-
-if remaining_warnings:
-
-    remaining_sketch_ids = set()
-    remaining_elem_ids   = set()
-
-    for w in remaining_warnings:
-        try:
-            ids = w.GetFailingElements()
-        except Exception:
-            continue
-        for eid in ids:
-            iv   = get_id_value(eid)
-            remaining_elem_ids.add(iv)
-            elem = doc.GetElement(eid)
-            if iv in curve_id_to_sketch_id:
-                remaining_sketch_ids.add(
-                    get_id_value(curve_id_to_sketch_id[iv]))
-                continue
-            if elem is not None and isinstance(elem, Sketch):
-                remaining_sketch_ids.add(iv)
-                continue
-            try:
-                sid = elem.SketchId
-                if sid and sid != ElementId.InvalidElementId:
-                    remaining_sketch_ids.add(get_id_value(sid))
-            except Exception:
-                pass
-
-    print("REMAINING FLAGGED IDS : {}"
-          .format(sorted(remaining_elem_ids)))
+if remaining_off_axis > 0:
     print("")
-    print("======== DIAGNOSTICS: STILL-FAILING SKETCHES ========")
-
-    for sid_int in remaining_sketch_ids:
-        sid    = ElementId(sid_int)
-        sketch = doc.GetElement(sid)
-        print("")
-        print("SKETCH {} :".format(sid_int))
-        if not sketch:
-            print("  (not found)")
-            continue
-        try:
-            plane  = sketch.SketchPlane.GetPlane()
-            origin = plane.Origin
-            ux     = plane.XVec
-            uy     = plane.YVec
-        except Exception as ex:
-            print("  plane error: {}".format(ex))
-            continue
-
-        for eid in sketch.GetAllElements():
-            try:
-                elem  = doc.GetElement(eid)
-                if not isinstance(elem, ModelCurve):
-                    continue
-                curve = elem.GeometryCurve
-                if curve is None:
-                    continue
-                p0  = curve.GetEndPoint(0)
-                p1  = curve.GetEndPoint(1)
-                rel = p1 - p0
-                du  = rel.DotProduct(ux)
-                dv  = rel.DotProduct(uy)
-                try:
-                    length = curve.Length
-                except Exception:
-                    length = -1
-                try:
-                    angle_deg = math.degrees(math.atan2(dv, du))
-                except Exception:
-                    angle_deg = None
-                flagged = (
-                    " <<<< STILL FLAGGED"
-                    if get_id_value(elem.Id) in remaining_elem_ids
-                    else "")
-                kind = ("Line" if isinstance(curve, Line)
-                        else type(curve).__name__)
-                print("  {} {} : length={:.6f}  "
-                      "du={:.9f}  dv={:.9f}  angle={}{}"
-                      .format(kind, get_id_value(elem.Id),
-                              length, du, dv,
-                              angle_deg, flagged))
-            except Exception:
-                pass
-
-    print("")
-    print("=====================================================")
+    print("TIP: Run the script again - each pass can catch")
+    print("     warnings that only appear after previous fixes.")
+    print("     If warnings persist after 2-3 runs, they may")
+    print("     be on lines whose endpoints are pinned by")
+    print("     splines or other constraints.")
 
 print("")
 print("DONE")
