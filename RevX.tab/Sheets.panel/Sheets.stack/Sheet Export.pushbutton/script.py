@@ -639,33 +639,162 @@ def write_rule_xml(path, rule):
 
 def read_rule_xml(path):
     import xml.etree.ElementTree as ET
-    root = ET.parse(path).getroot()
+    import re
 
-    def text(tag, default=""):
-        node = root.find(tag)
-        return default if node is None or node.text is None else node.text
-
-    def flag(tag, default=False):
-        return text(tag, str(default)).strip().lower() in ("true", "1", "yes")
-
-    params = root.find("Parameters")
     tokens = []
-    if params is not None:
-        def order_of(n):
-            try:
-                return int(n.get("order", "0"))
-            except Exception:
-                return 0
-        for node in sorted(params.findall("Parameter"), key=order_of):
-            if node.text:
-                tokens.append(node.text)
-    return dict(tokens=tokens,
-                separator=text("Separator", "_"),
-                prefix=text("Prefix", ""),
-                suffix=text("Suffix", ""),
-                remove_spaces=flag("RemoveSpaces"),
-                upper=flag("Uppercase"),
-                do_sanitize=flag("Sanitize", True))
+    separator = "_"
+    prefix = ""
+    suffix = ""
+    remove_spaces = False
+    upper = False
+    do_sanitize = True
+
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+    except Exception as ex:
+        raise ValueError("Invalid XML file format: %s" % ex)
+
+    def strip_ns(tag):
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    def find_text_anywhere(target_tag, default=""):
+        for elem in root.iter():
+            if strip_ns(elem.tag) == target_tag and elem.text is not None and elem.text.strip():
+                return elem.text.strip()
+        return default
+
+    def find_flag_anywhere(target_tag, default=False):
+        val = find_text_anywhere(target_tag, str(default))
+        return val.strip().lower() in ("true", "1", "yes")
+
+    root_tag = strip_ns(root.tag)
+
+    # 1. Standard RevX XML (<SheetExportNaming>)
+    if root_tag == "SheetExportNaming":
+        params_node = None
+        for elem in root.iter():
+            if strip_ns(elem.tag) == "Parameters":
+                params_node = elem
+                break
+        if params_node is not None:
+            def order_of(n):
+                try:
+                    return int(n.get("order", "0"))
+                except Exception:
+                    return 0
+            param_elems = [e for e in params_node if strip_ns(e.tag) == "Parameter"]
+            for node in sorted(param_elems, key=order_of):
+                if node.text and node.text.strip():
+                    tokens.append(node.text.strip())
+        
+        return dict(
+            tokens=tokens,
+            separator=find_text_anywhere("Separator", "_"),
+            prefix=find_text_anywhere("Prefix", ""),
+            suffix=find_text_anywhere("Suffix", ""),
+            remove_spaces=find_flag_anywhere("RemoveSpaces"),
+            upper=find_flag_anywhere("Uppercase"),
+            do_sanitize=find_flag_anywhere("Sanitize", True)
+        )
+
+    # 2. ProSheets / DiRoots XML (<Profiles> / <Profile> / <SelectSheetParameters>)
+    select_params_node = None
+    for elem in root.iter():
+        if strip_ns(elem.tag) == "SelectSheetParameters":
+            select_params_node = elem
+            break
+
+    if select_params_node is not None:
+        combine_params_node = None
+        for elem in select_params_node.iter():
+            if strip_ns(elem.tag) == "CombineParameters":
+                combine_params_node = elem
+                break
+        
+        sep_found = None
+        if combine_params_node is not None:
+            for p_model in combine_params_node:
+                if strip_ns(p_model.tag) == "ParameterModel":
+                    p_name = None
+                    for child in p_model:
+                        if strip_ns(child.tag) == "ParameterName" and child.text and child.text.strip():
+                            p_name = child.text.strip()
+                            break
+                    if p_name:
+                        tokens.append(p_name)
+                    
+                    for attr_k, attr_v in p_model.attrib.items():
+                        if ("preserve" in attr_k.lower() or "space" in attr_k.lower()) and attr_v:
+                            sep_found = attr_v
+
+        if not sep_found:
+            cp_name = find_text_anywhere("CombineParameterName", "")
+            if cp_name and len(tokens) > 1:
+                for candidate in ["-", "_", ".", " "]:
+                    if candidate.join(tokens) == cp_name:
+                        sep_found = candidate
+                        break
+                if not sep_found:
+                    first_t = tokens[0]
+                    if first_t in cp_name:
+                        idx = cp_name.find(first_t) + len(first_t)
+                        if idx < len(cp_name):
+                            sep_found = cp_name[idx]
+
+        if sep_found:
+            separator = sep_found
+
+        if tokens:
+            return dict(
+                tokens=tokens,
+                separator=separator,
+                prefix=prefix,
+                suffix=suffix,
+                remove_spaces=remove_spaces,
+                upper=upper,
+                do_sanitize=do_sanitize
+            )
+
+    # 3. ExportProfile XML (<NamingTemplate>)
+    naming_template_text = find_text_anywhere("NamingTemplate", "")
+    if naming_template_text:
+        found_tokens = re.findall(r'\{(?:\w+:)?([^}]+)\}', naming_template_text)
+        if found_tokens:
+            tokens = [t.strip() for t in found_tokens]
+            template_pattern = re.sub(r'\{(?:\w+:)?([^}]+)\}', 'TOKEN', naming_template_text)
+            sep_match = re.search(r'TOKEN([^\w\s])TOKEN', template_pattern)
+            if sep_match:
+                separator = sep_match.group(1)
+
+            return dict(
+                tokens=tokens,
+                separator=separator,
+                prefix=prefix,
+                suffix=suffix,
+                remove_spaces=remove_spaces,
+                upper=upper,
+                do_sanitize=do_sanitize
+            )
+
+    # 4. Generic XML Fallback
+    for elem in root.iter():
+        tag = strip_ns(elem.tag)
+        if tag in ("Parameter", "ParameterName", "Param", "Field", "Token"):
+            if elem.text and elem.text.strip():
+                txt = elem.text.strip()
+                if txt not in tokens and "<" not in txt:
+                    tokens.append(txt)
+
+    return dict(
+        tokens=tokens,
+        separator=find_text_anywhere("Separator", "_"),
+        prefix=find_text_anywhere("Prefix", ""),
+        suffix=find_text_anywhere("Suffix", ""),
+        remove_spaces=find_flag_anywhere("RemoveSpaces"),
+        upper=find_flag_anywhere("Uppercase"),
+        do_sanitize=find_flag_anywhere("Sanitize", True)
+    )
 
 
 # --------------------------------------------------------------------------- #
