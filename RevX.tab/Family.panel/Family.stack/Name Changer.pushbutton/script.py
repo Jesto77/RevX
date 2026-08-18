@@ -126,16 +126,20 @@ for fam in FilteredElementCollector(doc).OfClass(Family).ToElements():
         {'id': fam.Id, 'name': fam.Name, 'kind': 'family'})
 
 # ---- system family types
-for et in FilteredElementCollector(doc).OfClass(ElementType).ToElements():
+for et in FilteredElementCollector(doc).WhereElementIsElementType() \
+        .ToElements():
+
+    if not isinstance(et, ElementType):
+        continue
+
     if isinstance(et, FamilySymbol):
         continue
 
     cat = et.Category
-    if cat is None:
-        continue
 
     try:
-        if cat.CategoryType != CategoryType.Model:
+        if cat is not None and cat.CategoryType not in (
+                CategoryType.Model, CategoryType.Annotation):
             continue
     except Exception:
         pass
@@ -150,9 +154,9 @@ for et in FilteredElementCollector(doc).OfClass(ElementType).ToElements():
         fam_name = ''
 
     try:
-        cat_key = cat.Name
+        cat_key = cat.Name if cat is not None else "<no category>"
     except Exception:
-        continue
+        cat_key = "<no category>"
 
     items_by_cat.setdefault(cat_key, []).append(
         {'id': et.Id, 'name': type_name, 'kind': 'type',
