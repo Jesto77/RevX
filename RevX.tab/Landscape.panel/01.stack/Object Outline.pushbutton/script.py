@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FloorToFilledRegion.py  (v7 - per-element transactions + arc tessellation)
+Surface Pattern Region (v8 - Robust Crash-Proof Floor Boundary Extractor)
 -------------------------------------------------------------------------------
 PyRevit Script: Creates filled regions from the topmost compound-structure
 layer of Floors, Roofs, Ceilings, and Toposolids.
@@ -9,18 +9,7 @@ FilledRegionType naming rule:
   "<ElementTypeName> (Layout)"
   e.g.  "LA_Paving type-IF1"  ->  "LA_Paving type-IF1 (Layout)"
 
-Compatible: Revit 2018-2027+  |  IronPython 2.7 (PyRevit)
-
-Changes in v7 (vs v6):
-  - Each element now processed in its OWN sub-transaction so a Revit
-    sketch-constraint failure on one floor cannot crash all others
-  - Arc/curve tessellation fallback: if a loop with arcs causes a
-    constraint error, arcs are converted to short line segments
-    (tessellate_loop_to_lines) and retried - fixes curved floors in Revit 2026
-  - Three-tier placement strategy per element:
-      Tier 1: all loops together with original curves
-      Tier 2: all loops together with arcs tessellated to lines
-      Tier 3: each loop individually (tessellated) as last resort
+Compatible: Revit 2023 - 2027+  |  IronPython 2.7 (PyRevit) / Pythonnet CPython
 """
 
 __title__  = "Surface Pattern Region"
@@ -32,21 +21,25 @@ __doc__    = (
 )
 
 import sys
+import math
 import traceback
 
 import clr
 clr.AddReference("RevitAPI")
 clr.AddReference("RevitAPIUI")
+clr.AddReference("System")
+
+from System.Collections.Generic import List
 
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
     Floor, RoofBase, Ceiling,
     FilledRegionType, FilledRegion,
-    CurveLoop, Transaction, ElementId, Options,
+    CurveLoop, Transaction, ElementId, Options, XYZ, Line, Arc, UV
 )
 
-# ISelectionFilter / ObjectType - handle both old and new import paths
+# Selection imports compatibility across Revit versions
 try:
     from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 except ImportError:
@@ -54,7 +47,7 @@ except ImportError:
         from Autodesk.Revit.UI import ISelectionFilter, ObjectType
     except ImportError:
         from Autodesk.Revit.UI.Selection import ObjectType
-        ISelectionFilter = object  # fallback stub
+        ISelectionFilter = object
 
 from Autodesk.Revit.Exceptions import OperationCanceledException
 
@@ -76,20 +69,28 @@ SUFFIX = " (Layout)"
 # Revit version detection
 # ---------------------------------------------------------------------------
 try:
-    _ver_str = doc.Application.VersionNumber          # e.g. "2026"
+    _ver_str = doc.Application.VersionNumber
     REVIT_VERSION = int(_ver_str)
 except Exception:
-    REVIT_VERSION = 2024   # safe fallback
+    REVIT_VERSION = 2024
 
+# Minimum curve length based on Revit's internal short curve tolerance (~0.00256 ft)
+try:
+    SHORT_CURVE_TOLERANCE = doc.Application.ShortCurveTolerance
+except Exception:
+    SHORT_CURVE_TOLERANCE = 0.00256
+
+MIN_CURVE_LEN = max(0.003, SHORT_CURVE_TOLERANCE * 1.05)
+GAP_TOLERANCE = 0.02   # Max gap in feet to consider vertices connected (~6mm)
 
 # =============================================================================
 # COMPAT HELPER: ElementId integer value
-# IntegerValue was deprecated in 2024 and removed in 2026.
-# Use .Value (Python int/long) when available.
 # =============================================================================
 
 def element_id_to_int(eid):
-    """Return the integer value of an ElementId regardless of Revit version."""
+    """Return the integer value of an ElementId regardless of Revit version (2023-2027+)."""
+    if eid is None:
+        return -1
     try:
         return int(eid.Value)          # Revit 2024+
     except AttributeError:
@@ -98,18 +99,12 @@ def element_id_to_int(eid):
         except Exception:
             return -1
 
-
 # =============================================================================
 # TYPE NAME EXTRACTION
 # =============================================================================
 
 def get_type_name(element):
-    """
-    Return the Type name of a system-family element.
-    Tries multiple API paths so it works across all Revit versions.
-    """
-
-    # 1. ElementType.Name
+    """Return the Type name of a system-family element."""
     try:
         etype = doc.GetElement(element.GetTypeId())
         if etype is not None:
@@ -119,7 +114,6 @@ def get_type_name(element):
     except Exception:
         pass
 
-    # 2. ALL_MODEL_TYPE_NAME on the type
     try:
         etype = doc.GetElement(element.GetTypeId())
         if etype is not None:
@@ -131,7 +125,6 @@ def get_type_name(element):
     except Exception:
         pass
 
-    # 3. SYMBOL_NAME_PARAM on the type
     try:
         etype = doc.GetElement(element.GetTypeId())
         if etype is not None:
@@ -143,7 +136,6 @@ def get_type_name(element):
     except Exception:
         pass
 
-    # 4. ELEM_TYPE_PARAM on the instance
     try:
         p = element.get_Parameter(DB.BuiltInParameter.ELEM_TYPE_PARAM)
         if p is not None:
@@ -153,17 +145,6 @@ def get_type_name(element):
     except Exception:
         pass
 
-    # 5. SYMBOL_NAME_PARAM on the instance
-    try:
-        p = element.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
-        if p is not None:
-            v = p.AsString()
-            if v and v.strip():
-                return v.strip()
-    except Exception:
-        pass
-
-    # 6. element.Name
     try:
         n = element.Name
         if n and n.strip() and not n.strip().isdigit():
@@ -171,9 +152,7 @@ def get_type_name(element):
     except Exception:
         pass
 
-    # 7. Absolute fallback - use compat helper instead of IntegerValue
     return "UnknownType_{}".format(element_id_to_int(element.Id))
-
 
 # =============================================================================
 # ELEMENT SUPPORT CHECK
@@ -188,7 +167,6 @@ def is_supported(element):
         return True
     return False
 
-
 # =============================================================================
 # TOP LAYER MATERIAL
 # =============================================================================
@@ -197,7 +175,6 @@ def get_top_layer_material(element):
     """
     Walk CompoundStructure and return the Material of the topmost
     exterior/finish layer that has a valid material assigned.
-    Falls back to element material parameters for Toposolids.
     """
     try:
         etype = doc.GetElement(element.GetTypeId())
@@ -229,7 +206,6 @@ def get_top_layer_material(element):
     except Exception:
         pass
 
-    # Fallback for Toposolid / no compound structure
     for bip in [
         DB.BuiltInParameter.MATERIAL_ID_PARAM,
         DB.BuiltInParameter.STRUCTURAL_MATERIAL_PARAM,
@@ -247,7 +223,6 @@ def get_top_layer_material(element):
 
     return None
 
-
 # =============================================================================
 # SURFACE PATTERN EXTRACTION
 # =============================================================================
@@ -257,7 +232,6 @@ def get_surface_pattern(material, foreground=True):
     if material is None:
         return None, None
 
-    # Revit 2019+ dual-pattern API
     try:
         if foreground:
             pid   = material.SurfaceForegroundPatternId
@@ -271,7 +245,6 @@ def get_surface_pattern(material, foreground=True):
     except AttributeError:
         pass
 
-    # Revit 2018 single-pattern API
     try:
         pid   = material.SurfacePatternId
         color = material.SurfacePatternColor
@@ -283,56 +256,51 @@ def get_surface_pattern(material, foreground=True):
     except Exception:
         return None, None
 
-
 # =============================================================================
-# BOUNDARY EXTRACTION
+# VIEW Z ELEVATION
 # =============================================================================
 
-def _from_get_profile(element):
-    """GetProfile() - present on some element types, removed/changed in 2026+."""
-    # Only attempt on Revit versions where it's reliable
-    if REVIT_VERSION >= 2026:
-        return []
+def get_view_z(v):
+    """Get the active view plane Z coordinate for coplanar 2D projection."""
     try:
-        p = element.GetProfile()
-        if p and len(p) > 0:
-            return list(p)
+        if v.GenLevel is not None:
+            return v.GenLevel.Elevation
     except Exception:
         pass
-    return []
+    try:
+        return v.Origin.Z
+    except Exception:
+        pass
+    return 0.0
 
+# =============================================================================
+# GEOMETRY & BOUNDARY EXTRACTION
+# =============================================================================
 
-def _from_sketch(element):
+def extract_raw_curves(element):
     """
-    Extract boundary from the element's Sketch.
-    SketchId property was removed in Revit 2026; use GetSketchId() or
-    fall back to SubElements / SpanDirection API.
+    Extract all boundary curves from an element using Sketch, Profile,
+    or Solid Geometry faces. Returns a flat list of DB.Curve objects.
     """
-    loops = []
+    raw_curves = []
 
-    # --- Method A: SketchId property (Revit 2018-2025) ---
+    # 1. Try Sketch
     sketch = None
     try:
-        sid = element.SketchId
-        if element_id_to_int(sid) != element_id_to_int(ElementId.InvalidElementId):
+        sid = element.SketchId if hasattr(element, "SketchId") else None
+        if sid and element_id_to_int(sid) != element_id_to_int(ElementId.InvalidElementId):
             sketch = doc.GetElement(sid)
-    except AttributeError:
-        pass   # property gone in 2026+
     except Exception:
         pass
 
-    # --- Method B: GetSketchId() method (Revit 2026+) ---
     if sketch is None:
         try:
             sid = element.GetSketchId()
             if element_id_to_int(sid) != element_id_to_int(ElementId.InvalidElementId):
                 sketch = doc.GetElement(sid)
-        except AttributeError:
-            pass
         except Exception:
             pass
 
-    # --- Method C: look for sketch via dependents (last resort) ---
     if sketch is None:
         try:
             dep_ids = element.GetDependentElements(None)
@@ -344,485 +312,268 @@ def _from_sketch(element):
         except Exception:
             pass
 
-    if sketch is None:
-        return loops
+    if sketch is not None:
+        try:
+            for arr in sketch.Profile:
+                for c in arr:
+                    if c is not None:
+                        raw_curves.append(c)
+            if raw_curves:
+                return raw_curves
+        except Exception:
+            pass
 
-    # Pull loops from sketch Profile
-    try:
-        for arr in sketch.Profile:
-            cl = CurveLoop()
-            for c in arr:
-                cl.Append(c)
-            loops.append(cl)
-    except Exception:
-        pass
+    # 2. Try GetProfile()
+    if REVIT_VERSION < 2026:
+        try:
+            prof = element.GetProfile()
+            if prof:
+                for lp in prof:
+                    for c in lp:
+                        raw_curves.append(c)
+                if raw_curves:
+                    return raw_curves
+        except Exception:
+            pass
 
-    return loops
-
-
-def _find_best_face(solid, upward):
-    """
-    Return the topmost (upward=True) or bottommost (upward=False) face
-    whose normal is within 5 degrees of vertical.
-    """
-    best_z    = None
-    best_face = None
-    try:
-        for face in solid.Faces:
-            try:
-                n = face.ComputeNormal(DB.UV(0.5, 0.5))
-                target = 1.0 if upward else -1.0
-                if abs(n.Z - target) < 0.09:   # ~5 degrees
-                    bb  = face.GetBoundingBox()
-                    mid = face.Evaluate(
-                        DB.UV(
-                            (bb.Min.U + bb.Max.U) * 0.5,
-                            (bb.Min.V + bb.Max.V) * 0.5
-                        )
-                    )
-                    z = mid.Z
-                    if best_z is None:
-                        best_z    = z
-                        best_face = face
-                    elif upward and z > best_z:
-                        best_z    = z
-                        best_face = face
-                    elif not upward and z < best_z:
-                        best_z    = z
-                        best_face = face
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return best_face
-
-
-def _from_geometry(element, upward=True):
-    """Extract boundary loops from solid geometry - works on all versions."""
-    loops     = []
-    best_z    = None
-    best_face = None
+    # 3. Try Solid Geometry
+    upward = not isinstance(element, Ceiling)
+    solids = []
 
     try:
         opts = Options()
         opts.ComputeReferences = False
-        # In Revit 2026+ the default detail level may differ; set explicitly
         try:
             opts.DetailLevel = DB.ViewDetailLevel.Fine
         except Exception:
             pass
 
         geom = element.get_Geometry(opts)
-        if geom is None:
-            return loops
+        if geom is not None:
+            def _collect_solids(g_elem):
+                collected = []
+                for obj in g_elem:
+                    if obj is None:
+                        continue
+                    if isinstance(obj, DB.Solid):
+                        if obj.Volume > 0.0001:
+                            collected.append(obj)
+                    elif hasattr(obj, "GetInstanceGeometry"):
+                        try:
+                            ig = obj.GetInstanceGeometry()
+                            if ig is not None:
+                                collected.extend(_collect_solids(ig))
+                        except Exception:
+                            pass
+                return collected
 
-        for obj in geom:
-            if obj is None:
-                continue
+            solids = _collect_solids(geom)
+    except Exception:
+        solids = []
 
-            # Collect solid candidates
-            solids = []
-            try:
-                inst_geom = obj.GetInstanceGeometry()
-                if inst_geom is not None:
-                    solids = [s for s in inst_geom if s is not None]
-            except AttributeError:
-                pass
+    best_face = None
+    best_z = None
 
-            if not solids:
-                # obj itself may be a Solid
+    for s in solids:
+        try:
+            for face in s.Faces:
                 try:
-                    if obj.Volume > 0:
-                        solids = [obj]
-                except Exception:
-                    solids = [obj]
+                    if isinstance(face, DB.PlanarFace):
+                        norm = face.FaceNormal
+                        z = face.Origin.Z
+                    else:
+                        norm = face.ComputeNormal(UV(0.5, 0.5))
+                        bb = face.GetBoundingBox()
+                        mid_uv = UV((bb.Min.U + bb.Max.U) * 0.5, (bb.Min.V + bb.Max.V) * 0.5)
+                        z = face.Evaluate(mid_uv).Z
 
-            for solid in solids:
-                face = _find_best_face(solid, upward)
-                if face is not None:
-                    try:
-                        bb  = face.GetBoundingBox()
-                        mid = face.Evaluate(
-                            DB.UV(
-                                (bb.Min.U + bb.Max.U) * 0.5,
-                                (bb.Min.V + bb.Max.V) * 0.5
-                            )
-                        )
-                        z = mid.Z
+                    target_z = 1.0 if upward else -1.0
+                    if abs(norm.Z - target_z) < 0.1:  # ~5 degrees vertical
                         if best_z is None:
-                            best_z    = z
+                            best_z = z
                             best_face = face
                         elif upward and z > best_z:
-                            best_z    = z
+                            best_z = z
                             best_face = face
                         elif not upward and z < best_z:
-                            best_z    = z
+                            best_z = z
                             best_face = face
-                    except Exception:
-                        pass
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
-        if best_face is not None:
+    if best_face is not None:
+        try:
             for lp in best_face.GetEdgesAsCurveLoops():
-                loops.append(lp)
+                for c in lp:
+                    raw_curves.append(c)
+        except Exception:
+            pass
 
-    except Exception:
-        pass
-    return loops
-
-
-def get_boundary_loops(element):
-    upward = not isinstance(element, Ceiling)
-
-    loops = _from_get_profile(element)
-    if loops:
-        return loops
-
-    loops = _from_sketch(element)
-    if loops:
-        return loops
-
-    loops = _from_geometry(element, upward)
-    return loops
-
+    return raw_curves
 
 # =============================================================================
-# LOOP SANITISATION
-# Revit's FilledRegion.Create() is strict:
-#   - Every CurveLoop must be closed (end of last curve == start of first)
-#   - No duplicate / zero-length curves
-#   - Curves must be co-planar with the view's sketch plane
-#   - No self-intersections
-# Floors with openings, sloped edges, or imported geometry often violate these.
+# TESSELLATION & FLATTENING
 # =============================================================================
 
-# Revit's internal tolerance is ~1/16" = 0.00521 ft.
-# We use a slightly larger snap tolerance for gap closing.
-CURVE_MIN_LENGTH = 0.001      # feet  – curves shorter than this are degenerate
-GAP_TOLERANCE    = 0.01       # feet  – max gap to snap when rebuilding a loop
-
-
-def _pt_key(pt, tol=0.001):
-    """Round a point to a grid so nearby points hash the same."""
-    scale = 1.0 / tol
-    return (
-        int(round(pt.X * scale)),
-        int(round(pt.Y * scale)),
-        int(round(pt.Z * scale)),
-    )
-
-
-def _pts_equal(a, b, tol=GAP_TOLERANCE):
-    d = a - b
-    return (d.X * d.X + d.Y * d.Y + d.Z * d.Z) ** 0.5 < tol
-
-
-def _flatten_curve(curve, z_ref):
+def tessellate_and_flatten(curves, z_target):
     """
-    Project a curve onto the horizontal plane at z_ref.
-    Returns a new curve or the original if already planar / projection fails.
-    Handles Line and Arc; other types are left unchanged.
+    Tessellate all curves (lines, arcs, splines) into straight 2D DB.Line segments
+    lying strictly on the z_target elevation plane.
     """
-    try:
-        sp = curve.GetEndPoint(0)
-        ep = curve.GetEndPoint(1)
-        if abs(sp.Z - z_ref) < 0.0001 and abs(ep.Z - z_ref) < 0.0001:
-            return curve   # already on plane - fast path
+    flat_lines = []
 
-        sp2 = DB.XYZ(sp.X, sp.Y, z_ref)
-        ep2 = DB.XYZ(ep.X, ep.Y, z_ref)
-
-        if isinstance(curve, DB.Line):
-            if _pts_equal(sp2, ep2, CURVE_MIN_LENGTH):
-                return None   # collapses to a point
-            return DB.Line.CreateBound(sp2, ep2)
-
-        if isinstance(curve, DB.Arc):
-            mid_param = (curve.GetEndParameter(0) + curve.GetEndParameter(1)) * 0.5
-            mp  = curve.Evaluate(mid_param, False)
-            mp2 = DB.XYZ(mp.X, mp.Y, z_ref)
-            try:
-                return DB.Arc.Create(sp2, ep2, mp2)
-            except Exception:
-                # Arc degenerates; replace with a line
-                if not _pts_equal(sp2, ep2, CURVE_MIN_LENGTH):
-                    return DB.Line.CreateBound(sp2, ep2)
-                return None
-
-    except Exception:
-        pass
-    return curve
-
-
-def _remove_short_curves(curves):
-    """Drop curves shorter than CURVE_MIN_LENGTH."""
-    good = []
     for c in curves:
+        if c is None:
+            continue
         try:
-            if c.Length >= CURVE_MIN_LENGTH:
-                good.append(c)
+            # Determine sample points along the curve
+            t0 = c.GetEndParameter(0)
+            t1 = c.GetEndParameter(1)
+
+            if isinstance(c, Line):
+                n_samples = 1
+            elif isinstance(c, Arc):
+                arc_len = abs(t1 - t0)
+                n_samples = max(4, int(math.ceil(arc_len / (math.pi / 16.0))))  # ~32 segs per full circle
+            else:
+                n_samples = 8  # Splines, Ellipses, etc.
+
+            pts = []
+            for i in range(n_samples + 1):
+                t = t0 + (t1 - t0) * (float(i) / float(n_samples))
+                eval_pt = c.Evaluate(t, False)
+                pts.append(XYZ(eval_pt.X, eval_pt.Y, z_target))
+
+            for i in range(len(pts) - 1):
+                p1 = pts[i]
+                p2 = pts[i + 1]
+                if p1.DistanceTo(p2) >= MIN_CURVE_LEN:
+                    flat_lines.append(Line.CreateBound(p1, p2))
         except Exception:
-            good.append(c)
-    return good
+            continue
 
+    return flat_lines
 
-def _remove_duplicates(curves):
-    """
-    Remove curves whose (start_key, end_key) pair already appeared
-    (checks both orientations).
-    """
-    seen = set()
-    good = []
-    for c in curves:
-        try:
-            sk = _pt_key(c.GetEndPoint(0))
-            ek = _pt_key(c.GetEndPoint(1))
-            key_fwd = (sk, ek)
-            key_rev = (ek, sk)
-            if key_fwd not in seen and key_rev not in seen:
-                seen.add(key_fwd)
-                good.append(c)
-        except Exception:
-            good.append(c)
-    return good
+# =============================================================================
+# CHAINING & LOOP CLOSURE
+# =============================================================================
 
+def chain_lines_to_loops(lines, z_target):
+    """
+    Group unordered flat DB.Line segments into closed, continuous CurveLoops.
+    Guarantees bitwise-exact vertex matches between adjacent segments and loop closure.
+    """
+    if not lines:
+        return []
 
-def _chain_curves(curves):
-    """
-    Try to form one or more closed CurveLoops from an unordered list of curves.
-    Uses a greedy next-segment search with GAP_TOLERANCE snapping.
-    Returns a list of CurveLoop objects (only the closed ones).
-    """
-    remaining = list(curves)
+    remaining = list(lines)
     closed_loops = []
 
+    def pts_near(pA, pB):
+        return pA.DistanceTo(pB) <= GAP_TOLERANCE
+
     while remaining:
-        # Start a new chain with the first remaining curve
-        chain  = [remaining.pop(0)]
+        first_line = remaining.pop(0)
+        # Chain of XYZ points forming the polygon
+        poly_pts = [first_line.GetEndPoint(0), first_line.GetEndPoint(1)]
         changed = True
 
-        while changed:
+        while changed and remaining:
             changed = False
-            tail = chain[-1].GetEndPoint(1)
+            tail = poly_pts[-1]
 
-            for i, cand in enumerate(remaining):
-                sp = cand.GetEndPoint(0)
-                ep = cand.GetEndPoint(1)
+            for i, line in enumerate(remaining):
+                sp = line.GetEndPoint(0)
+                ep = line.GetEndPoint(1)
 
-                if _pts_equal(tail, sp):
-                    chain.append(remaining.pop(i))
+                if pts_near(tail, sp):
+                    poly_pts.append(ep)
+                    remaining.pop(i)
                     changed = True
                     break
-                if _pts_equal(tail, ep):
-                    # append reversed
-                    try:
-                        chain.append(cand.CreateReversed())
-                    except Exception:
-                        chain.append(cand)
+                elif pts_near(tail, ep):
+                    poly_pts.append(sp)
                     remaining.pop(i)
                     changed = True
                     break
 
-        # Check if chain closes
-        if len(chain) >= 3:
-            head = chain[0].GetEndPoint(0)
-            tail = chain[-1].GetEndPoint(1)
-            if _pts_equal(head, tail):
-                cl = CurveLoop()
-                ok = True
-                for c in chain:
-                    try:
-                        cl.Append(c)
-                    except Exception:
-                        ok = False
-                        break
-                if ok:
-                    closed_loops.append(cl)
+        # Check loop closure: tail near head
+        if len(poly_pts) >= 4:  # At least 3 segments (4 points counting start/end)
+            head = poly_pts[0]
+            tail = poly_pts[-1]
+
+            if pts_near(head, tail):
+                # Force last point to match head exactly
+                poly_pts[-1] = head
+
+                # Filter duplicate/micro points
+                clean_pts = [poly_pts[0]]
+                for pt in poly_pts[1:]:
+                    if pt.DistanceTo(clean_pts[-1]) >= MIN_CURVE_LEN:
+                        clean_pts.append(pt)
+
+                # Ensure closing point matches first
+                if clean_pts[0].DistanceTo(clean_pts[-1]) > 0.0001:
+                    clean_pts.append(clean_pts[0])
+
+                if len(clean_pts) >= 4:
+                    cl = CurveLoop()
+                    ok = True
+                    for k in range(len(clean_pts) - 1):
+                        p_start = clean_pts[k]
+                        p_end   = clean_pts[k + 1]
+                        if p_start.DistanceTo(p_end) >= MIN_CURVE_LEN:
+                            try:
+                                seg = Line.CreateBound(p_start, p_end)
+                                cl.Append(seg)
+                            except Exception:
+                                ok = False
+                                break
+
+                    if ok and is_valid_loop(cl):
+                        closed_loops.append(cl)
 
     return closed_loops
 
-
-def _extract_curves_from_loop(loop):
-    """Iterate a CurveLoop and return its curves as a plain list."""
-    curves = []
-    try:
-        it = loop.GetEnumerator()
-        while it.MoveNext():
-            curves.append(it.Current)
-    except Exception:
-        try:
-            for c in loop:
-                curves.append(c)
-        except Exception:
-            pass
-    return curves
-
-
-def sanitize_loops(raw_loops, view_normal_z=1.0):
-    """
-    Given a list of CurveLoop objects (from any extraction method) return
-    a cleaned list ready for FilledRegion.Create().
-
-    Strategy:
-      1. Collect all curves from all loops into one pool.
-      2. Flatten to the view plane (z = 0 in view coords; we use z=0 for
-         drafting / use the average Z of the raw curves for model views).
-      3. Drop degenerate and duplicate curves.
-      4. Re-chain into closed loops.
-      5. Return only valid closed loops (>= 3 segments).
-
-    If re-chaining fails we fall back to returning the raw loops as-is
-    (original behaviour) so we never make things worse.
-    """
-    if not raw_loops:
-        return raw_loops
-
-    # Step 1: collect all curves
-    all_curves = []
-    for loop in raw_loops:
-        all_curves.extend(_extract_curves_from_loop(loop))
-
-    if not all_curves:
-        return raw_loops
-
-    # Step 2: determine reference Z (average of all endpoints)
-    try:
-        zs = []
-        for c in all_curves:
-            try:
-                zs.append(c.GetEndPoint(0).Z)
-                zs.append(c.GetEndPoint(1).Z)
-            except Exception:
-                pass
-        z_ref = sum(zs) / len(zs) if zs else 0.0
-    except Exception:
-        z_ref = 0.0
-
-    # Step 3: flatten
-    flat = []
-    for c in all_curves:
-        fc = _flatten_curve(c, z_ref)
-        if fc is not None:
-            flat.append(fc)
-
-    # Step 4: clean
-    flat = _remove_short_curves(flat)
-    flat = _remove_duplicates(flat)
-
-    if not flat:
-        return raw_loops   # nothing survived - return originals
-
-    # Step 5: re-chain
-    closed = _chain_curves(flat)
-
-    if closed:
-        return closed
-
-    # Fallback: raw loops unchanged
-    return raw_loops
-
-
 # =============================================================================
-# ARC TESSELLATION
-# Revit 2026 rejects arcs in FilledRegion sketch loops when the arc was
-# extracted from 3D geometry (the constraint solver cannot resolve the
-# implicit tangent constraints). Fix: approximate arcs as short lines.
+# LOOP VALIDATION & ORIENTATION
 # =============================================================================
 
-ARC_TESSELLATION_SEGMENTS = 32   # segments per full circle; arc gets proportional share
-
-
-def tessellate_curve(curve, segments=ARC_TESSELLATION_SEGMENTS):
-    """
-    Convert a single curve to a list of DB.Line segments.
-    Lines are returned as-is (one-element list).
-    Arcs, ellipses, splines etc. are sampled into straight segments.
-    """
+def is_valid_loop(cl):
+    """Check if CurveLoop is strictly valid for Revit's FilledRegion engine."""
+    if cl is None:
+        return False
     try:
-        if isinstance(curve, DB.Line):
-            return [curve]
+        if cl.IsOpen():
+            return False
+    except Exception:
+        pass
+    try:
+        if cl.HasOpenBounds():
+            return False
     except Exception:
         pass
 
-    lines = []
-    try:
-        t0 = curve.GetEndParameter(0)
-        t1 = curve.GetEndParameter(1)
+    curves = list(cl)
+    if len(curves) < 3:
+        return False
 
-        # For arcs: scale segment count by arc fraction of full circle
-        try:
-            if isinstance(curve, DB.Arc):
-                import math
-                arc_angle = abs(t1 - t0)          # radians
-                n = max(3, int(round(segments * arc_angle / (2.0 * math.pi))))
-            else:
-                n = segments
-        except Exception:
-            n = segments
-
-        pts = []
-        for i in range(n + 1):
-            t = t0 + (t1 - t0) * i / float(n)
-            try:
-                pts.append(curve.Evaluate(t, False))
-            except Exception:
-                pass
-
-        for i in range(len(pts) - 1):
-            try:
-                sp = pts[i]
-                ep = pts[i + 1]
-                if not _pts_equal(sp, ep, CURVE_MIN_LENGTH):
-                    lines.append(DB.Line.CreateBound(sp, ep))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return lines if lines else [curve]   # return original if tessellation failed
-
-
-def tessellate_loop(loop):
-    """
-    Return a new CurveLoop where every non-Line curve has been replaced
-    by tessellated line segments. Returns None if the result is not a
-    valid closed loop.
-    """
-    curves = _extract_curves_from_loop(loop)
-    new_curves = []
     for c in curves:
-        new_curves.extend(tessellate_curve(c))
+        try:
+            if c.Length < SHORT_CURVE_TOLERANCE:
+                return False
+        except Exception:
+            return False
 
-    new_curves = _remove_short_curves(new_curves)
-    if len(new_curves) < 3:
-        return None
-
-    # Re-chain to ensure closure after tessellation
-    chained = _chain_curves(new_curves)
-    if not chained:
-        return None
-
-    # Return the largest loop (outer boundary)
-    chained.sort(key=lambda lp: _loop_approx_area(lp), reverse=True)
-    return chained[0]
+    return True
 
 
-def tessellate_loops(loops):
-    """Tessellate every loop in the list; skip loops that fail."""
-    result = []
-    for lp in loops:
-        tl = tessellate_loop(lp)
-        if tl is not None:
-            result.append(tl)
-    return result if result else loops   # fallback to originals
-
-
-def _loop_approx_area(loop):
-    """Rough shoelace area of a loop (ignores Z). Used for sorting only."""
+def loop_area_2d(cl):
+    """Calculate signed 2D shoelace area of a CurveLoop."""
     try:
-        pts = []
-        it = loop.GetEnumerator()
-        while it.MoveNext():
-            pts.append(it.Current.GetEndPoint(0))
+        pts = [c.GetEndPoint(0) for c in cl]
         n = len(pts)
         if n < 3:
             return 0.0
@@ -831,72 +582,105 @@ def _loop_approx_area(loop):
             j = (i + 1) % n
             area += pts[i].X * pts[j].Y
             area -= pts[j].X * pts[i].Y
-        return abs(area) * 0.5
+        return area * 0.5
     except Exception:
         return 0.0
 
 
+def point_in_polygon_2d(pt, poly_pts):
+    """Ray-casting algorithm to test if 2D point is inside a polygon of XYZ points."""
+    x, y = pt.X, pt.Y
+    inside = False
+    n = len(poly_pts)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly_pts[i].X, poly_pts[i].Y
+        xj, yj = poly_pts[j].X, poly_pts[j].Y
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / float(yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def orient_loops(loops):
+    """
+    Sort loops by area (descending) and set winding orientation:
+    - Outer islands: Counter-Clockwise (CCW)
+    - Holes inside islands: Clockwise (CW)
+    """
+    if not loops:
+        return []
+
+    # Sort loops by absolute area descending
+    sorted_loops = sorted(loops, key=lambda lp: abs(loop_area_2d(lp)), reverse=True)
+
+    normal_z = XYZ.BasisZ
+    final_loops = []
+
+    for i, cl in enumerate(sorted_loops):
+        # Extract points for containment testing
+        pts_i = [c.GetEndPoint(0) for c in cl]
+        test_pt = pts_i[0]
+
+        # Count how many larger loops contain this loop's test point
+        containment_depth = 0
+        for j in range(i):
+            pts_j = [c.GetEndPoint(0) for c in sorted_loops[j]]
+            if point_in_polygon_2d(test_pt, pts_j):
+                containment_depth += 1
+
+        is_outer = (containment_depth % 2 == 0)  # Even depth = Island, Odd depth = Hole
+
+        try:
+            is_ccw = cl.IsCounterClockwise(normal_z)
+            if is_outer and not is_ccw:
+                cl.Flip()
+            elif not is_outer and is_ccw:
+                cl.Flip()
+        except Exception:
+            pass
+
+        final_loops.append(cl)
+
+    return final_loops
+
 # =============================================================================
-# FILLED REGION TYPE - find by name then update, or create new
+# FILLED REGION TYPE MANAGEMENT
 # =============================================================================
 
 def _apply_patterns(frt, fg_pat, fg_col, bg_pat, bg_col):
-    """Apply patterns and colours to a FilledRegionType."""
-
+    """Apply surface patterns and colors to a FilledRegionType."""
     def safe_set(obj, attr, val):
         try:
             setattr(obj, attr, val)
         except Exception:
             pass
 
-    invalid = element_id_to_int(ElementId.InvalidElementId)
-
-    # Revit 2019+ dual-pattern API
     try:
         fg_id = fg_pat.Id if fg_pat is not None else ElementId.InvalidElementId
         bg_id = bg_pat.Id if bg_pat is not None else ElementId.InvalidElementId
         safe_set(frt, "ForegroundPatternId", fg_id)
         safe_set(frt, "BackgroundPatternId", bg_id)
-        if fg_col is not None:
-            try:
-                if fg_col.IsValid:
-                    safe_set(frt, "ForegroundPatternColor", fg_col)
-            except Exception:
-                pass
-        if bg_col is not None:
-            try:
-                if bg_col.IsValid:
-                    safe_set(frt, "BackgroundPatternColor", bg_col)
-            except Exception:
-                pass
+        if fg_col is not None and getattr(fg_col, "IsValid", True):
+            safe_set(frt, "ForegroundPatternColor", fg_col)
+        if bg_col is not None and getattr(bg_col, "IsValid", True):
+            safe_set(frt, "BackgroundPatternColor", bg_col)
         return
     except AttributeError:
         pass
 
-    # Revit 2018 single-pattern API
     if fg_pat is not None:
         safe_set(frt, "FillPatternId", fg_pat.Id)
-    if fg_col is not None:
-        try:
-            if fg_col.IsValid:
-                safe_set(frt, "Color", fg_col)
-        except Exception:
-            pass
+    if fg_col is not None and getattr(fg_col, "IsValid", True):
+        safe_set(frt, "Color", fg_col)
 
 
 def get_or_create_fr_type(name, fg_pat, fg_col, bg_pat, bg_col):
-    """Find FilledRegionType by name and update it, or create a new one."""
-    all_frt = list(
-        FilteredElementCollector(doc).OfClass(FilledRegionType).ToElements()
-    )
+    """Find FilledRegionType by name and update it, or duplicate to create a new one."""
+    all_frt = list(FilteredElementCollector(doc).OfClass(FilledRegionType).ToElements())
     if not all_frt:
-        forms.alert(
-            "No Filled Region Type exists in the project.\n"
-            "Create one manually first, then re-run.",
-            exitscript=True
-        )
+        forms.alert("No Filled Region Type exists in project. Create one manually first.", exitscript=True)
 
-    # Search by exact name
     for frt in all_frt:
         try:
             if frt.Name == name:
@@ -905,12 +689,9 @@ def get_or_create_fr_type(name, fg_pat, fg_col, bg_pat, bg_col):
         except Exception:
             continue
 
-    # Not found - duplicate first available and rename
-    # Duplicate() signature is stable; the result is a new ElementType
     try:
         new_frt = all_frt[0].Duplicate(name)
     except Exception:
-        # Last resort: duplicate with a temp name then rename
         import time
         temp_name = "_tmp_{}".format(int(time.time()))
         new_frt = all_frt[0].Duplicate(temp_name)
@@ -923,25 +704,18 @@ def get_or_create_fr_type(name, fg_pat, fg_col, bg_pat, bg_col):
     return new_frt
 
 
-# =============================================================================
-# DELETE EXISTING FILLED REGIONS BY TYPE NAME IN CURRENT VIEW
-# =============================================================================
-
-def delete_existing_filled_regions(fr_type_id):
-    """
-    Delete every FilledRegion in the active view whose type matches fr_type_id.
-    Called inside an open Transaction.
-    """
-    existing = FilteredElementCollector(doc, view.Id)\
-                   .OfClass(FilledRegion)\
-                   .ToElements()
+def delete_existing_filled_regions(fr_type_ids):
+    """Delete existing FilledRegions matching fr_type_ids in the active view once."""
+    if not fr_type_ids:
+        return
+    type_int_set = set(element_id_to_int(tid) for tid in fr_type_ids)
+    existing = FilteredElementCollector(doc, view.Id).OfClass(FilledRegion).ToElements()
     for fr in existing:
         try:
-            if element_id_to_int(fr.GetTypeId()) == element_id_to_int(fr_type_id):
+            if element_id_to_int(fr.GetTypeId()) in type_int_set:
                 doc.Delete(fr.Id)
         except Exception:
             pass
-
 
 # =============================================================================
 # SELECTION FILTER
@@ -953,7 +727,6 @@ class SupportedFilter(ISelectionFilter):
 
     def AllowReference(self, r, p):
         return False
-
 
 # =============================================================================
 # MAIN
@@ -970,17 +743,13 @@ def main():
         DB.ViewType.Elevation,
     ]
     if view.ViewType not in valid_vt:
-        forms.alert(
-            "Run this from a Plan, Section, Elevation, or Detail view.",
-            exitscript=True
-        )
+        forms.alert("Run this script from a Plan, Section, Elevation, or Detail view.", exitscript=True)
 
-    # Select elements
     try:
         refs = uidoc.Selection.PickObjects(
             ObjectType.Element,
             SupportedFilter(),
-            "Select Floors / Roofs / Ceilings / Toposolids, then Finish."
+            "Select Floors / Roofs / Ceilings / Toposolids, then press Finish."
         )
     except OperationCanceledException:
         sys.exit()
@@ -994,154 +763,122 @@ def main():
     if not elements:
         forms.alert("No supported elements in selection.", exitscript=True)
 
-    created = 0
-    skipped = []
+    z_view = get_view_z(view)
 
-    # ------------------------------------------------------------------
-    # STRATEGY (v8)
-    # Root cause: Revit 2026 constraint solver rejects FilledRegion loops
-    # that contain arcs extracted from geometry when openings are present.
-    # Fix:
-    #   1. ALWAYS tessellate every curve to lines (no arcs ever passed).
-    #   2. Classify loops as outer boundary vs inner holes by signed area
-    #      and sort them: largest (outer) first, holes after.
-    #   3. Use SubTransaction inside one outer Transaction so a single
-    #      failure is isolated without a blocking modal dialog.
-    #   4. Fallback: if combined placement fails, place outer loop only
-    #      (ignores holes) - better than nothing.
-    # ------------------------------------------------------------------
-
-    # Pass 1: prepare types and loops (one transaction for type creation)
-    type_map    = {}   # int(elem.Id) -> (fr_type, sorted_tess_loops, label)
-    prep_errors = []
+    # Preparation Pass: Types & Clean CurveLoops
+    prep_data = []
+    created_fr_types = set()
+    skipped_info = []
 
     with Transaction(doc, "FR - Prepare Types") as t_prep:
         t_prep.Start()
         for elem in elements:
-            label = "{} [{}]".format(
-                elem.GetType().Name, element_id_to_int(elem.Id)
-            )
+            label = "{} [{}]".format(elem.GetType().Name, element_id_to_int(elem.Id))
             try:
                 type_name    = get_type_name(elem)
                 fr_type_name = type_name + SUFFIX
-                mat            = get_top_layer_material(elem)
+                mat          = get_top_layer_material(elem)
                 fg_pat, fg_col = get_surface_pattern(mat, foreground=True)
                 bg_pat, bg_col = get_surface_pattern(mat, foreground=False)
-                fr_type = get_or_create_fr_type(
-                    fr_type_name, fg_pat, fg_col, bg_pat, bg_col
-                )
-                raw_loops = get_boundary_loops(elem)
-                if not raw_loops:
-                    prep_errors.append("{} - no boundary extracted".format(label))
+
+                fr_type = get_or_create_fr_type(fr_type_name, fg_pat, fg_col, bg_pat, bg_col)
+                created_fr_types.add(fr_type.Id)
+
+                raw_curves = extract_raw_curves(elem)
+                if not raw_curves:
+                    skipped_info.append("{} - could not extract geometry boundary".format(label))
                     continue
 
-                # Sanitize -> tessellate ALL curves to lines -> sort by area
-                clean   = sanitize_loops(raw_loops)
-                tessed  = tessellate_loops(clean)
-                # Sort: largest area first (outer boundary), smaller = holes
-                tessed.sort(key=lambda lp: _loop_approx_area(lp), reverse=True)
+                flat_lines = tessellate_and_flatten(raw_curves, z_view)
+                closed_loops = chain_lines_to_loops(flat_lines, z_view)
 
-                type_map[element_id_to_int(elem.Id)] = (fr_type, tessed, label)
+                if not closed_loops:
+                    skipped_info.append("{} - loop closure failed".format(label))
+                    continue
+
+                oriented_loops = orient_loops(closed_loops)
+                prep_data.append((elem, fr_type, oriented_loops, label))
             except Exception as ex:
-                prep_errors.append("{} - prep error: {}".format(label, str(ex)))
+                skipped_info.append("{} - error preparing: {}".format(label, str(ex)))
         t_prep.Commit()
 
-    skipped.extend(prep_errors)
+    # Clean up pre-existing filled regions of these types ONCE before placing
+    with Transaction(doc, "FR - Clear Existing") as t_clear:
+        t_clear.Start()
+        delete_existing_filled_regions(created_fr_types)
+        t_clear.Commit()
 
-    # Pass 2: place each element in its own outer Transaction.
-    # Inside that we use SubTransaction for the actual Create call so
-    # Revit's constraint failure is isolated and never shows a modal dialog.
-    for elem in elements:
-        eid = element_id_to_int(elem.Id)
-        if eid not in type_map:
-            continue
+    # Placement Pass: SubTransactions per element
+    created_count = 0
 
-        fr_type, tessed_loops, label = type_map[eid]
+    for elem, fr_type, oriented_loops, label in prep_data:
+        placed = False
 
-        def _place_with_subtx(loop_list, tx_name):
-            """
-            Try FilledRegion.Create inside a SubTransaction.
-            SubTransaction rolls back silently on failure - no modal dialog.
-            Returns True on success.
-            Must be called inside an already-started outer Transaction.
-            """
+        def try_create_fr(loops_to_place):
             stx = DB.SubTransaction(doc)
             stx.Start()
             try:
-                delete_existing_filled_regions(fr_type.Id)
-                FilledRegion.Create(doc, fr_type.Id, view.Id, loop_list)
-                stx.Commit()
-                return True
-            except Exception:
-                try:
-                    stx.RollBack()
-                except Exception:
-                    pass
-                return False
+                net_list = List[CurveLoop]()
+                for lp in loops_to_place:
+                    if is_valid_loop(lp):
+                        net_list.Add(lp)
 
-        placed = False
+                if net_list.Count > 0:
+                    FilledRegion.Create(doc, fr_type.Id, view.Id, net_list)
+                    stx.Commit()
+                    return True
+            except Exception:
+                pass
+            try:
+                stx.RollBack()
+            except Exception:
+                pass
+            return False
 
         with Transaction(doc, "FR - Place: {}".format(label)) as tx:
             tx.Start()
 
-            # Tier 1: all loops (boundary + holes), fully tessellated
-            if _place_with_subtx(tessed_loops, "all-loops"):
+            # Tier 1: All loops (Boundary + Holes)
+            if try_create_fr(oriented_loops):
                 placed = True
 
-            # Tier 2: outer boundary loop only (drop holes)
-            if not placed and tessed_loops:
-                outer = [tessed_loops[0]]
-                if _place_with_subtx(outer, "outer-only"):
+            # Tier 2: Outer Boundary only (Drop Holes if tier 1 fails)
+            if not placed and oriented_loops:
+                if try_create_fr([oriented_loops[0]]):
                     placed = True
-                    skipped.append(
-                        "{} - placed outer boundary only "
-                        "(holes skipped due to constraint error)".format(label)
-                    )
+                    skipped_info.append("{} - placed outer boundary only (holes skipped)".format(label))
 
-            # Tier 3: try each loop individually, collect whatever works
+            # Tier 3: Place loops individually
             if not placed:
-                ok_count = 0
-                for i, single_loop in enumerate(tessed_loops):
-                    stx = DB.SubTransaction(doc)
-                    stx.Start()
-                    try:
-                        if i == 0:
-                            # Only delete existing on first loop attempt
-                            delete_existing_filled_regions(fr_type.Id)
-                        FilledRegion.Create(
-                            doc, fr_type.Id, view.Id, [single_loop]
-                        )
-                        stx.Commit()
-                        ok_count += 1
-                    except Exception:
-                        try:
-                            stx.RollBack()
-                        except Exception:
-                            pass
-
-                if ok_count > 0:
+                indiv_success = 0
+                for lp in oriented_loops:
+                    if try_create_fr([lp]):
+                        indiv_success += 1
+                if indiv_success > 0:
                     placed = True
-                    skipped.append(
-                        "{} - placed {}/{} loops individually".format(
-                            label, ok_count, len(tessed_loops)
-                        )
-                    )
+                    skipped_info.append("{} - placed {}/{} loops individually".format(label, indiv_success, len(oriented_loops)))
 
             if placed:
                 tx.Commit()
-                created += 1
+                created_count += 1
             else:
                 tx.RollBack()
-                skipped.append(
-                    "{} - all placement tiers failed".format(label)
-                )
+                skipped_info.append("{} - all placement tiers failed".format(label))
 
+    # Final summary alert
+    msg = "Created {} Filled Region(s).".format(created_count)
+    if skipped_info:
+        msg += "\n\nSkipped / Warnings:\n" + "\n".join(skipped_info[:10])
+        if len(skipped_info) > 10:
+            msg += "\n...and {} more.".format(len(skipped_info) - 10)
+
+    forms.alert(msg, title="Surface Pattern Region", warn_icon=False if created_count > 0 else True)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         forms.alert(
-            "Unexpected error:\n{}\n\n{}".format(str(e), traceback.format_exc()),
+            "Unexpected script error:\n{}\n\n{}".format(str(e), traceback.format_exc()),
             title="Script Error"
         )
