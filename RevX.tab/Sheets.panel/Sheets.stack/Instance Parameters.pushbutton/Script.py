@@ -18,13 +18,48 @@ from System.Windows.Forms import (
     Keys, Panel, AnchorStyles,
     DataGridViewCellStyle, DataGridViewColumnHeadersHeightSizeMode,
     Clipboard, TextDataFormat, Label, DataGridViewEditMode, FlatStyle,
-    SortOrder, Padding
+    SortOrder, Padding, DataGridViewTriState, ScrollBars, TextRenderer,
+    DataGridViewContentAlignment, DataGridViewCellBorderStyle,
+    DataGridViewHeaderBorderStyle, BorderStyle, TextFormatFlags
 )
-from System.Drawing import Size, Font, FontStyle, Color, Point, ContentAlignment
+from System.Drawing import (
+    Size, Font, FontStyle, Color, Point, ContentAlignment, SolidBrush,
+    Rectangle, Pen
+)
 
 from pyrevit import revit, DB, forms, script
 
 doc = revit.doc
+
+
+# -----------------------------------------------------------------------------
+# THEME
+# -----------------------------------------------------------------------------
+
+class Theme(object):
+    """Cohesive, modern palette designed for Revit BIM workflows."""
+    BG = Color.FromArgb(245, 247, 250)
+    PANEL_BG = Color.FromArgb(255, 255, 255)
+    BORDER = Color.FromArgb(220, 224, 230)
+
+    HEADER_BG = Color.FromArgb(236, 240, 246)
+    HEADER_FG = Color.FromArgb(40, 50, 68)
+    HEADER_BORDER = Color.FromArgb(208, 214, 222)
+
+    FROZEN_HEADER_BG = Color.FromArgb(226, 234, 246)
+    FROZEN_BG = Color.FromArgb(242, 246, 252)
+    FROZEN_SEL = Color.FromArgb(195, 215, 245)
+
+    ROW_ALT = Color.FromArgb(248, 250, 253)
+    GRID_LINES = Color.FromArgb(228, 232, 238)
+
+    ACCENT = Color.FromArgb(0, 115, 210)
+    ACCENT_TEXT = Color.White
+
+    TEXT = Color.FromArgb(35, 42, 52)
+    SUBTEXT = Color.FromArgb(100, 110, 125)
+
+    FONT_FAMILY = "Segoe UI"
 
 
 # -----------------------------------------------------------------------------
@@ -148,11 +183,28 @@ def get_sheet_of_titleblock(tb):
     return sheet_number, sheet_name
 
 
+def estimate_column_width(text, font):
+    """Measure how wide `text` needs to render in `font` with padding."""
+    try:
+        measured = TextRenderer.MeasureText(text, font).Width
+    except Exception:
+        measured = 8 * len(text)
+    width = measured + 32
+    if width < 120:
+        width = 120
+    if width > 240:
+        width = 240
+    return width
+
+
 # -----------------------------------------------------------------------------
 # GUI - EDIT TABLE
 # -----------------------------------------------------------------------------
 
 class EditTableForm(Form):
+
+    HEADER_HEIGHT = 46
+    ROW_HEIGHT = 28
 
     def __init__(self, titleblocks, parameter_names):
         self.titleblocks = titleblocks
@@ -160,104 +212,169 @@ class EditTableForm(Form):
         self.changes = {}
         self.original_values = {}
 
-        # ---- Form settings ----
+        self._header_bg_brush = SolidBrush(Theme.HEADER_BG)
+        self._frozen_header_brush = SolidBrush(Theme.FROZEN_HEADER_BG)
+        self._header_border_pen = Pen(Theme.HEADER_BORDER)
+        self._header_font = Font(Theme.FONT_FAMILY, 9.5, FontStyle.Bold)
+
         self.Text = "Edit Title Block Parameters"
-        self.Size = Size(1200, 700)
+        self.Size = Size(1400, 780)
         self.StartPosition = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.Sizable
         self.MinimumSize = Size(800, 400)
-
-        # ==================================================================
-        # ORDER OF CONTROL ADDITION MATTERS:
-        # Docked controls fill in reverse order of how they're added.
-        # Add BOTTOM first, then TOP, then FILL last so FILL fits in between.
-        # ==================================================================
+        self.BackColor = Theme.BG
+        self.Font = Font(Theme.FONT_FAMILY, 9)
 
         # -------------------------------------------------------------------
-        # BOTTOM: Button panel (added FIRST so it docks to the bottom)
+        # BOTTOM: Button panel
         # -------------------------------------------------------------------
         btn_panel = Panel()
-        btn_panel.Height = 60
+        btn_panel.Height = 62
         btn_panel.Dock = DockStyle.Bottom
-        btn_panel.BackColor = Color.FromArgb(230, 230, 230)
-        btn_panel.Padding = Padding(10)
+        btn_panel.BackColor = Theme.PANEL_BG
+        btn_panel.Padding = Padding(12)
 
-        # Cancel button (docked right first, so it goes to the far right)
+        top_border = Panel()
+        top_border.Height = 1
+        top_border.Dock = DockStyle.Top
+        top_border.BackColor = Theme.BORDER
+        btn_panel.Controls.Add(top_border)
+
         self.cancel_btn = Button()
         self.cancel_btn.Text = "Cancel"
-        self.cancel_btn.Size = Size(140, 40)
+        self.cancel_btn.Size = Size(120, 36)
         self.cancel_btn.Dock = DockStyle.Right
-        self.cancel_btn.Font = Font("Segoe UI", 10, FontStyle.Regular)
-        self.cancel_btn.FlatStyle = FlatStyle.Standard
+        self.cancel_btn.Margin = Padding(8, 0, 0, 0)
+        self.cancel_btn.Font = Font(Theme.FONT_FAMILY, 9.5)
+        self.cancel_btn.FlatStyle = FlatStyle.Flat
+        self.cancel_btn.FlatAppearance.BorderColor = Theme.BORDER
+        self.cancel_btn.BackColor = Theme.PANEL_BG
+        self.cancel_btn.ForeColor = Theme.TEXT
         self.cancel_btn.Click += self.on_cancel
         btn_panel.Controls.Add(self.cancel_btn)
 
-        # Apply button (docked right AFTER cancel, so it appears LEFT of cancel)
         self.apply_btn = Button()
         self.apply_btn.Text = "Apply Changes"
-        self.apply_btn.Size = Size(160, 40)
+        self.apply_btn.Size = Size(150, 36)
         self.apply_btn.Dock = DockStyle.Right
-        self.apply_btn.BackColor = Color.FromArgb(0, 122, 204)
-        self.apply_btn.ForeColor = Color.White
+        self.apply_btn.BackColor = Theme.ACCENT
+        self.apply_btn.ForeColor = Theme.ACCENT_TEXT
         self.apply_btn.FlatStyle = FlatStyle.Flat
-        self.apply_btn.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        self.apply_btn.FlatAppearance.BorderSize = 0
+        self.apply_btn.Font = Font(Theme.FONT_FAMILY, 9.5, FontStyle.Bold)
         self.apply_btn.Click += self.on_apply
         btn_panel.Controls.Add(self.apply_btn)
+
+        self.fit_btn = Button()
+        self.fit_btn.Text = "Fit Columns to Content"
+        self.fit_btn.Size = Size(180, 36)
+        self.fit_btn.Dock = DockStyle.Left
+        self.fit_btn.Font = Font(Theme.FONT_FAMILY, 9.5)
+        self.fit_btn.FlatStyle = FlatStyle.Flat
+        self.fit_btn.FlatAppearance.BorderColor = Theme.BORDER
+        self.fit_btn.BackColor = Theme.PANEL_BG
+        self.fit_btn.ForeColor = Theme.TEXT
+        self.fit_btn.Click += self.on_fit_columns
+        btn_panel.Controls.Add(self.fit_btn)
 
         self.Controls.Add(btn_panel)
 
         # -------------------------------------------------------------------
-        # TOP: Info label
+        # TOP: Info label  (clean, full words, no unicode escapes)
         # -------------------------------------------------------------------
         info_panel = Panel()
-        info_panel.Height = 40
+        info_panel.Height = 38
         info_panel.Dock = DockStyle.Top
-        info_panel.BackColor = Color.FromArgb(240, 240, 240)
+        info_panel.BackColor = Theme.PANEL_BG
+
+        bottom_border = Panel()
+        bottom_border.Height = 1
+        bottom_border.Dock = DockStyle.Bottom
+        bottom_border.BackColor = Theme.BORDER
+        info_panel.Controls.Add(bottom_border)
 
         lbl = Label()
-        lbl.Text = ("  Tip: Shift+Click to select range | Ctrl+C to copy | "
-                    "Ctrl+V to paste | Ctrl+A to select column | Double-click cell to edit")
+        lbl.Text = (
+            "  {0} sheet(s)  |  {1} parameter(s)  |  "
+            "Shift+Click = select range   "
+            "Ctrl+C / Ctrl+V = copy / paste   "
+            "Ctrl+A = select column"
+        ).format(len(titleblocks), len(parameter_names))
         lbl.Dock = DockStyle.Fill
-        lbl.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        lbl.Font = Font(Theme.FONT_FAMILY, 9)
+        lbl.ForeColor = Theme.SUBTEXT
         lbl.TextAlign = ContentAlignment.MiddleLeft
         info_panel.Controls.Add(lbl)
         self.Controls.Add(info_panel)
 
         # -------------------------------------------------------------------
-        # FILL: DataGridView (added LAST so it fills the remaining space)
+        # FILL: DataGridView
         # -------------------------------------------------------------------
+        outer = Panel()
+        outer.Dock = DockStyle.Fill
+        outer.BackColor = Theme.BG
+        outer.Padding = Padding(10)
+
         self.grid = DataGridView()
         self.grid.Dock = DockStyle.Fill
+        self.grid.BackgroundColor = Theme.PANEL_BG
+        self.grid.BorderStyle = BorderStyle.None
+        self.grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal
+        self.grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single
+        self.grid.RowHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single
+        self.grid.GridColor = Theme.GRID_LINES
         self.grid.AllowUserToAddRows = False
         self.grid.AllowUserToDeleteRows = False
         self.grid.AllowUserToResizeRows = False
+        self.grid.AllowUserToResizeColumns = True
+        self.grid.RowTemplate.Height = self.ROW_HEIGHT
         self.grid.SelectionMode = DataGridViewSelectionMode.CellSelect
         self.grid.MultiSelect = True
         self.grid.ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText
         self.grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2
         self.grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None
-        self.grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize
-        self.grid.RowHeadersWidth = 40
+        self.grid.RowHeadersWidth = 32
+        self.grid.RowHeadersVisible = True
         self.grid.EnableHeadersVisualStyles = False
+        self.grid.ShowCellToolTips = True
+        self.grid.ScrollBars = ScrollBars.Both
 
-        # Header styling
+        self.grid.ColumnHeadersHeightSizeMode = \
+            DataGridViewColumnHeadersHeightSizeMode.EnableResizing
+        self.grid.ColumnHeadersHeight = self.HEADER_HEIGHT
+
         header_style = DataGridViewCellStyle()
-        header_style.BackColor = Color.FromArgb(50, 50, 50)
-        header_style.ForeColor = Color.White
-        header_style.Font = Font("Segoe UI", 9, FontStyle.Bold)
-        header_style.SelectionBackColor = Color.FromArgb(50, 50, 50)
-        header_style.SelectionForeColor = Color.White
+        header_style.BackColor = Theme.HEADER_BG
+        header_style.ForeColor = Theme.HEADER_FG
+        header_style.Font = self._header_font
+        header_style.SelectionBackColor = Theme.HEADER_BG
+        header_style.SelectionForeColor = Theme.HEADER_FG
+        header_style.WrapMode = DataGridViewTriState.True
+        header_style.Alignment = DataGridViewContentAlignment.MiddleLeft
+        header_style.Padding = Padding(8, 2, 8, 2)
         self.grid.ColumnHeadersDefaultCellStyle = header_style
 
-        # --- Always-visible identifier columns ---
+        self.grid.CellPainting += self.on_cell_painting
+
+        self.grid.DefaultCellStyle.Font = Font(Theme.FONT_FAMILY, 9.5)
+        self.grid.DefaultCellStyle.ForeColor = Theme.TEXT
+        self.grid.DefaultCellStyle.SelectionBackColor = Theme.ACCENT
+        self.grid.DefaultCellStyle.SelectionForeColor = Color.White
+        self.grid.DefaultCellStyle.Padding = Padding(6, 0, 6, 0)
+        self.grid.AlternatingRowsDefaultCellStyle.BackColor = Theme.ROW_ALT
+        self.grid.RowHeadersDefaultCellStyle.BackColor = Theme.FROZEN_BG
+        self.grid.RowHeadersDefaultCellStyle.ForeColor = Theme.SUBTEXT
+
         col_sheet = DataGridViewTextBoxColumn()
         col_sheet.HeaderText = "Sheet #"
         col_sheet.Name = "SheetNum"
         col_sheet.ReadOnly = True
-        col_sheet.Width = 100
+        col_sheet.Width = 105
         col_sheet.Frozen = True
-        col_sheet.DefaultCellStyle.BackColor = Color.FromArgb(220, 230, 245)
-        col_sheet.DefaultCellStyle.SelectionBackColor = Color.FromArgb(180, 200, 230)
+        col_sheet.DefaultCellStyle.BackColor = Theme.FROZEN_BG
+        col_sheet.DefaultCellStyle.SelectionBackColor = Theme.FROZEN_SEL
+        col_sheet.DefaultCellStyle.SelectionForeColor = Theme.TEXT
+        col_sheet.DefaultCellStyle.Font = Font(Theme.FONT_FAMILY, 9.5, FontStyle.Bold)
         self.grid.Columns.Add(col_sheet)
 
         col_name = DataGridViewTextBoxColumn()
@@ -266,19 +383,20 @@ class EditTableForm(Form):
         col_name.ReadOnly = True
         col_name.Width = 220
         col_name.Frozen = True
-        col_name.DefaultCellStyle.BackColor = Color.FromArgb(220, 230, 245)
-        col_name.DefaultCellStyle.SelectionBackColor = Color.FromArgb(180, 200, 230)
+        col_name.DefaultCellStyle.BackColor = Theme.FROZEN_BG
+        col_name.DefaultCellStyle.SelectionBackColor = Theme.FROZEN_SEL
+        col_name.DefaultCellStyle.SelectionForeColor = Theme.TEXT
         self.grid.Columns.Add(col_name)
 
-        # --- User-selected parameter columns ---
         for pname in parameter_names:
             col = DataGridViewTextBoxColumn()
             col.HeaderText = pname
             col.Name = "PARAM__" + pname
-            col.Width = 150
+            col.Width = estimate_column_width(pname, self._header_font)
+            col.MinimumWidth = 90
+            col.HeaderCell.ToolTipText = pname
             self.grid.Columns.Add(col)
 
-        # --- Populate rows ---
         for tb in titleblocks:
             sheet_num, sheet_name = get_sheet_of_titleblock(tb)
             row_data = [sheet_num, sheet_name]
@@ -291,21 +409,84 @@ class EditTableForm(Form):
             row_index = self.grid.Rows.Add(*row_data)
             self.grid.Rows[row_index].Tag = tb
 
-        # Key handling for paste
         self.grid.KeyDown += self.on_key_down
 
-        # Sort rows by sheet number ascending
         try:
             self.grid.Sort(self.grid.Columns["SheetNum"], SortOrder.Ascending)
         except Exception:
             pass
 
-        # Add grid LAST so it fills remaining space between top and bottom panels
-        self.Controls.Add(self.grid)
+        outer.Controls.Add(self.grid)
+        self.Controls.Add(outer)
 
     # -----------------------------
     # Event Handlers
     # -----------------------------
+
+    def on_fit_columns(self, sender, e):
+        """Auto-fit parameter columns to content with sensible minimums."""
+        try:
+            self.grid.AutoResizeColumns(
+                DataGridViewAutoSizeColumnsMode.AllCellsExceptHeader)
+            for col in self.grid.Columns:
+                if not col.Name.startswith("PARAM__"):
+                    continue
+                needed = estimate_column_width(col.HeaderText, self._header_font)
+                if col.Width < needed:
+                    col.Width = needed
+        except Exception as ex:
+            MessageBox.Show("Could not fit columns: " + str(ex))
+
+    def on_cell_painting(self, sender, e):
+        """Cleanly render headers without visual clashes or glitches."""
+        try:
+            is_corner = (e.RowIndex == -1 and e.ColumnIndex == -1)
+            is_header = (e.RowIndex == -1 and e.ColumnIndex >= 0)
+
+            if not (is_corner or is_header):
+                return
+
+            g = e.Graphics
+            rect = e.CellBounds
+
+            is_frozen = False
+            if is_header:
+                col = self.grid.Columns[e.ColumnIndex]
+                if col.Frozen:
+                    is_frozen = True
+            elif is_corner:
+                is_frozen = True
+
+            bg_brush = self._frozen_header_brush if is_frozen else self._header_bg_brush
+            g.FillRectangle(bg_brush, rect)
+
+            g.DrawLine(self._header_border_pen, rect.Left, rect.Bottom - 1, rect.Right, rect.Bottom - 1)
+            g.DrawLine(self._header_border_pen, rect.Right - 1, rect.Top, rect.Right - 1, rect.Bottom - 1)
+
+            if is_header:
+                text = e.FormattedValue if e.FormattedValue is not None else ""
+                text = str(text)
+
+                text_rect = Rectangle(rect.X + 8, rect.Y + 2, rect.Width - 16, rect.Height - 4)
+                flags = (
+                    TextFormatFlags.Left |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.WordBreak |
+                    TextFormatFlags.EndEllipsis
+                )
+                TextRenderer.DrawText(
+                    g,
+                    text,
+                    self._header_font,
+                    text_rect,
+                    Theme.HEADER_FG,
+                    flags
+                )
+
+            e.Handled = True
+
+        except Exception:
+            pass
 
     def on_key_down(self, sender, e):
         """Handle Ctrl+V paste and Ctrl+A select-column."""
@@ -347,7 +528,6 @@ class EditTableForm(Form):
             start_row = self.grid.CurrentCell.RowIndex if self.grid.CurrentCell else 0
             start_col = self.grid.CurrentCell.ColumnIndex if self.grid.CurrentCell else 2
 
-            # Single value → fill all selected cells
             if len(lines) == 1 and "\t" not in lines[0] and self.grid.SelectedCells.Count > 1:
                 value = lines[0]
                 for cell in self.grid.SelectedCells:
@@ -355,7 +535,6 @@ class EditTableForm(Form):
                         cell.Value = value
                 return
 
-            # Normal paste
             for i, line in enumerate(lines):
                 target_row = start_row + i
                 if target_row >= self.grid.Rows.Count:
@@ -378,7 +557,6 @@ class EditTableForm(Form):
 
     def on_apply(self, sender, e):
         """Collect changes and close with OK result."""
-        # Commit any in-progress cell edit before reading values
         try:
             self.grid.EndEdit()
         except Exception:
@@ -424,7 +602,6 @@ def main():
         forms.alert("No title blocks found in this project.")
         return
 
-    # Collect all unique instance parameter names
     all_param_names = set()
     for tb in titleblocks:
         for p in get_instance_parameters(tb):
@@ -439,7 +616,6 @@ def main():
 
     sorted_names = sorted(all_param_names)
 
-    # Let user select parameters
     selected = forms.SelectFromList.show(
         sorted_names,
         title="Select parameters to edit",
@@ -456,7 +632,6 @@ def main():
         forms.alert("No parameters selected.")
         return
 
-    # Show edit table
     form = EditTableForm(titleblocks, selected)
     result = form.ShowDialog()
 
@@ -467,7 +642,6 @@ def main():
         forms.alert("No changes were made.")
         return
 
-    # Apply changes in a transaction
     success = 0
     failed = []
 
@@ -495,7 +669,6 @@ def main():
             except Exception as ex:
                 failed.append("{} / {} ({})".format(tb_id, pname, ex))
 
-    # Report
     msg = "Updated {} value(s).".format(success)
     if failed:
         msg += "\n\nFailed:\n" + "\n".join(failed[:20])
