@@ -1617,8 +1617,23 @@ class SheetExportWindow(forms.WPFWindow):
             opt.FileName = name
             ids = List[ElementId]([i.Id for i in items])
             self._set_progress(0, 1, "PDF (combined)")
+            target = os.path.join(folder, name + ".pdf")
+            before_files = set(os.listdir(folder)) if os.path.exists(folder) else set()
             try:
                 doc.Export(folder, ids, opt)
+                if not os.path.exists(target) and os.path.exists(folder):
+                    after_files = set(os.listdir(folder))
+                    new_files = [f for f in (after_files - before_files) if f.lower().endswith(".pdf")]
+                    if new_files:
+                        new_pdf = max(new_files, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+                        new_pdf_path = os.path.join(folder, new_pdf)
+                        if new_pdf_path != target:
+                            try:
+                                if os.path.exists(target):
+                                    os.remove(target)
+                                os.rename(new_pdf_path, target)
+                            except Exception:
+                                pass
                 records.append(("PDF", "%d items" % total,
                                 os.path.join(folder, name + ".pdf"), "OK", ""))
                 self._log("PDF combined -> %s.pdf" % name)
@@ -1650,8 +1665,31 @@ class SheetExportWindow(forms.WPFWindow):
                         fname = os.path.splitext(
                             os.path.basename(unique_path(target, False)))[0]
                         opt.FileName = fname
+                        target = os.path.join(item_folder, fname + ".pdf")
+
+                before_files = set(os.listdir(item_folder)) if os.path.exists(item_folder) else set()
+
                 ids = List[ElementId]([item.Id])
                 doc.Export(item_folder, ids, opt)
+
+                # Ensure exported PDF file is renamed to exact target name if Revit named it differently
+                if not os.path.exists(target) and os.path.exists(item_folder):
+                    after_files = set(os.listdir(item_folder))
+                    new_files = [f for f in (after_files - before_files) if f.lower().endswith(".pdf")]
+                    if new_files:
+                        new_pdf = max(new_files, key=lambda f: os.path.getmtime(os.path.join(item_folder, f)))
+                        new_pdf_path = os.path.join(item_folder, new_pdf)
+                        if new_pdf_path != target:
+                            try:
+                                if os.path.exists(target):
+                                    os.remove(target)
+                                os.rename(new_pdf_path, target)
+                            except Exception:
+                                try:
+                                    os.replace(new_pdf_path, target)
+                                except Exception as ex_ren:
+                                    self._log("PDF rename warning (%s -> %s): %s" % (new_pdf, fname + ".pdf", ex_ren))
+
                 records.append(("PDF", item.Number or item.Name,
                                 self._rel_name(folder, item_folder, fname + ".pdf"), "OK", ""))
             except Exception as ex:
