@@ -252,9 +252,12 @@
                             <Button x:Name="BtnSaveVSSet" Style="{StaticResource FlatButton}"
                                     Content="Save V/S Set" Margin="8,0,0,0" Height="24"
                                     ToolTip="Save current selection as a Revit View/Sheet Set"/>
-                            <CheckBox x:Name="ChkGroupSeries" Content="Group by Series Range"
+                            <CheckBox x:Name="ChkGroupSeries" Content="Group by"
                                       VerticalAlignment="Center" Margin="16,0,0,0"
-                                      ToolTip="Organise the grid into groups using the sheet's 'Series Range' parameter, same as the Project Browser"/>
+                                      ToolTip="Organise the grid into groups using the chosen parameter, same as the Project Browser"/>
+                            <ComboBox x:Name="CmbGroupParam" Width="150" Height="24"
+                                      Margin="6,0,0,0" VerticalContentAlignment="Center"
+                                      ToolTip="Parameter to group rows by (defaults to 'Series Range' if present)"/>
                         </StackPanel>
 
                         <Grid Grid.Column="2" Width="230">
@@ -425,7 +428,7 @@
                             <Button x:Name="BtnNaming" Style="{StaticResource FlatButton}"
                                     Content="Custom File Name..." FontWeight="SemiBold" Height="24"
                                     ToolTip="Open the file naming builder"/>
-                            <TextBlock x:Name="TxtRuleSummary" VerticalAlignment="Center" Margin="10,0,0,0"
+                            <TextBlock x:Name="TxtRuleSummary" Text="" VerticalAlignment="Center" Margin="10,0,0,0"
                                        Foreground="#FF1B5E20" FontSize="11"/>
                         </StackPanel>
                         <CheckBox x:Name="ChkOnlyActive" Content="Show only active Sheets/Views"
@@ -575,7 +578,7 @@
                                                         <CheckBox x:Name="ChkHideScopeBoxes" Style="{StaticResource Row}"
                                                                   Content="Hide scope boxes" IsChecked="True"/>
                                                         <CheckBox x:Name="ChkHideCropBound" Style="{StaticResource Row}"
-                                                                  Content="Hide crop boundaries" IsChecked="True"/>
+                                                                  Content="Hide crop boundaries"/>
                                                         <CheckBox x:Name="ChkHideUnrefTags" Style="{StaticResource Row}"
                                                                   Content="Hide unreferenced view tags"/>
                                                         <CheckBox x:Name="ChkMaskCoincident" Style="{StaticResource Row}"
@@ -905,8 +908,8 @@
                             <CheckBox x:Name="ChkSubfolderDate" Style="{StaticResource Row}"
                                       Content="Create a sub-folder with today's date"/>
                             <CheckBox x:Name="ChkSubfolderPerSeries" Style="{StaticResource Row}"
-                                      Content="Create a sub-folder per series (from the Series Range)"
-                                      ToolTip="Each sheet is exported into &lt;output&gt;\...\&lt;Series Range&gt;\ instead of one flat folder. Only applies to sheets, and has no effect on Combined PDF / Merged DWF, since those produce a single file."/>
+                                      Content="Create a sub-folder per group"
+                                      ToolTip="Each sheet is exported into &lt;output&gt;\...\&lt;group&gt;\ instead of one flat folder, using the grouping parameter chosen on the Selection tab. Only applies to sheets, and has no effect on Combined PDF / Merged DWF / NWC / IFC, since those produce a single file."/>
                             <CheckBox x:Name="ChkOverwrite" Style="{StaticResource Row}"
                                       Content="Overwrite existing files" IsChecked="True"/>
                             <CheckBox x:Name="ChkOpenWhenDone" Style="{StaticResource Row}"

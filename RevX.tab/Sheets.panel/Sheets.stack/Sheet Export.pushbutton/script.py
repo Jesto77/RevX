@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import json
+import shutil
 import codecs
 import datetime
 import traceback
@@ -31,13 +32,14 @@ clr.AddReference("System.Windows.Forms")
 
 import System
 from System import Guid, EventHandler
+from System.Windows import RoutedEventHandler
 from System.Collections.Generic import List
 from System.Collections.ObjectModel import ObservableCollection
 from System.ComponentModel import INotifyPropertyChanged, PropertyChangedEventArgs
 from System.Windows import Visibility
 from System.Windows.Media import VisualTreeHelper
 from System.Windows.Controls import CheckBox
-from System.Windows.Data import CollectionViewSource, Binding
+from System.Windows.Data import CollectionViewSource, Binding, PropertyGroupDescription
 from System.Windows.Input import Cursors, Key
 from System.Windows.Threading import DispatcherPriority
 from System.Windows.Controls import TextChangedEventHandler
@@ -136,6 +138,7 @@ class ExportItem(INotifyPropertyChanged, object):
         self._handlers = []
         self._selected = False
         self._custom = ""
+        self._group_key = ""
 
         self.Element = element
         self.IsSheet = is_sheet
@@ -195,6 +198,20 @@ class ExportItem(INotifyPropertyChanged, object):
     def CustomFileName(self, value):
         self._custom = value or ""
         self._notify("CustomFileName")
+
+    @property
+    def GroupKey(self):
+        """Value of whichever parameter the grid is currently grouped by
+        (Selection tab). Recomputed by _apply_grouping() whenever the
+        grouping checkbox or parameter combo changes."""
+        return self._group_key
+
+    @GroupKey.setter
+    def GroupKey(self, value):
+        value = value or "Unassigned"
+        if value != self._group_key:
+            self._group_key = value
+            self._notify("GroupKey")
 
     # --- helpers ------------------------------------------------------------ #
     @staticmethod
@@ -677,6 +694,7 @@ class SheetExportWindow(forms.WPFWindow):
         self._wire_events()
         self._load_defaults()
         self._load_items(force=True)
+        self._load_group_params()
         self._load_profiles()
 
     # ------------------------------------------------------------------ #
@@ -690,13 +708,19 @@ class SheetExportWindow(forms.WPFWindow):
         self.ChkOnlyActive.Unchecked += self.on_search
         self.CmbVSSet.SelectionChanged += self.on_vsset_changed
         self.BtnSaveVSSet.Click += self.on_save_vsset
+        self.ChkGroupSeries.Checked += self.on_group_toggled
+        self.ChkGroupSeries.Unchecked += self.on_group_toggled
+        self.CmbGroupParam.SelectionChanged += self.on_group_toggled
+        self.GridItems.AddHandler(CheckBox.ClickEvent,
+                                   RoutedEventHandler(self.on_group_checkbox_click))
 
         self.BtnSelAll.Click += lambda s, e: self._set_all(True)
         self.BtnSelNone.Click += lambda s, e: self._set_all(False)
         self.BtnSelInvert.Click += self.on_invert
         self.BtnResetNames.Click += self.on_reset_names
         self.BtnNaming.Click += self.on_open_naming
-        self.BtnReload.Click += lambda s, e: self._load_items(force=True)
+        self.BtnReload.Click += lambda s, e: (self._load_items(force=True),
+                                              self._load_group_params())
 
         self.BtnNext1.Click += lambda s, e: self._goto(1)
         self.BtnBack2.Click += lambda s, e: self._goto(0)
@@ -811,6 +835,80 @@ class SheetExportWindow(forms.WPFWindow):
             self._syncing = False
         self._checkbox_click = False
         self._visible_rows = rows
+        self._apply_grouping()
+
+    def _load_group_params(self):
+        """Populate the Selection-tab grouping parameter combo from whatever
+        parameters are actually present on the selected sheets/views."""
+        try:
+            names = collect_parameters(self._all_items)
+        except Exception:
+            names = []
+        prev = self.CmbGroupParam.SelectedItem
+        self._loading_group_params = True
+        try:
+            self.CmbGroupParam.Items.Clear()
+            for n in names:
+                self.CmbGroupParam.Items.Add(n)
+            if prev and prev in names:
+                self.CmbGroupParam.SelectedItem = prev
+            elif names:
+                self.CmbGroupParam.SelectedItem = (
+                    "Series Range" if "Series Range" in names else names[0])
+        finally:
+            self._loading_group_params = False
+
+    def on_group_toggled(self, sender, args):
+        if getattr(self, "_loading_group_params", False):
+            return
+        self._apply_grouping()
+
+    def _apply_grouping(self):
+        """Group the Selection-tab grid by whichever parameter is chosen in
+        CmbGroupParam, with header rows showing the group name and count -
+        same mechanism the Project Browser uses, just parameter-driven
+        instead of hardcoded to 'Series Range'."""
+        collection = self.GridItems.ItemsSource
+        if collection is None:
+            return
+        view = CollectionViewSource.GetDefaultView(collection)
+        if view is None:
+            return
+        view.GroupDescriptions.Clear()
+
+        enabled = bool(self.ChkGroupSeries.IsChecked)
+        token = self.CmbGroupParam.SelectedItem
+        if not enabled or not token:
+            return
+
+        token = str(token)
+        for row in self._visible_rows:
+            if row.IsSheet:
+                try:
+                    row.GroupKey = param_value(row, token) or "Unassigned"
+                except Exception:
+                    row.GroupKey = "Unassigned"
+            else:
+                row.GroupKey = "Unassigned"
+        view.GroupDescriptions.Add(PropertyGroupDescription("GroupKey"))
+
+    def on_group_checkbox_click(self, sender, args):
+        """The 'select every sheet in this series' tick box in each group
+        header - bubbles up from the DataTemplate, so it's handled here at
+        the DataGrid level rather than wired individually per group."""
+        try:
+            box = args.OriginalSource
+            if not isinstance(box, CheckBox) or box.Name != "ChkSeriesAll":
+                return
+            group = box.Tag
+            items = getattr(group, "Items", None)
+            if items is None:
+                return
+            select = bool(box.IsChecked)
+            for row in items:
+                row.IsSelected = select
+        except Exception:
+            pass
 
     def _load_vssets(self):
         self.CmbVSSet.Items.Clear()
@@ -840,16 +938,11 @@ class SheetExportWindow(forms.WPFWindow):
         return cfg
 
     def _update_rule_summary(self):
-        rule = self._rule
-        tokens = rule.get("tokens", [])
-        if not tokens:
-            self.TxtRuleSummary.Text = "no naming rule set"
-            return
-        sep = rule.get("separator", "_")
-        sep = "" if sep == "none" else sep
-        parts = sep.join("<%s>" % t for t in tokens)
-        self.TxtRuleSummary.Text = "Rule:  %s%s%s" % (
-            rule.get("prefix", ""), parts, rule.get("suffix", ""))
+        # Rule summary display intentionally disabled (was overlapping the
+        # "Show only active Sheets/Views" checkbox in the footer). Keeping
+        # this method (and all its call sites) as a no-op so the rest of
+        # the naming-rule workflow/logic is untouched.
+        self.TxtRuleSummary.Text = ""
 
     # ------------------------------------------------------------------ #
     #  Custom File Name dialog
@@ -1111,15 +1204,35 @@ class SheetExportWindow(forms.WPFWindow):
         self.TxtProgress.Text = "%d / %d  %s" % (done, total, label)
         self._pump()
 
-    def _output_dir(self, fmt):
+    def _output_dir(self, fmt, item=None):
         root = self.TxtFolder.Text
         if self.ChkSubfolderDate.IsChecked:
             root = os.path.join(root, datetime.datetime.now().strftime("%Y-%m-%d"))
         if self.ChkSubfolderPerFormat.IsChecked:
             root = os.path.join(root, fmt)
+        series = self._series_subfolder(item)
+        if series:
+            root = os.path.join(root, series)
         if not os.path.isdir(root):
             os.makedirs(root)
         return root
+
+    def _series_subfolder(self, item):
+        """Sub-folder name for this item, from the same grouping parameter
+        chosen on the Selection tab (CmbGroupParam) - not hardcoded to
+        'Series Range'. Only applies to sheets exported one-file-per-item;
+        combined / merged / single-model exports pass item=None and get no
+        sub-folder, since they can't be split by parameter value."""
+        if not self.ChkSubfolderPerSeries.IsChecked or item is None or not item.IsSheet:
+            return None
+        token = getattr(self, "CmbGroupParam", None) and self.CmbGroupParam.SelectedItem
+        if not token:
+            return None
+        try:
+            value = param_value(item, str(token))
+        except Exception:
+            value = ""
+        return sanitize(value, True) if value else "Unassigned"
 
     def _selected_formats(self):
         pairs = [("PDF", self.ChkPDF), ("DWG", self.ChkDWG), ("DGN", self.ChkDGN),
@@ -1344,6 +1457,7 @@ class SheetExportWindow(forms.WPFWindow):
         for index, item in enumerate(items, 1):
             if self._cancel:
                 break
+            folder = self._output_dir("PDF", item)
             fname = self._resolve_filename(item, cfg)
             self._set_progress(index - 1, total, "PDF  " + fname)
             try:
@@ -1361,8 +1475,44 @@ class SheetExportWindow(forms.WPFWindow):
                         fname = os.path.splitext(
                             os.path.basename(unique_path(target, False)))[0]
                         opt.FileName = fname
+                        target = os.path.join(folder, fname + ".pdf")
+
+                # NOTE: when Combine=False, Revit's native PDF exporter
+                # ignores opt.FileName for single-sheet/view exports and
+                # writes its own auto-named file (sheet number/name based).
+                # Snapshot the folder before/after and rename whatever
+                # Revit actually produced to the intended Custom File Name
+                # so PDF output matches DWG/other formats.
+                try:
+                    before = set(os.listdir(folder))
+                except Exception:
+                    before = set()
+
                 ids = List[ElementId]([item.Id])
                 doc.Export(folder, ids, opt)
+
+                try:
+                    after = set(os.listdir(folder))
+                except Exception:
+                    after = set()
+                new_files = [f for f in (after - before) if f.lower().endswith(".pdf")]
+
+                actual = os.path.join(folder, fname + ".pdf")
+                if not os.path.isfile(actual) and new_files:
+                    # Revit used its own name instead of opt.FileName -
+                    # rename the newly created file to match.
+                    src = os.path.join(folder, sorted(
+                        new_files, key=lambda f: os.path.getmtime(
+                            os.path.join(folder, f)))[-1])
+                    try:
+                        if os.path.abspath(src) != os.path.abspath(target):
+                            if os.path.exists(target):
+                                os.remove(target)
+                            os.rename(src, target)
+                    except Exception as ex:
+                        self._log("PDF: could not rename '%s' -> '%s': %s"
+                                  % (src, fname + ".pdf", ex))
+
                 records.append(("PDF", item.Number or item.Name,
                                 fname + ".pdf", "OK", ""))
             except Exception as ex:
@@ -1451,6 +1601,7 @@ class SheetExportWindow(forms.WPFWindow):
         for index, item in enumerate(items, 1):
             if self._cancel:
                 break
+            folder = self._output_dir("DWG", item)
             fname = self._resolve_filename(item, cfg)
             self._set_progress(index - 1, total, "DWG  " + fname)
             try:
@@ -1489,6 +1640,7 @@ class SheetExportWindow(forms.WPFWindow):
         for index, item in enumerate(items, 1):
             if self._cancel:
                 break
+            folder = self._output_dir("DGN", item)
             fname = self._resolve_filename(item, cfg)
             self._set_progress(index - 1, total, "DGN  " + fname)
             try:
@@ -1579,6 +1731,7 @@ class SheetExportWindow(forms.WPFWindow):
         for index, item in enumerate(items, 1):
             if self._cancel:
                 break
+            folder = self._output_dir("DWF", item)
             fname = self._resolve_filename(item, cfg)
             self._set_progress(index - 1, total, "DWF  " + fname)
             try:
@@ -1840,6 +1993,7 @@ class SheetExportWindow(forms.WPFWindow):
         for index, item in enumerate(items, 1):
             if self._cancel:
                 break
+            folder = self._output_dir("IMG", item)
             fname = self._resolve_filename(item, cfg)
             self._set_progress(index - 1, total, "IMG  " + fname)
             try:
@@ -1869,12 +2023,12 @@ class SheetExportWindow(forms.WPFWindow):
     #  Profiles
     # ------------------------------------------------------------------ #
     def _load_defaults(self):
-        try:
-            base = os.path.dirname(doc.PathName) if doc.PathName else ""
-        except Exception:
-            base = ""
-        self.TxtFolder.Text = base or os.path.join(
-            os.path.expanduser("~"), "Documents", "Sheet Export")
+        # Output location default: Desktop\Sheet Export, always, regardless
+        # of where the current Revit model lives - user can still change it
+        # via the "..." browse button, it just won't default to Documents
+        # (or the project folder) anymore.
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        self.TxtFolder.Text = os.path.join(desktop, "Sheet Export")
         self.TxtCombinedName.Text = sanitize(doc.Title or "Combined")
         self.TxtNwcName.Text = sanitize(doc.Title or "Model")
         self.TxtIfcName.Text = sanitize(doc.Title or "Model")
@@ -2039,7 +2193,9 @@ class SheetExportWindow(forms.WPFWindow):
         self._log("Naming rule saved as '%s'." % name)
 
     def on_profile_browse(self, sender, args):
-        """Load a rule XML from anywhere and add it to the list."""
+        """Load a rule XML from anywhere, copy it into the rules folder so
+        it shows up in the dropdown every time the tool is opened, and
+        apply it."""
         dlg = OpenFileDialog()
         dlg.Filter = "Sheet Export naming rule (*.xml)|*.xml|All files (*.*)|*.*"
         dlg.Title = "Load naming rule"
@@ -2050,8 +2206,29 @@ class SheetExportWindow(forms.WPFWindow):
         except Exception as ex:
             forms.alert("Could not read the XML:\n%s" % ex, title="Sheet Export")
             return
+
         label = os.path.splitext(os.path.basename(dlg.FileName))[0]
-        self._profiles[label] = dlg.FileName
+        try:
+            if not os.path.isdir(RULES_DIR):
+                os.makedirs(RULES_DIR)
+            dest = os.path.join(RULES_DIR, label + ".xml")
+            # avoid clobbering a different existing rule with the same name
+            if (os.path.isfile(dest)
+                    and os.path.normcase(os.path.abspath(dest))
+                        != os.path.normcase(os.path.abspath(dlg.FileName))):
+                n = 2
+                while os.path.isfile(os.path.join(RULES_DIR, "%s (%d).xml" % (label, n))):
+                    n += 1
+                label = "%s (%d)" % (label, n)
+                dest = os.path.join(RULES_DIR, label + ".xml")
+            if os.path.normcase(os.path.abspath(dest)) != os.path.normcase(os.path.abspath(dlg.FileName)):
+                shutil.copy2(dlg.FileName, dest)
+            self._profiles = self._rule_files()
+        except Exception as ex:
+            # still usable for this session even if the copy failed
+            logger.debug("could not copy rule into RULES_DIR: %s", ex)
+            self._profiles[label] = dlg.FileName
+
         self._refresh_profile_combo(label)
         self._update_rule_summary()
         self._fill_names(only_empty=False)
