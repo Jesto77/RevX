@@ -34,11 +34,10 @@ from System import Guid, EventHandler
 from System.Collections.Generic import List
 from System.Collections.ObjectModel import ObservableCollection
 from System.ComponentModel import INotifyPropertyChanged, PropertyChangedEventArgs
-from System.Windows import Visibility, RoutedEventHandler, FrameworkElement
+from System.Windows import Visibility
 from System.Windows.Media import VisualTreeHelper
 from System.Windows.Controls import CheckBox
-from System.Windows.Data import (CollectionViewSource, Binding,
-                                  PropertyGroupDescription, CollectionViewGroup)
+from System.Windows.Data import CollectionViewSource, Binding
 from System.Windows.Input import Cursors, Key
 from System.Windows.Threading import DispatcherPriority
 from System.Windows.Controls import TextChangedEventHandler
@@ -155,10 +154,8 @@ class ExportItem(INotifyPropertyChanged, object):
 
         self.Revision = self._revision(element, is_sheet)
         self.Size = self._size(element, is_sheet)
-        self.SeriesRange = self._series_range(element, is_sheet)
         self.ViewTypeName = str(element.ViewType)
-        self._search = (u"%s %s %s %s" % (self.Number, self.Name, self.Size,
-                                          self.SeriesRange)).lower()
+        self._search = (u"%s %s %s" % (self.Number, self.Name, self.Size)).lower()
 
     # --- INotifyPropertyChanged -------------------------------------------- #
     def add_PropertyChanged(self, handler):
@@ -220,27 +217,6 @@ class ExportItem(INotifyPropertyChanged, object):
         if not is_sheet:
             return ""
         return SIZE_MAP.get(eid_value(element.Id), "-")
-
-    @staticmethod
-    def _series_range(element, is_sheet):
-        """Sheet 'Series Range' parameter value, mirroring the Project Browser
-        grouping. Views never carry this, so they always fall back to "".
-        """
-        if not is_sheet:
-            return ""
-        try:
-            p = element.LookupParameter("Series Range")
-            if p:
-                val = ""
-                if p.StorageType == StorageType.String:
-                    val = p.AsString() or ""
-                if not val:
-                    val = p.AsValueString() or ""
-                if val:
-                    return val
-        except Exception:
-            pass
-        return "(No Series Range)"
 
     def matches(self, term):
         return term in self._search
@@ -639,162 +615,33 @@ def write_rule_xml(path, rule):
 
 def read_rule_xml(path):
     import xml.etree.ElementTree as ET
-    import re
+    root = ET.parse(path).getroot()
 
+    def text(tag, default=""):
+        node = root.find(tag)
+        return default if node is None or node.text is None else node.text
+
+    def flag(tag, default=False):
+        return text(tag, str(default)).strip().lower() in ("true", "1", "yes")
+
+    params = root.find("Parameters")
     tokens = []
-    separator = "_"
-    prefix = ""
-    suffix = ""
-    remove_spaces = False
-    upper = False
-    do_sanitize = True
-
-    try:
-        tree = ET.parse(path)
-        root = tree.getroot()
-    except Exception as ex:
-        raise ValueError("Invalid XML file format: %s" % ex)
-
-    def strip_ns(tag):
-        return tag.split("}")[-1] if "}" in tag else tag
-
-    def find_text_anywhere(target_tag, default=""):
-        for elem in root.iter():
-            if strip_ns(elem.tag) == target_tag and elem.text is not None and elem.text.strip():
-                return elem.text.strip()
-        return default
-
-    def find_flag_anywhere(target_tag, default=False):
-        val = find_text_anywhere(target_tag, str(default))
-        return val.strip().lower() in ("true", "1", "yes")
-
-    root_tag = strip_ns(root.tag)
-
-    # 1. Standard RevX XML (<SheetExportNaming>)
-    if root_tag == "SheetExportNaming":
-        params_node = None
-        for elem in root.iter():
-            if strip_ns(elem.tag) == "Parameters":
-                params_node = elem
-                break
-        if params_node is not None:
-            def order_of(n):
-                try:
-                    return int(n.get("order", "0"))
-                except Exception:
-                    return 0
-            param_elems = [e for e in params_node if strip_ns(e.tag) == "Parameter"]
-            for node in sorted(param_elems, key=order_of):
-                if node.text and node.text.strip():
-                    tokens.append(node.text.strip())
-        
-        return dict(
-            tokens=tokens,
-            separator=find_text_anywhere("Separator", "_"),
-            prefix=find_text_anywhere("Prefix", ""),
-            suffix=find_text_anywhere("Suffix", ""),
-            remove_spaces=find_flag_anywhere("RemoveSpaces"),
-            upper=find_flag_anywhere("Uppercase"),
-            do_sanitize=find_flag_anywhere("Sanitize", True)
-        )
-
-    # 2. ProSheets / DiRoots XML (<Profiles> / <Profile> / <SelectSheetParameters>)
-    select_params_node = None
-    for elem in root.iter():
-        if strip_ns(elem.tag) == "SelectSheetParameters":
-            select_params_node = elem
-            break
-
-    if select_params_node is not None:
-        combine_params_node = None
-        for elem in select_params_node.iter():
-            if strip_ns(elem.tag) == "CombineParameters":
-                combine_params_node = elem
-                break
-        
-        sep_found = None
-        if combine_params_node is not None:
-            for p_model in combine_params_node:
-                if strip_ns(p_model.tag) == "ParameterModel":
-                    p_name = None
-                    for child in p_model:
-                        if strip_ns(child.tag) == "ParameterName" and child.text and child.text.strip():
-                            p_name = child.text.strip()
-                            break
-                    if p_name:
-                        tokens.append(p_name)
-                    
-                    for attr_k, attr_v in p_model.attrib.items():
-                        if ("preserve" in attr_k.lower() or "space" in attr_k.lower()) and attr_v:
-                            sep_found = attr_v
-
-        if not sep_found:
-            cp_name = find_text_anywhere("CombineParameterName", "")
-            if cp_name and len(tokens) > 1:
-                for candidate in ["-", "_", ".", " "]:
-                    if candidate.join(tokens) == cp_name:
-                        sep_found = candidate
-                        break
-                if not sep_found:
-                    first_t = tokens[0]
-                    if first_t in cp_name:
-                        idx = cp_name.find(first_t) + len(first_t)
-                        if idx < len(cp_name):
-                            sep_found = cp_name[idx]
-
-        if sep_found:
-            separator = sep_found
-
-        if tokens:
-            return dict(
-                tokens=tokens,
-                separator=separator,
-                prefix=prefix,
-                suffix=suffix,
-                remove_spaces=remove_spaces,
-                upper=upper,
-                do_sanitize=do_sanitize
-            )
-
-    # 3. ExportProfile XML (<NamingTemplate>)
-    naming_template_text = find_text_anywhere("NamingTemplate", "")
-    if naming_template_text:
-        found_tokens = re.findall(r'\{(?:\w+:)?([^}]+)\}', naming_template_text)
-        if found_tokens:
-            tokens = [t.strip() for t in found_tokens]
-            template_pattern = re.sub(r'\{(?:\w+:)?([^}]+)\}', 'TOKEN', naming_template_text)
-            sep_match = re.search(r'TOKEN([^\w\s])TOKEN', template_pattern)
-            if sep_match:
-                separator = sep_match.group(1)
-
-            return dict(
-                tokens=tokens,
-                separator=separator,
-                prefix=prefix,
-                suffix=suffix,
-                remove_spaces=remove_spaces,
-                upper=upper,
-                do_sanitize=do_sanitize
-            )
-
-    # 4. Generic XML Fallback
-    for elem in root.iter():
-        tag = strip_ns(elem.tag)
-        if tag in ("Parameter", "ParameterName", "Param", "Field", "Token"):
-            if elem.text and elem.text.strip():
-                txt = elem.text.strip()
-                if txt not in tokens and "<" not in txt:
-                    tokens.append(txt)
-
-    return dict(
-        tokens=tokens,
-        separator=find_text_anywhere("Separator", "_"),
-        prefix=find_text_anywhere("Prefix", ""),
-        suffix=find_text_anywhere("Suffix", ""),
-        remove_spaces=find_flag_anywhere("RemoveSpaces"),
-        upper=find_flag_anywhere("Uppercase"),
-        do_sanitize=find_flag_anywhere("Sanitize", True)
-    )
+    if params is not None:
+        def order_of(n):
+            try:
+                return int(n.get("order", "0"))
+            except Exception:
+                return 0
+        for node in sorted(params.findall("Parameter"), key=order_of):
+            if node.text:
+                tokens.append(node.text)
+    return dict(tokens=tokens,
+                separator=text("Separator", "_"),
+                prefix=text("Prefix", ""),
+                suffix=text("Suffix", ""),
+                remove_spaces=flag("RemoveSpaces"),
+                upper=flag("Uppercase"),
+                do_sanitize=flag("Sanitize", True))
 
 
 # --------------------------------------------------------------------------- #
@@ -825,7 +672,7 @@ class SheetExportWindow(forms.WPFWindow):
         except Exception:
             self.TxtDocName.Text = doc.Title
 
-        SELECTION_CALLBACK[0] = self._on_selection_changed
+        SELECTION_CALLBACK[0] = self._update_status
 
         self._wire_events()
         self._load_defaults()
@@ -841,8 +688,6 @@ class SheetExportWindow(forms.WPFWindow):
         self.TxtSearch.TextChanged += self.on_search
         self.ChkOnlyActive.Checked += self.on_search
         self.ChkOnlyActive.Unchecked += self.on_search
-        self.ChkGroupSeries.Checked += self.on_search
-        self.ChkGroupSeries.Unchecked += self.on_search
         self.CmbVSSet.SelectionChanged += self.on_vsset_changed
         self.BtnSaveVSSet.Click += self.on_save_vsset
 
@@ -874,13 +719,6 @@ class SheetExportWindow(forms.WPFWindow):
         self.GridItems.SelectionChanged += self.on_grid_selection_changed
         self.GridItems.PreviewKeyDown += self.on_grid_key
         self.GridItems.PreviewMouseLeftButtonDown += self.on_grid_mouse_down
-
-        # per-series "select all" tick box lives in the group header
-        # template, so it's wired by bubbling rather than by name
-        self.GridItems.AddHandler(CheckBox.ClickEvent,
-                                   RoutedEventHandler(self.on_series_checkbox_click))
-        self.GridItems.AddHandler(FrameworkElement.LoadedEvent,
-                                   RoutedEventHandler(self.on_series_header_loaded), True)
 
         # header "select all" checkbox lives in a column header template
         self.Loaded += self.on_loaded
@@ -943,10 +781,6 @@ class SheetExportWindow(forms.WPFWindow):
         cols[4].Visibility = Visibility.Visible if sheets_mode else Visibility.Collapsed
         # a Binding becomes sealed once used, so always assign a fresh one
         cols[1].Binding = Binding("Number" if sheets_mode else "ViewTypeName")
-        # grouping only makes sense for sheets - Views have no Series Range
-        self.ChkGroupSeries.IsEnabled = sheets_mode
-        if not sheets_mode:
-            self.ChkGroupSeries.IsChecked = False
 
     def _refresh_filter(self):
         term = (self.TxtSearch.Text or "").strip().lower()
@@ -964,16 +798,6 @@ class SheetExportWindow(forms.WPFWindow):
         if active_id is not None:
             rows = [r for r in rows if r.IdValue == active_id or r.IsSelected]
 
-        sheets_mode = bool(self.RbSheets.IsChecked)
-        group_on = sheets_mode and bool(self.ChkGroupSeries.IsChecked)
-
-        if group_on:
-            # groups appear / sort in source order, so pre-sort by
-            # (Series Range, natural sheet number) before handing rows
-            # to the CollectionView - this mirrors the Project Browser.
-            rows = sorted(rows, key=lambda r: (self._natural(r.SeriesRange),
-                                               self._natural(r.Number)))
-
         collection = ObservableCollection[object]()
         for r in rows:
             collection.Add(r)
@@ -982,13 +806,7 @@ class SheetExportWindow(forms.WPFWindow):
         # suppress the handler so existing ticks survive a search/filter
         self._syncing = True
         try:
-            if group_on:
-                cvs = CollectionViewSource()
-                cvs.Source = collection
-                cvs.GroupDescriptions.Add(PropertyGroupDescription("SeriesRange"))
-                self.GridItems.ItemsSource = cvs.View
-            else:
-                self.GridItems.ItemsSource = collection
+            self.GridItems.ItemsSource = collection
         finally:
             self._syncing = False
         self._checkbox_click = False
@@ -1112,8 +930,8 @@ class SheetExportWindow(forms.WPFWindow):
                 self.GridItems.UnselectAll()
             finally:
                 self._syncing = False
-                SELECTION_CALLBACK[0] = self._on_selection_changed
-                self._on_selection_changed()
+                SELECTION_CALLBACK[0] = self._update_status
+                self._update_status()
         except Exception as ex:
             logger.debug("V/S set filter failed: %s", ex)
 
@@ -1171,7 +989,7 @@ class SheetExportWindow(forms.WPFWindow):
         if getattr(self, "_checkbox_click", False):
             # the user clicked the tick box itself - leave its value alone
             self._checkbox_click = False
-            self._on_selection_changed()
+            self._update_status()
             return
         self._syncing = True
         SELECTION_CALLBACK[0] = None
@@ -1180,9 +998,9 @@ class SheetExportWindow(forms.WPFWindow):
                 if isinstance(row, ExportItem):
                     row.IsSelected = True
         finally:
-            SELECTION_CALLBACK[0] = self._on_selection_changed
+            SELECTION_CALLBACK[0] = self._update_status
             self._syncing = False
-        self._on_selection_changed()
+        self._update_status()
 
     def on_grid_key(self, sender, args):
         """Space toggles the ticks of every highlighted row."""
@@ -1199,10 +1017,10 @@ class SheetExportWindow(forms.WPFWindow):
             for row in rows:
                 row.IsSelected = target
         finally:
-            SELECTION_CALLBACK[0] = self._on_selection_changed
+            SELECTION_CALLBACK[0] = self._update_status
             self._syncing = False
         self._checkbox_click = False
-        self._on_selection_changed()
+        self._update_status()
         args.Handled = True
 
     def _set_all(self, state):
@@ -1216,8 +1034,8 @@ class SheetExportWindow(forms.WPFWindow):
             self.GridItems.UnselectAll()
         finally:
             self._syncing = False
-            SELECTION_CALLBACK[0] = self._on_selection_changed
-        self._on_selection_changed()
+            SELECTION_CALLBACK[0] = self._update_status
+        self._update_status()
 
     def on_invert(self, sender, args):
         SELECTION_CALLBACK[0] = None
@@ -1228,84 +1046,8 @@ class SheetExportWindow(forms.WPFWindow):
             self.GridItems.UnselectAll()
         finally:
             self._syncing = False
-            SELECTION_CALLBACK[0] = self._on_selection_changed
-        self._on_selection_changed()
-
-    def on_series_checkbox_click(self, sender, args):
-        """Header tick box on a 'Series: ...' group - selects / clears every
-        sheet in that series in one click, regardless of what state WPF's
-        own tri-state cycling left the box in."""
-        box = args.OriginalSource
-        if not isinstance(box, CheckBox):
-            return
-        group = box.Tag
-        if not isinstance(group, CollectionViewGroup):
-            return
-        items = [it for it in group.Items if isinstance(it, ExportItem)]
-        if not items:
-            return
-        # toggle relative to the state BEFORE this click, ignoring whatever
-        # WPF's built-in checked/unchecked/indeterminate cycle just set
-        new_state = not all(it.IsSelected for it in items)
-
-        SELECTION_CALLBACK[0] = None
-        self._syncing = True
-        try:
-            for it in items:
-                it.IsSelected = new_state
-        finally:
-            self._syncing = False
-            SELECTION_CALLBACK[0] = self._on_selection_changed
-        box.IsChecked = new_state
-        self._on_selection_changed()
-        args.Handled = True
-
-    def on_series_header_loaded(self, sender, args):
-        """A group header tick box was just realised (initial load, or
-        scrolled back into view under virtualization) - give it the right
-        checked / unchecked / indeterminate state straight away."""
-        box = args.OriginalSource
-        if isinstance(box, CheckBox) and isinstance(box.Tag, CollectionViewGroup):
-            self._sync_one_group_checkbox(box)
-
-    def _sync_one_group_checkbox(self, box):
-        group = box.Tag
-        items = [it for it in group.Items if isinstance(it, ExportItem)]
-        if not items:
-            state = False
-        else:
-            selected = sum(1 for it in items if it.IsSelected)
-            if selected == 0:
-                state = False
-            elif selected == len(items):
-                state = True
-            else:
-                state = None
-        if box.IsChecked != state:
-            box.IsChecked = state
-
-    def _sync_group_checkboxes(self):
-        """Walk the realised visual tree and refresh every series tick box.
-        Cheap enough to call after any bulk selection change - only the
-        currently-materialised (visible-ish) group headers are touched."""
-        if not bool(self.ChkGroupSeries.IsChecked):
-            return
-        try:
-            self._walk_for_series_checkboxes(self.GridItems)
-        except Exception:
-            pass
-
-    def _walk_for_series_checkboxes(self, parent):
-        count = VisualTreeHelper.GetChildrenCount(parent)
-        for i in range(count):
-            child = VisualTreeHelper.GetChild(parent, i)
-            if isinstance(child, CheckBox) and isinstance(getattr(child, "Tag", None), CollectionViewGroup):
-                self._sync_one_group_checkbox(child)
-            self._walk_for_series_checkboxes(child)
-
-    def _on_selection_changed(self):
+            SELECTION_CALLBACK[0] = self._update_status
         self._update_status()
-        self._sync_group_checkboxes()
 
     def _checked_items(self):
         return [i for i in self._all_items if i.IsSelected]
@@ -1379,30 +1121,6 @@ class SheetExportWindow(forms.WPFWindow):
             os.makedirs(root)
         return root
 
-    def _series_subdir(self, base_folder, item):
-        """When 'sub-folder per series' is on, route this sheet's file into
-        <base_folder>\\<Series Range>\\ instead of the flat base folder.
-        Views never carry a Series Range, so they always stay in the base
-        folder, and callers doing a combined/merged export never call this
-        per item in the first place."""
-        if not bool(self.ChkSubfolderPerSeries.IsChecked):
-            return base_folder
-        if not item.IsSheet or not item.SeriesRange:
-            return base_folder
-        target = os.path.join(base_folder, sanitize(item.SeriesRange, True))
-        if not os.path.isdir(target):
-            os.makedirs(target)
-        return target
-
-    @staticmethod
-    def _rel_name(base_folder, item_folder, fname_with_ext):
-        """File name for the log/status list - includes the series
-        sub-folder when one was used, so the CSV log reads e.g.
-        '01 - Master plan\\0000_COVER SHEET.pdf' instead of just the name."""
-        if item_folder == base_folder:
-            return fname_with_ext
-        return os.path.join(os.path.relpath(item_folder, base_folder), fname_with_ext)
-
     def _selected_formats(self):
         pairs = [("PDF", self.ChkPDF), ("DWG", self.ChkDWG), ("DGN", self.ChkDGN),
                  ("DWF", self.ChkDWF), ("NWC", self.ChkNWC), ("IFC", self.ChkIFC),
@@ -1460,12 +1178,6 @@ class SheetExportWindow(forms.WPFWindow):
 
         self._log("Export started - %d item(s), format(s): %s"
                   % (len(items), ", ".join(formats)))
-        if (bool(self.ChkSubfolderPerSeries.IsChecked)
-                and ((("PDF" in formats) and bool(self.ChkCombinePDF.IsChecked))
-                     or (("DWF" in formats) and bool(self.ChkDwfMerge.IsChecked)))):
-            self._log("Note: 'sub-folder per series' has no effect on a "
-                      "combined PDF or merged DWF - those produce one file "
-                      "for the whole selection.")
 
         try:
             for fmt in formats:
@@ -1617,23 +1329,8 @@ class SheetExportWindow(forms.WPFWindow):
             opt.FileName = name
             ids = List[ElementId]([i.Id for i in items])
             self._set_progress(0, 1, "PDF (combined)")
-            target = os.path.join(folder, name + ".pdf")
-            before_files = set(os.listdir(folder)) if os.path.exists(folder) else set()
             try:
                 doc.Export(folder, ids, opt)
-                if not os.path.exists(target) and os.path.exists(folder):
-                    after_files = set(os.listdir(folder))
-                    new_files = [f for f in (after_files - before_files) if f.lower().endswith(".pdf")]
-                    if new_files:
-                        new_pdf = max(new_files, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
-                        new_pdf_path = os.path.join(folder, new_pdf)
-                        if new_pdf_path != target:
-                            try:
-                                if os.path.exists(target):
-                                    os.remove(target)
-                                os.rename(new_pdf_path, target)
-                            except Exception:
-                                pass
                 records.append(("PDF", "%d items" % total,
                                 os.path.join(folder, name + ".pdf"), "OK", ""))
                 self._log("PDF combined -> %s.pdf" % name)
@@ -1648,13 +1345,12 @@ class SheetExportWindow(forms.WPFWindow):
             if self._cancel:
                 break
             fname = self._resolve_filename(item, cfg)
-            item_folder = self._series_subdir(folder, item)
             self._set_progress(index - 1, total, "PDF  " + fname)
             try:
                 opt = base_options()
                 opt.Combine = False
                 opt.FileName = fname
-                target = os.path.join(item_folder, fname + ".pdf")
+                target = os.path.join(folder, fname + ".pdf")
                 if os.path.exists(target):
                     if self.ChkOverwrite.IsChecked:
                         try:
@@ -1665,33 +1361,10 @@ class SheetExportWindow(forms.WPFWindow):
                         fname = os.path.splitext(
                             os.path.basename(unique_path(target, False)))[0]
                         opt.FileName = fname
-                        target = os.path.join(item_folder, fname + ".pdf")
-
-                before_files = set(os.listdir(item_folder)) if os.path.exists(item_folder) else set()
-
                 ids = List[ElementId]([item.Id])
-                doc.Export(item_folder, ids, opt)
-
-                # Ensure exported PDF file is renamed to exact target name if Revit named it differently
-                if not os.path.exists(target) and os.path.exists(item_folder):
-                    after_files = set(os.listdir(item_folder))
-                    new_files = [f for f in (after_files - before_files) if f.lower().endswith(".pdf")]
-                    if new_files:
-                        new_pdf = max(new_files, key=lambda f: os.path.getmtime(os.path.join(item_folder, f)))
-                        new_pdf_path = os.path.join(item_folder, new_pdf)
-                        if new_pdf_path != target:
-                            try:
-                                if os.path.exists(target):
-                                    os.remove(target)
-                                os.rename(new_pdf_path, target)
-                            except Exception:
-                                try:
-                                    os.replace(new_pdf_path, target)
-                                except Exception as ex_ren:
-                                    self._log("PDF rename warning (%s -> %s): %s" % (new_pdf, fname + ".pdf", ex_ren))
-
+                doc.Export(folder, ids, opt)
                 records.append(("PDF", item.Number or item.Name,
-                                self._rel_name(folder, item_folder, fname + ".pdf"), "OK", ""))
+                                fname + ".pdf", "OK", ""))
             except Exception as ex:
                 records.append(("PDF", item.Number or item.Name,
                                 fname, "FAIL", str(ex)))
@@ -1779,13 +1452,12 @@ class SheetExportWindow(forms.WPFWindow):
             if self._cancel:
                 break
             fname = self._resolve_filename(item, cfg)
-            item_folder = self._series_subdir(folder, item)
             self._set_progress(index - 1, total, "DWG  " + fname)
             try:
                 ids = List[ElementId]([item.Id])
-                doc.Export(item_folder, fname, ids, opt)
+                doc.Export(folder, fname, ids, opt)
                 records.append(("DWG", item.Number or item.Name,
-                                self._rel_name(folder, item_folder, fname + ".dwg"), "OK", ""))
+                                fname + ".dwg", "OK", ""))
             except Exception as ex:
                 records.append(("DWG", item.Number or item.Name, fname, "FAIL", str(ex)))
                 self._log("DWG FAILED %s: %s" % (fname, ex))
@@ -1818,13 +1490,12 @@ class SheetExportWindow(forms.WPFWindow):
             if self._cancel:
                 break
             fname = self._resolve_filename(item, cfg)
-            item_folder = self._series_subdir(folder, item)
             self._set_progress(index - 1, total, "DGN  " + fname)
             try:
                 ids = List[ElementId]([item.Id])
-                doc.Export(item_folder, fname, ids, opt)
+                doc.Export(folder, fname, ids, opt)
                 records.append(("DGN", item.Number or item.Name,
-                                self._rel_name(folder, item_folder, fname + ".dgn"), "OK", ""))
+                                fname + ".dgn", "OK", ""))
             except Exception as ex:
                 records.append(("DGN", item.Number or item.Name, fname, "FAIL", str(ex)))
                 self._log("DGN FAILED %s: %s" % (fname, ex))
@@ -1867,7 +1538,7 @@ class SheetExportWindow(forms.WPFWindow):
                 pass
             return opt
 
-        def export_batch(rows, fname, out_folder):
+        def export_batch(rows, fname):
             vs = ViewSet()
             for row in rows:
                 if not row.Element.CanBePrinted:
@@ -1881,7 +1552,7 @@ class SheetExportWindow(forms.WPFWindow):
             trans = Transaction(doc, "DWF Export")
             trans.Start()
             try:
-                ok = doc.Export(out_folder, fname, vs, opt)
+                ok = doc.Export(folder, fname, vs, opt)
             finally:
                 trans.RollBack()
             if ok is False:
@@ -1892,7 +1563,7 @@ class SheetExportWindow(forms.WPFWindow):
             fname = sanitize(self.TxtCombinedName.Text or "Combined", True)
             self._set_progress(0, 1, "DWF (merged)")
             try:
-                export_batch(items, fname, folder)
+                export_batch(items, fname)
                 records.append(("DWF", "%d items" % len(items),
                                 fname + ext, "OK", ""))
                 self._log("DWF merged -> %s%s  (Revit may append '-' to the name)"
@@ -1909,12 +1580,11 @@ class SheetExportWindow(forms.WPFWindow):
             if self._cancel:
                 break
             fname = self._resolve_filename(item, cfg)
-            item_folder = self._series_subdir(folder, item)
             self._set_progress(index - 1, total, "DWF  " + fname)
             try:
-                export_batch([item], fname, item_folder)
+                export_batch([item], fname)
                 records.append(("DWF", item.Number or item.Name,
-                                self._rel_name(folder, item_folder, fname + ext), "OK", ""))
+                                fname + ext, "OK", ""))
             except Exception as ex:
                 records.append(("DWF", item.Number or item.Name,
                                 fname, "FAIL", str(ex)))
@@ -2171,7 +1841,6 @@ class SheetExportWindow(forms.WPFWindow):
             if self._cancel:
                 break
             fname = self._resolve_filename(item, cfg)
-            item_folder = self._series_subdir(folder, item)
             self._set_progress(index - 1, total, "IMG  " + fname)
             try:
                 opt = ImageExportOptions()
@@ -2185,12 +1854,11 @@ class SheetExportWindow(forms.WPFWindow):
                 opt.ExportRange = ExportRange.SetOfViews
                 opt.HLRandWFViewsFileType = ftype
                 opt.ShadowViewsFileType = ftype
-                opt.FilePath = os.path.join(item_folder, fname)
+                opt.FilePath = os.path.join(folder, fname)
                 ids = List[ElementId]([item.Id])
                 opt.SetViewsAndSheets(ids)
                 doc.ExportImage(opt)
-                records.append(("IMG", item.Number or item.Name,
-                                self._rel_name(folder, item_folder, fname + ext), "OK", ""))
+                records.append(("IMG", item.Number or item.Name, fname + ext, "OK", ""))
             except Exception as ex:
                 records.append(("IMG", item.Number or item.Name, fname, "FAIL", str(ex)))
                 self._log("IMG FAILED %s: %s" % (fname, ex))
