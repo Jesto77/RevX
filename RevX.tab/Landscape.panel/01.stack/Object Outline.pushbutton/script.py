@@ -1,23 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Surface Pattern Region (v8 - Robust Crash-Proof Floor Boundary Extractor)
+Surface Pattern Region (v9 - Crash-Hardened)
 -------------------------------------------------------------------------------
-PyRevit Script: Creates filled regions from the topmost compound-structure
-layer of Floors, Roofs, Ceilings, and Toposolids.
-
-FilledRegionType naming rule:
-  "<ElementTypeName> (Layout)"
-  e.g.  "LA_Paving type-IF1"  ->  "LA_Paving type-IF1 (Layout)"
-
-Compatible: Revit 2023 - 2027+  |  IronPython 2.7 (PyRevit) / Pythonnet CPython
+Creates filled regions from top compound layer of Floors/Roofs/Ceilings/Toposolids.
+Hardened for large/complex floors & toposolids.
 """
 
-__title__  = "Surface Pattern Region"
-__author__  = "PyRevit"
-__doc__    = (
+__title__ = "Surface Pattern Region"
+__author__ = "PyRevit"
+__doc__ = (
     "Select Floors, Roofs, Ceilings or Toposolids. "
-    "Creates a FilledRegion named '<TypeName> (Layout)' matching "
-    "the topmost layer surface foreground + background patterns."
+    "Creates FilledRegion '<TypeName> (Layout)' from top surface patterns."
 )
 
 import sys
@@ -33,21 +26,16 @@ from System.Collections.Generic import List
 
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import (
-    FilteredElementCollector,
-    Floor, RoofBase, Ceiling,
-    FilledRegionType, FilledRegion,
-    CurveLoop, Transaction, ElementId, Options, XYZ, Line, Arc, UV
+    FilteredElementCollector, Floor, RoofBase, Ceiling,
+    FilledRegionType, FilledRegion, CurveLoop, Transaction,
+    ElementId, Options, XYZ, Line, Arc, UV, FailureProcessingResult
 )
 
-# Selection imports compatibility across Revit versions
 try:
     from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 except ImportError:
-    try:
-        from Autodesk.Revit.UI import ISelectionFilter, ObjectType
-    except ImportError:
-        from Autodesk.Revit.UI.Selection import ObjectType
-        ISelectionFilter = object
+    from Autodesk.Revit.UI.Selection import ObjectType
+    ISelectionFilter = object
 
 from Autodesk.Revit.Exceptions import OperationCanceledException
 
@@ -57,256 +45,231 @@ try:
 except ImportError:
     HAS_TOPOSOLID = False
 
+try:
+    from Autodesk.Revit.DB import HostObjectUtils
+    HAS_HOST_UTILS = True
+except ImportError:
+    HAS_HOST_UTILS = False
+
 from pyrevit import forms, revit
 
-doc   = revit.doc
+doc = revit.doc
 uidoc = revit.uidoc
-view  = doc.ActiveView
+view = doc.ActiveView
 
 SUFFIX = " (Layout)"
 
-# ---------------------------------------------------------------------------
-# Revit version detection
-# ---------------------------------------------------------------------------
+# ---------------- limits (raise carefully) ----------------
+MAX_SEGMENTS_PER_LOOP = 400          # hard cap before simplify/skip
+MAX_LOOPS_PER_ELEMENT = 40
+MAX_TESSELLATION_SAMPLES = 24        # arcs/splines
+COLLINEAR_DOT_TOL = 0.99985          # simplify almost-straight chains
+GAP_TOLERANCE = 0.05                 # ~15mm join tolerance
+AREA_MIN = 0.05                      # ignore tiny slivers (ft^2)
+
 try:
-    _ver_str = doc.Application.VersionNumber
-    REVIT_VERSION = int(_ver_str)
+    SHORT_CURVE_TOLERANCE = float(doc.Application.ShortCurveTolerance)
+except Exception:
+    SHORT_CURVE_TOLERANCE = 0.00256
+MIN_CURVE_LEN = max(0.005, SHORT_CURVE_TOLERANCE * 2.0)
+
+try:
+    REVIT_VERSION = int(doc.Application.VersionNumber)
 except Exception:
     REVIT_VERSION = 2024
 
-# Minimum curve length based on Revit's internal short curve tolerance (~0.00256 ft)
-try:
-    SHORT_CURVE_TOLERANCE = doc.Application.ShortCurveTolerance
-except Exception:
-    SHORT_CURVE_TOLERANCE = 0.00256
-
-MIN_CURVE_LEN = max(0.003, SHORT_CURVE_TOLERANCE * 1.05)
-GAP_TOLERANCE = 0.02   # Max gap in feet to consider vertices connected (~6mm)
 
 # =============================================================================
-# COMPAT HELPER: ElementId integer value
+# FAILURE PREPROCESSOR (prevents many hard crashes)
 # =============================================================================
+class _WarnSwallower(DB.IFailuresPreprocessor):
+    def PreprocessFailures(self, failuresAccessor):
+        try:
+            for f in list(failuresAccessor.GetFailureMessages()):
+                try:
+                    failuresAccessor.DeleteWarning(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return FailureProcessingResult.Continue
 
-def element_id_to_int(eid):
-    """Return the integer value of an ElementId regardless of Revit version (2023-2027+)."""
+
+def _cfg_tx(t):
+    """Configure transaction to be less crashy."""
+    try:
+        opts = t.GetFailureHandlingOptions()
+        opts.SetFailuresPreprocessor(_WarnSwallower())
+        opts.SetClearAfterRollback(True)
+        opts.SetDelayedMiniWarnings(True)
+        t.SetFailureHandlingOptions(opts)
+    except Exception:
+        pass
+
+
+def eid_int(eid):
     if eid is None:
         return -1
     try:
-        return int(eid.Value)          # Revit 2024+
-    except AttributeError:
+        return int(eid.Value)
+    except Exception:
         try:
-            return int(eid.IntegerValue)   # Revit 2018-2025
+            return int(eid.IntegerValue)
         except Exception:
             return -1
 
-# =============================================================================
-# TYPE NAME EXTRACTION
-# =============================================================================
 
-def get_type_name(element):
-    """Return the Type name of a system-family element."""
-    try:
-        etype = doc.GetElement(element.GetTypeId())
-        if etype is not None:
-            n = etype.Name
-            if n and n.strip():
-                return n.strip()
-    except Exception:
-        pass
-
-    try:
-        etype = doc.GetElement(element.GetTypeId())
-        if etype is not None:
-            p = etype.get_Parameter(DB.BuiltInParameter.ALL_MODEL_TYPE_NAME)
-            if p is not None:
-                v = p.AsString()
-                if v and v.strip():
-                    return v.strip()
-    except Exception:
-        pass
-
-    try:
-        etype = doc.GetElement(element.GetTypeId())
-        if etype is not None:
-            p = etype.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
-            if p is not None:
-                v = p.AsString()
-                if v and v.strip():
-                    return v.strip()
-    except Exception:
-        pass
-
-    try:
-        p = element.get_Parameter(DB.BuiltInParameter.ELEM_TYPE_PARAM)
-        if p is not None:
-            v = p.AsString()
-            if v and v.strip():
-                return v.strip()
-    except Exception:
-        pass
-
-    try:
-        n = element.Name
-        if n and n.strip() and not n.strip().isdigit():
-            return n.strip()
-    except Exception:
-        pass
-
-    return "UnknownType_{}".format(element_id_to_int(element.Id))
-
-# =============================================================================
-# ELEMENT SUPPORT CHECK
-# =============================================================================
-
-def is_supported(element):
-    if element is None:
+def is_supported(e):
+    if e is None:
         return False
-    if isinstance(element, (Floor, RoofBase, Ceiling)):
+    if isinstance(e, (Floor, RoofBase, Ceiling)):
         return True
-    if HAS_TOPOSOLID and isinstance(element, Toposolid):
+    if HAS_TOPOSOLID and isinstance(e, Toposolid):
         return True
     return False
 
+
+class SupportedFilter(ISelectionFilter):
+    def AllowElement(self, e):
+        return is_supported(e)
+    def AllowReference(self, r, p):
+        return False
+
+
 # =============================================================================
-# TOP LAYER MATERIAL
+# TYPE / MATERIAL / PATTERN
 # =============================================================================
+def get_type_name(element):
+    try:
+        et = doc.GetElement(element.GetTypeId())
+        if et and et.Name and et.Name.strip():
+            return et.Name.strip()
+    except Exception:
+        pass
+    try:
+        et = doc.GetElement(element.GetTypeId())
+        p = et.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM) if et else None
+        if p and p.AsString():
+            return p.AsString().strip()
+    except Exception:
+        pass
+    return "UnknownType_{}".format(eid_int(element.Id))
+
 
 def get_top_layer_material(element):
-    """
-    Walk CompoundStructure and return the Material of the topmost
-    exterior/finish layer that has a valid material assigned.
-    """
     try:
-        etype = doc.GetElement(element.GetTypeId())
-        if etype is not None:
-            cs = etype.GetCompoundStructure()
-            if cs is not None:
-                layers = list(cs.GetLayers())
-                if layers:
-                    try:
-                        first_core = cs.GetFirstCoreLayerIndex()
-                    except Exception:
-                        first_core = 0
-
-                    if first_core > 0:
-                        order = list(range(first_core)) + list(range(first_core, len(layers)))
-                    else:
-                        order = list(range(len(layers)))
-
-                    for idx in order:
-                        lyr = layers[idx]
-                        try:
-                            mid = lyr.MaterialId
-                            if element_id_to_int(mid) != element_id_to_int(ElementId.InvalidElementId):
-                                mat = doc.GetElement(mid)
-                                if mat is not None:
-                                    return mat
-                        except Exception:
-                            continue
+        et = doc.GetElement(element.GetTypeId())
+        cs = et.GetCompoundStructure() if et else None
+        if cs:
+            layers = list(cs.GetLayers())
+            try:
+                first_core = cs.GetFirstCoreLayerIndex()
+            except Exception:
+                first_core = 0
+            order = list(range(first_core)) + list(range(first_core, len(layers))) if first_core > 0 else list(range(len(layers)))
+            for idx in order:
+                try:
+                    mid = layers[idx].MaterialId
+                    if eid_int(mid) != eid_int(ElementId.InvalidElementId):
+                        mat = doc.GetElement(mid)
+                        if mat:
+                            return mat
+                except Exception:
+                    continue
     except Exception:
         pass
-
-    for bip in [
-        DB.BuiltInParameter.MATERIAL_ID_PARAM,
-        DB.BuiltInParameter.STRUCTURAL_MATERIAL_PARAM,
-    ]:
+    for bip in (DB.BuiltInParameter.MATERIAL_ID_PARAM, DB.BuiltInParameter.STRUCTURAL_MATERIAL_PARAM):
         try:
             p = element.get_Parameter(bip)
-            if p is not None:
-                mid = p.AsElementId()
-                if mid is not None and element_id_to_int(mid) != element_id_to_int(ElementId.InvalidElementId):
-                    mat = doc.GetElement(mid)
-                    if mat is not None:
-                        return mat
+            if not p:
+                continue
+            mid = p.AsElementId()
+            if mid and eid_int(mid) != eid_int(ElementId.InvalidElementId):
+                mat = doc.GetElement(mid)
+                if mat:
+                    return mat
         except Exception:
             continue
-
     return None
 
-# =============================================================================
-# SURFACE PATTERN EXTRACTION
-# =============================================================================
 
 def get_surface_pattern(material, foreground=True):
-    """Return (FillPatternElement or None, Color or None)."""
     if material is None:
         return None, None
-
     try:
         if foreground:
-            pid   = material.SurfaceForegroundPatternId
-            color = material.SurfaceForegroundPatternColor
+            pid, color = material.SurfaceForegroundPatternId, material.SurfaceForegroundPatternColor
         else:
-            pid   = material.SurfaceBackgroundPatternId
-            color = material.SurfaceBackgroundPatternColor
-        invalid = element_id_to_int(ElementId.InvalidElementId)
-        pat = doc.GetElement(pid) if element_id_to_int(pid) != invalid else None
+            pid, color = material.SurfaceBackgroundPatternId, material.SurfaceBackgroundPatternColor
+        pat = doc.GetElement(pid) if eid_int(pid) != eid_int(ElementId.InvalidElementId) else None
         return pat, color
-    except AttributeError:
-        pass
-
-    try:
-        pid   = material.SurfacePatternId
-        color = material.SurfacePatternColor
-        invalid = element_id_to_int(ElementId.InvalidElementId)
-        pat   = doc.GetElement(pid) if element_id_to_int(pid) != invalid else None
-        if foreground:
-            return pat, color
-        return None, None
     except Exception:
-        return None, None
+        pass
+    try:
+        if foreground:
+            pid, color = material.SurfacePatternId, material.SurfacePatternColor
+            pat = doc.GetElement(pid) if eid_int(pid) != eid_int(ElementId.InvalidElementId) else None
+            return pat, color
+    except Exception:
+        pass
+    return None, None
 
-# =============================================================================
-# VIEW Z ELEVATION
-# =============================================================================
 
 def get_view_z(v):
-    """Get the active view plane Z coordinate for coplanar 2D projection."""
     try:
-        if v.GenLevel is not None:
-            return v.GenLevel.Elevation
+        if v.GenLevel:
+            return float(v.GenLevel.Elevation)
     except Exception:
         pass
     try:
-        return v.Origin.Z
+        return float(v.Origin.Z)
     except Exception:
-        pass
-    return 0.0
+        return 0.0
+
 
 # =============================================================================
-# GEOMETRY & BOUNDARY EXTRACTION
+# GEOMETRY EXTRACTION (lighter)
 # =============================================================================
+def _collect_solids(ge):
+    out = []
+    if ge is None:
+        return out
+    for obj in ge:
+        if obj is None:
+            continue
+        if isinstance(obj, DB.Solid) and obj.Volume > 1e-6:
+            out.append(obj)
+        elif hasattr(obj, "GetInstanceGeometry"):
+            try:
+                out.extend(_collect_solids(obj.GetInstanceGeometry()))
+            except Exception:
+                pass
+    return out
+
 
 def extract_raw_curves(element):
-    """
-    Extract all boundary curves from an element using Sketch, Profile,
-    or Solid Geometry faces. Returns a flat list of DB.Curve objects.
-    """
-    raw_curves = []
+    """Extract boundary curves with lightest possible method first."""
+    curves = []
 
-    # 1. Try Sketch
+    # 1) Sketch profile (best quality, lightest)
     sketch = None
-    try:
-        sid = element.SketchId if hasattr(element, "SketchId") else None
-        if sid and element_id_to_int(sid) != element_id_to_int(ElementId.InvalidElementId):
-            sketch = doc.GetElement(sid)
-    except Exception:
-        pass
-
-    if sketch is None:
+    for getter in (
+        lambda: doc.GetElement(element.SketchId) if hasattr(element, "SketchId") else None,
+        lambda: doc.GetElement(element.GetSketchId()) if hasattr(element, "GetSketchId") else None,
+    ):
         try:
-            sid = element.GetSketchId()
-            if element_id_to_int(sid) != element_id_to_int(ElementId.InvalidElementId):
-                sketch = doc.GetElement(sid)
+            s = getter()
+            if s is not None:
+                sketch = s
+                break
         except Exception:
             pass
 
     if sketch is None:
         try:
-            dep_ids = element.GetDependentElements(None)
-            for dep_id in dep_ids:
+            for dep_id in element.GetDependentElements(None):
                 dep = doc.GetElement(dep_id)
-                if dep is not None and dep.GetType().Name == "Sketch":
+                if dep and dep.GetType().Name == "Sketch":
                     sketch = dep
                     break
         except Exception:
@@ -317,285 +280,297 @@ def extract_raw_curves(element):
             for arr in sketch.Profile:
                 for c in arr:
                     if c is not None:
-                        raw_curves.append(c)
-            if raw_curves:
-                return raw_curves
+                        curves.append(c)
+            if curves:
+                return curves
         except Exception:
-            pass
+            curves = []
 
-    # 2. Try GetProfile()
-    if REVIT_VERSION < 2026:
+    # 2) Host top faces edges
+    if HAS_HOST_UTILS and isinstance(element, (Floor, RoofBase, Ceiling)):
         try:
-            prof = element.GetProfile()
-            if prof:
-                for lp in prof:
-                    for c in lp:
-                        raw_curves.append(c)
-                if raw_curves:
-                    return raw_curves
+            face_refs = HostObjectUtils.GetTopFaces(element)
+            opts = Options()
+            opts.ComputeReferences = True
+            geom = element.get_Geometry(opts)
+            # fallback to solid face edges below if needed
         except Exception:
-            pass
+            face_refs = None
 
-    # 3. Try Solid Geometry
-    upward = not isinstance(element, Ceiling)
-    solids = []
-
+    # 3) Solid top/bottom face edges (coarse detail!)
     try:
         opts = Options()
         opts.ComputeReferences = False
         try:
-            opts.DetailLevel = DB.ViewDetailLevel.Fine
+            opts.DetailLevel = DB.ViewDetailLevel.Coarse  # IMPORTANT for big elements
         except Exception:
             pass
-
-        geom = element.get_Geometry(opts)
-        if geom is not None:
-            def _collect_solids(g_elem):
-                collected = []
-                for obj in g_elem:
-                    if obj is None:
+        solids = _collect_solids(element.get_Geometry(opts))
+        upward = not isinstance(element, Ceiling)
+        best_face, best_z = None, None
+        for s in solids:
+            try:
+                for face in s.Faces:
+                    try:
+                        if isinstance(face, DB.PlanarFace):
+                            n = face.FaceNormal
+                            z = face.Origin.Z
+                        else:
+                            # skip heavy non-planar faces on huge toposolids
+                            if HAS_TOPOSOLID and isinstance(element, Toposolid):
+                                continue
+                            n = face.ComputeNormal(UV(0.5, 0.5))
+                            bb = face.GetBoundingBox()
+                            z = face.Evaluate(UV((bb.Min.U + bb.Max.U) * 0.5,
+                                                 (bb.Min.V + bb.Max.V) * 0.5)).Z
+                        target = 1.0 if upward else -1.0
+                        if abs(n.Z - target) > 0.15:
+                            continue
+                        if best_z is None or (upward and z > best_z) or ((not upward) and z < best_z):
+                            best_z = z
+                            best_face = face
+                    except Exception:
                         continue
-                    if isinstance(obj, DB.Solid):
-                        if obj.Volume > 0.0001:
-                            collected.append(obj)
-                    elif hasattr(obj, "GetInstanceGeometry"):
-                        try:
-                            ig = obj.GetInstanceGeometry()
-                            if ig is not None:
-                                collected.extend(_collect_solids(ig))
-                        except Exception:
-                            pass
-                return collected
+            except Exception:
+                continue
 
-            solids = _collect_solids(geom)
-    except Exception:
-        solids = []
-
-    best_face = None
-    best_z = None
-
-    for s in solids:
-        try:
-            for face in s.Faces:
-                try:
-                    if isinstance(face, DB.PlanarFace):
-                        norm = face.FaceNormal
-                        z = face.Origin.Z
-                    else:
-                        norm = face.ComputeNormal(UV(0.5, 0.5))
-                        bb = face.GetBoundingBox()
-                        mid_uv = UV((bb.Min.U + bb.Max.U) * 0.5, (bb.Min.V + bb.Max.V) * 0.5)
-                        z = face.Evaluate(mid_uv).Z
-
-                    target_z = 1.0 if upward else -1.0
-                    if abs(norm.Z - target_z) < 0.1:  # ~5 degrees vertical
-                        if best_z is None:
-                            best_z = z
-                            best_face = face
-                        elif upward and z > best_z:
-                            best_z = z
-                            best_face = face
-                        elif not upward and z < best_z:
-                            best_z = z
-                            best_face = face
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    if best_face is not None:
-        try:
+        if best_face is not None:
             for lp in best_face.GetEdgesAsCurveLoops():
                 for c in lp:
-                    raw_curves.append(c)
-        except Exception:
-            pass
+                    curves.append(c)
+    except Exception:
+        pass
 
-    return raw_curves
+    return curves
 
-# =============================================================================
-# TESSELLATION & FLATTENING
-# =============================================================================
-
-def tessellate_and_flatten(curves, z_target):
-    """
-    Tessellate all curves (lines, arcs, splines) into straight 2D DB.Line segments
-    lying strictly on the z_target elevation plane.
-    """
-    flat_lines = []
-
-    for c in curves:
-        if c is None:
-            continue
-        try:
-            # Determine sample points along the curve
-            t0 = c.GetEndParameter(0)
-            t1 = c.GetEndParameter(1)
-
-            if isinstance(c, Line):
-                n_samples = 1
-            elif isinstance(c, Arc):
-                arc_len = abs(t1 - t0)
-                n_samples = max(4, int(math.ceil(arc_len / (math.pi / 16.0))))  # ~32 segs per full circle
-            else:
-                n_samples = 8  # Splines, Ellipses, etc.
-
-            pts = []
-            for i in range(n_samples + 1):
-                t = t0 + (t1 - t0) * (float(i) / float(n_samples))
-                eval_pt = c.Evaluate(t, False)
-                pts.append(XYZ(eval_pt.X, eval_pt.Y, z_target))
-
-            for i in range(len(pts) - 1):
-                p1 = pts[i]
-                p2 = pts[i + 1]
-                if p1.DistanceTo(p2) >= MIN_CURVE_LEN:
-                    flat_lines.append(Line.CreateBound(p1, p2))
-        except Exception:
-            continue
-
-    return flat_lines
 
 # =============================================================================
-# CHAINING & LOOP CLOSURE
+# PROJECT / SIMPLIFY / LOOP BUILD
 # =============================================================================
+def _xy(p, z):
+    return XYZ(p.X, p.Y, z)
 
-def chain_lines_to_loops(lines, z_target):
+
+def _dist2d(a, b):
+    dx = a.X - b.X
+    dy = a.Y - b.Y
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def project_curve_to_plane(c, z):
     """
-    Group unordered flat DB.Line segments into closed, continuous CurveLoops.
-    Guarantees bitwise-exact vertex matches between adjacent segments and loop closure.
+    Keep Line/Arc as single curve when possible.
+    Tessellate only heavier curves, with hard sample cap.
+    Returns list[Curve].
     """
-    if not lines:
+    if c is None:
+        return []
+    try:
+        p0 = _xy(c.GetEndPoint(0), z)
+        p1 = _xy(c.GetEndPoint(1), z)
+        if _dist2d(p0, p1) < MIN_CURVE_LEN and not isinstance(c, Arc):
+            return []
+
+        # Straight line -> one segment
+        if isinstance(c, Line):
+            if _dist2d(p0, p1) >= MIN_CURVE_LEN:
+                return [Line.CreateBound(p0, p1)]
+            return []
+
+        # Arc: try planar projected arc-ish polyline with limited samples
+        n = 1
+        if isinstance(c, Arc):
+            try:
+                ang = abs(c.Length / max(c.Radius, 1e-6))
+                n = int(math.ceil(ang / (math.pi / 12.0)))  # ~15 deg
+            except Exception:
+                n = 8
+        else:
+            n = 10
+
+        n = max(2, min(MAX_TESSELLATION_SAMPLES, n))
+        t0 = c.GetEndParameter(0)
+        t1 = c.GetEndParameter(1)
+        pts = []
+        for i in range(n + 1):
+            t = t0 + (t1 - t0) * (float(i) / float(n))
+            pt = c.Evaluate(t, False)
+            pts.append(_xy(pt, z))
+        return _points_to_lines(pts)
+    except Exception:
         return []
 
-    remaining = list(lines)
-    closed_loops = []
 
-    def pts_near(pA, pB):
-        return pA.DistanceTo(pB) <= GAP_TOLERANCE
+def _points_to_lines(pts):
+    lines = []
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        if _dist2d(a, b) >= MIN_CURVE_LEN:
+            try:
+                lines.append(Line.CreateBound(a, b))
+            except Exception:
+                pass
+    return lines
 
-    while remaining:
-        first_line = remaining.pop(0)
-        # Chain of XYZ points forming the polygon
-        poly_pts = [first_line.GetEndPoint(0), first_line.GetEndPoint(1)]
-        changed = True
 
-        while changed and remaining:
-            changed = False
-            tail = poly_pts[-1]
+def simplify_points(pts):
+    """Remove near-duplicate and collinear points."""
+    if len(pts) < 3:
+        return pts
+    # dedupe consecutive
+    clean = [pts[0]]
+    for p in pts[1:]:
+        if _dist2d(p, clean[-1]) >= MIN_CURVE_LEN:
+            clean.append(p)
+    if len(clean) < 3:
+        return clean
 
-            for i, line in enumerate(remaining):
-                sp = line.GetEndPoint(0)
-                ep = line.GetEndPoint(1)
-
-                if pts_near(tail, sp):
-                    poly_pts.append(ep)
-                    remaining.pop(i)
-                    changed = True
-                    break
-                elif pts_near(tail, ep):
-                    poly_pts.append(sp)
-                    remaining.pop(i)
-                    changed = True
-                    break
-
-        # Check loop closure: tail near head
-        if len(poly_pts) >= 4:  # At least 3 segments (4 points counting start/end)
-            head = poly_pts[0]
-            tail = poly_pts[-1]
-
-            if pts_near(head, tail):
-                # Force last point to match head exactly
-                poly_pts[-1] = head
-
-                # Filter duplicate/micro points
-                clean_pts = [poly_pts[0]]
-                for pt in poly_pts[1:]:
-                    if pt.DistanceTo(clean_pts[-1]) >= MIN_CURVE_LEN:
-                        clean_pts.append(pt)
-
-                # Ensure closing point matches first
-                if clean_pts[0].DistanceTo(clean_pts[-1]) > 0.0001:
-                    clean_pts.append(clean_pts[0])
-
-                if len(clean_pts) >= 4:
-                    cl = CurveLoop()
-                    ok = True
-                    for k in range(len(clean_pts) - 1):
-                        p_start = clean_pts[k]
-                        p_end   = clean_pts[k + 1]
-                        if p_start.DistanceTo(p_end) >= MIN_CURVE_LEN:
-                            try:
-                                seg = Line.CreateBound(p_start, p_end)
-                                cl.Append(seg)
-                            except Exception:
-                                ok = False
-                                break
-
-                    if ok and is_valid_loop(cl):
-                        closed_loops.append(cl)
-
-    return closed_loops
-
-# =============================================================================
-# LOOP VALIDATION & ORIENTATION
-# =============================================================================
-
-def is_valid_loop(cl):
-    """Check if CurveLoop is strictly valid for Revit's FilledRegion engine."""
-    if cl is None:
-        return False
-    try:
-        if cl.IsOpen():
-            return False
-    except Exception:
-        pass
-    try:
-        if cl.HasOpenBounds():
-            return False
-    except Exception:
-        pass
-
-    curves = list(cl)
-    if len(curves) < 3:
-        return False
-
-    for c in curves:
+    # collinear reduce
+    out = [clean[0]]
+    for i in range(1, len(clean) - 1):
+        a = out[-1]
+        b = clean[i]
+        c = clean[i + 1]
+        v1 = XYZ(b.X - a.X, b.Y - a.Y, 0)
+        v2 = XYZ(c.X - b.X, c.Y - b.Y, 0)
         try:
-            if c.Length < SHORT_CURVE_TOLERANCE:
-                return False
+            l1 = math.sqrt(v1.X * v1.X + v1.Y * v1.Y)
+            l2 = math.sqrt(v2.X * v2.X + v2.Y * v2.Y)
+            if l1 < 1e-9 or l2 < 1e-9:
+                continue
+            dot = (v1.X * v2.X + v1.Y * v2.Y) / (l1 * l2)
+            if dot > COLLINEAR_DOT_TOL:
+                continue  # almost collinear, skip b
         except Exception:
-            return False
+            pass
+        out.append(b)
+    out.append(clean[-1])
+    return out
 
-    return True
+
+def curves_to_simple_loops(raw_curves, z):
+    """Project, chain, simplify, build closed CurveLoops with hard caps."""
+    segs = []
+    for c in raw_curves:
+        segs.extend(project_curve_to_plane(c, z))
+    if not segs:
+        return []
+
+    # safety: insane geometry
+    if len(segs) > 5000:
+        return []  # caller will report too complex
+
+    remaining = list(segs)
+    loops = []
+
+    def near(a, b):
+        return _dist2d(a, b) <= GAP_TOLERANCE
+
+    guard = 0
+    max_guard = max(50, len(remaining) * 2)
+
+    while remaining and len(loops) < MAX_LOOPS_PER_ELEMENT and guard < max_guard:
+        guard += 1
+        ln = remaining.pop(0)
+        pts = [ln.GetEndPoint(0), ln.GetEndPoint(1)]
+        grew = True
+        local_guard = 0
+        while grew and remaining and local_guard < len(segs) + 5:
+            local_guard += 1
+            grew = False
+            tail = pts[-1]
+            for i, s in enumerate(remaining):
+                sp, ep = s.GetEndPoint(0), s.GetEndPoint(1)
+                if near(tail, sp):
+                    pts.append(ep)
+                    remaining.pop(i)
+                    grew = True
+                    break
+                if near(tail, ep):
+                    pts.append(sp)
+                    remaining.pop(i)
+                    grew = True
+                    break
+
+        if len(pts) < 4:
+            continue
+        if not near(pts[0], pts[-1]):
+            continue
+
+        pts[-1] = pts[0]
+        pts = simplify_points(pts)
+        if len(pts) >= 3 and _dist2d(pts[0], pts[-1]) > 1e-6:
+            pts.append(pts[0])
+        if len(pts) < 4:
+            continue
+
+        # hard simplify if still too dense
+        if len(pts) - 1 > MAX_SEGMENTS_PER_LOOP:
+            step = int(math.ceil((len(pts) - 1) / float(MAX_SEGMENTS_PER_LOOP)))
+            reduced = [pts[i] for i in range(0, len(pts) - 1, step)]
+            if reduced[0].DistanceTo(pts[0]) > 1e-9:
+                reduced = [pts[0]] + reduced
+            reduced.append(pts[0])
+            pts = simplify_points(reduced)
+            if len(pts) >= 3 and _dist2d(pts[0], pts[-1]) > 1e-6:
+                pts.append(pts[0])
+
+        if len(pts) < 4:
+            continue
+
+        cl = CurveLoop()
+        ok = True
+        count = 0
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            if _dist2d(a, b) < MIN_CURVE_LEN:
+                continue
+            try:
+                cl.Append(Line.CreateBound(a, b))
+                count += 1
+            except Exception:
+                ok = False
+                break
+            if count > MAX_SEGMENTS_PER_LOOP:
+                ok = False
+                break
+        if not ok or count < 3:
+            continue
+        try:
+            if cl.IsOpen():
+                continue
+        except Exception:
+            continue
+        if abs(loop_area_2d(cl)) < AREA_MIN:
+            continue
+        loops.append(cl)
+
+    return loops
 
 
 def loop_area_2d(cl):
-    """Calculate signed 2D shoelace area of a CurveLoop."""
     try:
         pts = [c.GetEndPoint(0) for c in cl]
         n = len(pts)
         if n < 3:
             return 0.0
-        area = 0.0
+        a = 0.0
         for i in range(n):
             j = (i + 1) % n
-            area += pts[i].X * pts[j].Y
-            area -= pts[j].X * pts[i].Y
-        return area * 0.5
+            a += pts[i].X * pts[j].Y - pts[j].X * pts[i].Y
+        return 0.5 * a
     except Exception:
         return 0.0
 
 
-def point_in_polygon_2d(pt, poly_pts):
-    """Ray-casting algorithm to test if 2D point is inside a polygon of XYZ points."""
+def point_in_poly(pt, poly):
     x, y = pt.X, pt.Y
     inside = False
-    n = len(poly_pts)
+    n = len(poly)
     j = n - 1
     for i in range(n):
-        xi, yi = poly_pts[i].X, poly_pts[i].Y
-        xj, yj = poly_pts[j].X, poly_pts[j].Y
+        xi, yi = poly[i].X, poly[i].Y
+        xj, yj = poly[j].X, poly[j].Y
         if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / float(yj - yi + 1e-12) + xi):
             inside = not inside
         j = i
@@ -603,84 +578,67 @@ def point_in_polygon_2d(pt, poly_pts):
 
 
 def orient_loops(loops):
-    """
-    Sort loops by area (descending) and set winding orientation:
-    - Outer islands: Counter-Clockwise (CCW)
-    - Holes inside islands: Clockwise (CW)
-    """
     if not loops:
         return []
-
-    # Sort loops by absolute area descending
-    sorted_loops = sorted(loops, key=lambda lp: abs(loop_area_2d(lp)), reverse=True)
-
-    normal_z = XYZ.BasisZ
-    final_loops = []
-
-    for i, cl in enumerate(sorted_loops):
-        # Extract points for containment testing
+    ordered = sorted(loops, key=lambda lp: abs(loop_area_2d(lp)), reverse=True)
+    out = []
+    for i, cl in enumerate(ordered):
         pts_i = [c.GetEndPoint(0) for c in cl]
-        test_pt = pts_i[0]
-
-        # Count how many larger loops contain this loop's test point
-        containment_depth = 0
+        depth = 0
         for j in range(i):
-            pts_j = [c.GetEndPoint(0) for c in sorted_loops[j]]
-            if point_in_polygon_2d(test_pt, pts_j):
-                containment_depth += 1
-
-        is_outer = (containment_depth % 2 == 0)  # Even depth = Island, Odd depth = Hole
-
+            pts_j = [c.GetEndPoint(0) for c in ordered[j]]
+            if point_in_poly(pts_i[0], pts_j):
+                depth += 1
+        is_outer = (depth % 2 == 0)
         try:
-            is_ccw = cl.IsCounterClockwise(normal_z)
-            if is_outer and not is_ccw:
+            ccw = cl.IsCounterclockwise(XYZ.BasisZ)
+            if is_outer and not ccw:
                 cl.Flip()
-            elif not is_outer and is_ccw:
+            elif (not is_outer) and ccw:
                 cl.Flip()
         except Exception:
-            pass
+            try:
+                # older API name
+                ccw = cl.IsCounterClockwise(XYZ.BasisZ)
+                if is_outer and not ccw:
+                    cl.Flip()
+                elif (not is_outer) and ccw:
+                    cl.Flip()
+            except Exception:
+                pass
+        out.append(cl)
+    return out
 
-        final_loops.append(cl)
-
-    return final_loops
 
 # =============================================================================
-# FILLED REGION TYPE MANAGEMENT
+# FILLED REGION TYPE
 # =============================================================================
-
 def _apply_patterns(frt, fg_pat, fg_col, bg_pat, bg_col):
-    """Apply surface patterns and colors to a FilledRegionType."""
     def safe_set(obj, attr, val):
         try:
             setattr(obj, attr, val)
         except Exception:
             pass
-
     try:
-        fg_id = fg_pat.Id if fg_pat is not None else ElementId.InvalidElementId
-        bg_id = bg_pat.Id if bg_pat is not None else ElementId.InvalidElementId
-        safe_set(frt, "ForegroundPatternId", fg_id)
-        safe_set(frt, "BackgroundPatternId", bg_id)
-        if fg_col is not None and getattr(fg_col, "IsValid", True):
+        safe_set(frt, "ForegroundPatternId", fg_pat.Id if fg_pat else ElementId.InvalidElementId)
+        safe_set(frt, "BackgroundPatternId", bg_pat.Id if bg_pat else ElementId.InvalidElementId)
+        if fg_col is not None:
             safe_set(frt, "ForegroundPatternColor", fg_col)
-        if bg_col is not None and getattr(bg_col, "IsValid", True):
+        if bg_col is not None:
             safe_set(frt, "BackgroundPatternColor", bg_col)
         return
-    except AttributeError:
+    except Exception:
         pass
-
     if fg_pat is not None:
         safe_set(frt, "FillPatternId", fg_pat.Id)
-    if fg_col is not None and getattr(fg_col, "IsValid", True):
+    if fg_col is not None:
         safe_set(frt, "Color", fg_col)
 
 
 def get_or_create_fr_type(name, fg_pat, fg_col, bg_pat, bg_col):
-    """Find FilledRegionType by name and update it, or duplicate to create a new one."""
     all_frt = list(FilteredElementCollector(doc).OfClass(FilledRegionType).ToElements())
     if not all_frt:
-        forms.alert("No Filled Region Type exists in project. Create one manually first.", exitscript=True)
-
+        forms.alert("No Filled Region Type in project. Create one first.", exitscript=True)
     for frt in all_frt:
         try:
             if frt.Name == name:
@@ -688,197 +646,208 @@ def get_or_create_fr_type(name, fg_pat, fg_col, bg_pat, bg_col):
                 return frt
         except Exception:
             continue
-
     try:
         new_frt = all_frt[0].Duplicate(name)
     except Exception:
         import time
-        temp_name = "_tmp_{}".format(int(time.time()))
-        new_frt = all_frt[0].Duplicate(temp_name)
+        new_frt = all_frt[0].Duplicate("_tmp_{}".format(int(time.time())))
         try:
             new_frt.Name = name
         except Exception:
             pass
-
     _apply_patterns(new_frt, fg_pat, fg_col, bg_pat, bg_col)
     return new_frt
 
 
-def delete_existing_filled_regions(fr_type_ids):
-    """Delete existing FilledRegions matching fr_type_ids in the active view once."""
-    if not fr_type_ids:
+def delete_existing_of_types(type_ids):
+    if not type_ids:
         return
-    type_int_set = set(element_id_to_int(tid) for tid in fr_type_ids)
-    existing = FilteredElementCollector(doc, view.Id).OfClass(FilledRegion).ToElements()
-    for fr in existing:
+    wanted = set(eid_int(t) for t in type_ids)
+    doomed = []
+    for fr in FilteredElementCollector(doc, view.Id).OfClass(FilledRegion):
         try:
-            if element_id_to_int(fr.GetTypeId()) in type_int_set:
-                doc.Delete(fr.Id)
+            if eid_int(fr.GetTypeId()) in wanted:
+                doomed.append(fr.Id)
         except Exception:
             pass
+    # delete in chunks
+    chunk = 50
+    for i in range(0, len(doomed), chunk):
+        part = doomed[i:i + chunk]
+        ids = List[ElementId]()
+        for x in part:
+            ids.Add(x)
+        try:
+            doc.Delete(ids)
+        except Exception:
+            for x in part:
+                try:
+                    doc.Delete(x)
+                except Exception:
+                    pass
+
 
 # =============================================================================
-# SELECTION FILTER
+# CREATE FR SAFELY
 # =============================================================================
+def create_fr_safe(fr_type_id, loops):
+    """
+    Try create filled region with fallbacks.
+    Returns (ok, note)
+    """
+    if not loops:
+        return False, "no loops"
 
-class SupportedFilter(ISelectionFilter):
-    def AllowElement(self, e):
-        return is_supported(e)
-
-    def AllowReference(self, r, p):
-        return False
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-def main():
-    valid_vt = [
-        DB.ViewType.FloorPlan,
-        DB.ViewType.CeilingPlan,
-        DB.ViewType.AreaPlan,
-        DB.ViewType.Detail,
-        DB.ViewType.DraftingView,
-        DB.ViewType.Section,
-        DB.ViewType.Elevation,
-    ]
-    if view.ViewType not in valid_vt:
-        forms.alert("Run this script from a Plan, Section, Elevation, or Detail view.", exitscript=True)
-
-    try:
-        refs = uidoc.Selection.PickObjects(
-            ObjectType.Element,
-            SupportedFilter(),
-            "Select Floors / Roofs / Ceilings / Toposolids, then press Finish."
-        )
-    except OperationCanceledException:
-        sys.exit()
-
-    if not refs:
-        forms.alert("Nothing selected.", exitscript=True)
-
-    elements = [doc.GetElement(r.ElementId) for r in refs]
-    elements = [e for e in elements if is_supported(e)]
-
-    if not elements:
-        forms.alert("No supported elements in selection.", exitscript=True)
-
-    z_view = get_view_z(view)
-
-    # Preparation Pass: Types & Clean CurveLoops
-    prep_data = []
-    created_fr_types = set()
-    skipped_info = []
-
-    with Transaction(doc, "FR - Prepare Types") as t_prep:
-        t_prep.Start()
-        for elem in elements:
-            label = "{} [{}]".format(elem.GetType().Name, element_id_to_int(elem.Id))
+    def _try(loop_list):
+        t = Transaction(doc, "FR place")
+        t.Start()
+        _cfg_tx(t)
+        try:
+            net = List[CurveLoop]()
+            for lp in loop_list:
+                net.Add(lp)
+            FilledRegion.Create(doc, fr_type_id, view.Id, net)
+            t.Commit()
+            return True
+        except Exception:
             try:
-                type_name    = get_type_name(elem)
-                fr_type_name = type_name + SUFFIX
-                mat          = get_top_layer_material(elem)
-                fg_pat, fg_col = get_surface_pattern(mat, foreground=True)
-                bg_pat, bg_col = get_surface_pattern(mat, foreground=False)
-
-                fr_type = get_or_create_fr_type(fr_type_name, fg_pat, fg_col, bg_pat, bg_col)
-                created_fr_types.add(fr_type.Id)
-
-                raw_curves = extract_raw_curves(elem)
-                if not raw_curves:
-                    skipped_info.append("{} - could not extract geometry boundary".format(label))
-                    continue
-
-                flat_lines = tessellate_and_flatten(raw_curves, z_view)
-                closed_loops = chain_lines_to_loops(flat_lines, z_view)
-
-                if not closed_loops:
-                    skipped_info.append("{} - loop closure failed".format(label))
-                    continue
-
-                oriented_loops = orient_loops(closed_loops)
-                prep_data.append((elem, fr_type, oriented_loops, label))
-            except Exception as ex:
-                skipped_info.append("{} - error preparing: {}".format(label, str(ex)))
-        t_prep.Commit()
-
-    # Clean up pre-existing filled regions of these types ONCE before placing
-    with Transaction(doc, "FR - Clear Existing") as t_clear:
-        t_clear.Start()
-        delete_existing_filled_regions(created_fr_types)
-        t_clear.Commit()
-
-    # Placement Pass: SubTransactions per element
-    created_count = 0
-
-    for elem, fr_type, oriented_loops, label in prep_data:
-        placed = False
-
-        def try_create_fr(loops_to_place):
-            stx = DB.SubTransaction(doc)
-            stx.Start()
-            try:
-                net_list = List[CurveLoop]()
-                for lp in loops_to_place:
-                    if is_valid_loop(lp):
-                        net_list.Add(lp)
-
-                if net_list.Count > 0:
-                    FilledRegion.Create(doc, fr_type.Id, view.Id, net_list)
-                    stx.Commit()
-                    return True
-            except Exception:
-                pass
-            try:
-                stx.RollBack()
+                if t.HasStarted() and not t.HasEnded():
+                    t.RollBack()
             except Exception:
                 pass
             return False
 
-        with Transaction(doc, "FR - Place: {}".format(label)) as tx:
-            tx.Start()
+    # 1) all loops
+    if len(loops) <= MAX_LOOPS_PER_ELEMENT and _try(loops):
+        return True, "all loops"
 
-            # Tier 1: All loops (Boundary + Holes)
-            if try_create_fr(oriented_loops):
-                placed = True
+    # 2) outer only
+    if _try([loops[0]]):
+        return True, "outer only"
 
-            # Tier 2: Outer Boundary only (Drop Holes if tier 1 fails)
-            if not placed and oriented_loops:
-                if try_create_fr([oriented_loops[0]]):
-                    placed = True
-                    skipped_info.append("{} - placed outer boundary only (holes skipped)".format(label))
+    # 3) each loop separately
+    ok_n = 0
+    for lp in loops[:MAX_LOOPS_PER_ELEMENT]:
+        if _try([lp]):
+            ok_n += 1
+    if ok_n:
+        return True, "individual {}/{}".format(ok_n, len(loops))
+    return False, "create failed"
 
-            # Tier 3: Place loops individually
-            if not placed:
-                indiv_success = 0
-                for lp in oriented_loops:
-                    if try_create_fr([lp]):
-                        indiv_success += 1
-                if indiv_success > 0:
-                    placed = True
-                    skipped_info.append("{} - placed {}/{} loops individually".format(label, indiv_success, len(oriented_loops)))
 
-            if placed:
-                tx.Commit()
-                created_count += 1
-            else:
-                tx.RollBack()
-                skipped_info.append("{} - all placement tiers failed".format(label))
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    valid_vt = [
+        DB.ViewType.FloorPlan, DB.ViewType.CeilingPlan, DB.ViewType.AreaPlan,
+        DB.ViewType.Detail, DB.ViewType.DraftingView, DB.ViewType.Section, DB.ViewType.Elevation
+    ]
+    if view.ViewType not in valid_vt:
+        forms.alert("Run from Plan/Section/Elevation/Detail view.", exitscript=True)
 
-    # Final summary alert
-    msg = "Created {} Filled Region(s).".format(created_count)
-    if skipped_info:
-        msg += "\n\nSkipped / Warnings:\n" + "\n".join(skipped_info[:10])
-        if len(skipped_info) > 10:
-            msg += "\n...and {} more.".format(len(skipped_info) - 10)
+    try:
+        refs = uidoc.Selection.PickObjects(
+            ObjectType.Element, SupportedFilter(),
+            "Select Floors / Roofs / Ceilings / Toposolids, then Finish."
+        )
+    except OperationCanceledException:
+        sys.exit()
 
-    forms.alert(msg, title="Surface Pattern Region", warn_icon=False if created_count > 0 else True)
+    elements = [doc.GetElement(r.ElementId) for r in refs]
+    elements = [e for e in elements if is_supported(e)]
+    if not elements:
+        forms.alert("No supported elements selected.", exitscript=True)
+
+    z_view = get_view_z(view)
+    created = 0
+    skipped = []
+    type_ids = set()
+
+    # prep types first
+    prepared = []
+    t = Transaction(doc, "FR prepare types")
+    t.Start()
+    _cfg_tx(t)
+    try:
+        for e in elements:
+            label = "{} [{}]".format(e.GetType().Name, eid_int(e.Id))
+            try:
+                tname = get_type_name(e) + SUFFIX
+                mat = get_top_layer_material(e)
+                fg_p, fg_c = get_surface_pattern(mat, True)
+                bg_p, bg_c = get_surface_pattern(mat, False)
+                frt = get_or_create_fr_type(tname, fg_p, fg_c, bg_p, bg_c)
+                type_ids.add(frt.Id)
+                prepared.append((e, frt, label))
+            except Exception as ex:
+                skipped.append("{} prep: {}".format(label, ex))
+        t.Commit()
+    except Exception as ex:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        forms.alert("Type prep failed:\n{}".format(ex), exitscript=True)
+
+    # clear old once
+    t = Transaction(doc, "FR clear old")
+    t.Start()
+    _cfg_tx(t)
+    try:
+        delete_existing_of_types(type_ids)
+        t.Commit()
+    except Exception:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+
+    # place one by one with progress
+    total = len(prepared)
+    with forms.ProgressBar(title="Surface Pattern Region", cancellable=True) as pb:
+        for i, (e, frt, label) in enumerate(prepared):
+            if pb.cancelled:
+                skipped.append("Cancelled by user")
+                break
+            pb.update_progress(i + 1, total)
+
+            try:
+                raw = extract_raw_curves(e)
+                if not raw:
+                    skipped.append("{} - no boundary".format(label))
+                    continue
+                if len(raw) > 3000:
+                    skipped.append("{} - too complex ({} curves)".format(label, len(raw)))
+                    continue
+
+                loops = curves_to_simple_loops(raw, z_view)
+                if not loops:
+                    skipped.append("{} - loop build failed / too complex".format(label))
+                    continue
+
+                loops = orient_loops(loops)
+                ok, note = create_fr_safe(frt.Id, loops)
+                if ok:
+                    created += 1
+                    if note != "all loops":
+                        skipped.append("{} - {}".format(label, note))
+                else:
+                    skipped.append("{} - {}".format(label, note))
+            except Exception as ex:
+                skipped.append("{} - {}".format(label, ex))
+                continue
+
+    msg = "Created {} Filled Region(s).".format(created)
+    if skipped:
+        msg += "\n\nSkipped / Notes:\n" + "\n".join(skipped[:15])
+        if len(skipped) > 15:
+            msg += "\n...and {} more.".format(len(skipped) - 15)
+    forms.alert(msg, title="Surface Pattern Region", warn_icon=(created == 0))
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        forms.alert(
-            "Unexpected script error:\n{}\n\n{}".format(str(e), traceback.format_exc()),
-            title="Script Error"
-        )
+        forms.alert("Script error:\n{}\n\n{}".format(e, traceback.format_exc()), title="Error")
