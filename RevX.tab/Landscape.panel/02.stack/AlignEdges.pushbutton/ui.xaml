@@ -1,0 +1,88 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Align Edges - RevX.extension" Height="420" Width="440"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        Background="White">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="16"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="14"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="14"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="14"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="Align Edges" FontSize="28" FontWeight="Bold"/>
+        <TextBlock Grid.Row="1" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="#555555"
+                   Text="Aligns points on the target slab that are coincident with adjacent elements in the XY plane."/>
+        <Border Grid.Row="2" BorderBrush="#C0392B" BorderThickness="0,0,0,2" VerticalAlignment="Bottom"/>
+
+        <Grid Grid.Row="3">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="150"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" VerticalAlignment="Center" Text="1. Select a slab to modify."/>
+            <Button x:Name="btn_pick_slab" Grid.Column="1" Height="28" Content="Pick Slab"
+                    Click="pick_slab_click"/>
+        </Grid>
+
+        <Grid Grid.Row="5">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="150"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" VerticalAlignment="Center" Text="2. Select Align Method"/>
+            <ComboBox x:Name="cmb_method" Grid.Column="1" Height="26"
+                      SelectionChanged="method_changed">
+                <ComboBoxItem Content="Slabs"/>
+                <ComboBoxItem Content="Walls"/>
+                <ComboBoxItem Content="Curbs"/>
+                <ComboBoxItem Content="Stairs"/>
+            </ComboBox>
+        </Grid>
+
+        <Grid Grid.Row="7">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="150"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" VerticalAlignment="Center" Text="3. Select adjacent elements."/>
+            <Button x:Name="btn_pick_adjacent" Grid.Column="1" Height="28" Content="Pick Element(s)"
+                    IsEnabled="False" Click="pick_adjacent_click"/>
+        </Grid>
+
+        <Grid Grid.Row="9">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="150"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" VerticalAlignment="Center" Text="4. Points Offset (ft)"/>
+            <TextBox x:Name="txt_offset" Grid.Column="1" Height="26" Text="0" VerticalContentAlignment="Center"/>
+        </Grid>
+
+        <Grid Grid.Row="11">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <CheckBox x:Name="chk_keep_open" Grid.Column="0" VerticalAlignment="Center" Content="Keep dialog open"/>
+            <Button x:Name="btn_help" Grid.Column="1" Width="28" Height="28" Margin="12,0,0,0"
+                    Content="?" Click="help_click"/>
+            <Button x:Name="btn_close" Grid.Column="3" Width="90" Height="30" Content="Close"
+                    Click="close_click"/>
+            <Button x:Name="btn_run" Grid.Column="4" Width="90" Height="30" Margin="10,0,0,0"
+                    Content="Run" IsEnabled="False" Click="run_click"/>
+        </Grid>
+    </Grid>
+</Window>

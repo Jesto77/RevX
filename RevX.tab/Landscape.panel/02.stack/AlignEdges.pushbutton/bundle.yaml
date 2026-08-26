@@ -1,0 +1,9 @@
+title: Align Edges
+tooltip: >
+  Pick a slab to modify, choose an Align Method (Slabs / Walls / Curbs /
+  Stairs), pick one or more adjacent elements, and any target point
+  coincident in XY with an adjacent edge is re-graded to match its
+  elevation/slope.
+tooltip_title: Align Edges
+context: doc-project
+min_revit_version: 2023
