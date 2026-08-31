@@ -39,6 +39,80 @@ MM_TO_FEET = 1.0 / 304.8  # Conversion factor: 1 mm = 0.00328084 feet
 
 
 # ==============================================================================
+# Z-REFERENCE BASELINE (ported from the working Match Slope tool)
+# ==============================================================================
+# ModifySubElement's value is an ABSOLUTE offset from the slab's flat
+# (un-shape-edited) baseline elevation — NOT an incremental delta from
+# wherever the vertex currently sits. Computing "target_z - pos.Z" (current
+# position) is only correct the very first time a vertex is ever touched;
+# for a vertex that already carries an earlier edit (from this same run's
+# point-injection step, or from a previous run of the tool), that math
+# silently compounds and drifts. Match Slope avoids this by detecting the
+# true flat baseline once and always working from it — we do the same here.
+def get_height_offset_param(el):
+    bips = [
+        getattr(DB.BuiltInParameter, "FLOOR_HEIGHTABOVELEVEL_PARAM", None),
+        getattr(DB.BuiltInParameter, "TOPOSOLID_HEIGHTABOVELEVEL_PARAM", None),
+    ]
+    for bip in bips:
+        if bip is None:
+            continue
+        try:
+            p = el.get_Parameter(bip)
+            if p is not None and p.HasValue:
+                return p.AsDouble()
+        except Exception:
+            pass
+    return 0.0
+
+
+def get_level_elevation(el):
+    try:
+        lvl = doc.GetElement(el.LevelId)
+        if lvl is not None:
+            return lvl.Elevation
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_param_datum_z(el):
+    """Fallback flat baseline if the probe-based detection below fails."""
+    return get_level_elevation(el) + get_height_offset_param(el)
+
+
+def detect_ref_z(editor, target_elem, probe_vertex):
+    """Probe the TRUE flat baseline Z that ModifySubElement measures from,
+    by applying a 0.0 offset inside a throwaway SubTransaction and reading
+    back the resulting position — then rolling back so nothing is actually
+    changed. This matches the vertex by nearest XY since the vertex object
+    itself may be invalidated by the regenerate.
+    """
+    ref_z = None
+    sub = DB.SubTransaction(doc)
+    sub.Start()
+    try:
+        editor.ModifySubElement(probe_vertex, 0.0)
+        doc.Regenerate()
+        editor2 = get_shape_editor(target_elem)
+        if editor2 is not None:
+            verts = list(editor2.SlabShapeVertices) if editor2.SlabShapeVertices else []
+            if verts:
+                ox, oy = probe_vertex.Position.X, probe_vertex.Position.Y
+                best_v, best_d = verts[0], float("inf")
+                for vv in verts:
+                    d = (vv.Position.X - ox) ** 2 + (vv.Position.Y - oy) ** 2
+                    if d < best_d:
+                        best_d, best_v = d, vv
+                ref_z = best_v.Position.Z
+    except Exception:
+        pass
+    finally:
+        sub.RollBack()
+    return ref_z
+
+
+# ==============================================================================
 # STATE CONTAINER
 # ==============================================================================
 class AlignmentState(object):
@@ -308,7 +382,19 @@ def element_label(elem):
 # CORE ALIGN
 # ==============================================================================
 def align_slab(target_elem, adjacent_elements, align_method, offset_feet):
-    """Returns (moved, missed, interior, tolerance, error_msg)."""
+    """Returns (moved, missed, interior, tolerance, boundary_locked, error_msg).
+
+    Ported from the working Match Slope tool's approach: NEVER use
+    MoveSubElement (Revit silently clamps XY back onto the sketch profile
+    for perimeter vertices anyway), and NEVER compute the ModifySubElement
+    value as "target - current position" (that's only valid the very first
+    time a vertex is touched). Instead: (1) inject new points wherever the
+    source has a corner/node the target doesn't, at the correct XY with a
+    placeholder Z, and (2) for every vertex — old or newly injected — apply
+    Z via ModifySubElement using an ABSOLUTE offset from a probed flat
+    baseline (ref_z). Only vertices already coincident in XY with a source
+    edge get touched — matching what "Align Edges" is actually meant to do.
+    """
     ref_curves = []
     source_nodes = []
 
@@ -331,11 +417,11 @@ def align_slab(target_elem, adjacent_elements, align_method, offset_feet):
                         source_nodes.append(p)
 
     if not ref_curves:
-        return (0, 0, 0, 0.0, "No edges found on source elements.")
+        return (0, 0, 0, 0.0, 0, "No edges found on source elements.")
 
     editor = get_shape_editor(target_elem)
     if editor is None:
-        return (0, 0, 0, 0.0, "Could not get shape editor for target.")
+        return (0, 0, 0, 0.0, 0, "Could not get shape editor for target.")
     ensure_enabled(editor)
 
     own_curves = get_reference_curves(target_elem, "Slabs")
@@ -346,19 +432,40 @@ def align_slab(target_elem, adjacent_elements, align_method, offset_feet):
         _, dist = get_exact_3d_point_and_dist_2d(own_curves, pt_xyz.X, pt_xyz.Y)
         return dist <= max_dist
 
+    # STEP 0: Determine the TRUE flat Z baseline that ModifySubElement's value
+    # is measured from, by probing an existing vertex (0.0 offset, rolled back).
+    existing_verts0 = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+    ref_z = detect_ref_z(editor, target_elem, existing_verts0[0]) if existing_verts0 else None
+    if ref_z is None:
+        ref_z = get_param_datum_z(target_elem)  # fallback if the probe failed
+
+    # "Coincident in the XY dimension" tolerance — Align Edges only Z-corrects
+    # points that are ALREADY at (or very near) the source edge in plan.
+    # Defined here (before injection) so the SAME radius is used both to skip
+    # duplicate injection AND to decide which vertices get Z-corrected —
+    # no gap between the two checks.
+    COINCIDENT_TOL = 0.065  # ~20mm
+    COINCIDENT_TOL_SQ = COINCIDENT_TOL * COINCIDENT_TOL
+
     # STEP 1: DYNAMIC POINT INJECTION (Foreground Method)
     # Inject missing shape points onto target slab along source corners & curve nodes
-    existing_verts = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
-    existing_xy = [(v.Position.X, v.Position.Y) for v in existing_verts]
+    #
+    # IMPORTANT: this radius MUST match COINCIDENT_TOL below (~0.065 ft). If the
+    # de-dup radius here were smaller than the coincidence check, a vertex could
+    # sit just far enough away to block injection of a fresh point, yet still be
+    # too far to pass the coincidence check itself — leaving it stranded,
+    # untouched, and wrong. Same constant, no gap between the two.
+    existing_xy = [(v.Position.X, v.Position.Y) for v in existing_verts0]
+    injected = 0
 
     for s_pt in source_nodes:
         if not is_near_target_boundary(s_pt, max_dist=0.5):
             continue
 
-        # Check if a target vertex already exists nearby (< 20mm / 0.065 ft)
+        # Check if a target vertex already exists nearby
         already_exists = False
         for ex_x, ex_y in existing_xy:
-            if ((ex_x - s_pt.X) ** 2 + (ex_y - s_pt.Y) ** 2) <= 0.0042:
+            if ((ex_x - s_pt.X) ** 2 + (ex_y - s_pt.Y) ** 2) <= COINCIDENT_TOL_SQ:
                 already_exists = True
                 break
 
@@ -367,75 +474,127 @@ def align_slab(target_elem, adjacent_elements, align_method, offset_feet):
                 best_3d, _ = get_exact_3d_point_and_dist_2d(ref_curves, s_pt.X, s_pt.Y)
                 if best_3d is not None:
                     target_z = best_3d.Z + offset_feet
-                    # Add point directly to shape editor
+                    # Add point directly to shape editor (Z here is just a placeholder;
+                    # the real elevation is set below via ModifySubElement).
                     new_v = editor.AddPoint(DB.XYZ(s_pt.X, s_pt.Y, target_z))
                     if new_v:
-                        # CRITICAL: Force exact Z elevation on newly created vertex
-                        dz = target_z - new_v.Position.Z
-                        if abs(dz) > MIN_MOVE:
-                            editor.ModifySubElement(new_v, dz)
+                        doc.Regenerate()
+                        value = target_z - ref_z  # ABSOLUTE offset from flat baseline
+                        if abs(value) > MIN_MOVE:
+                            editor.ModifySubElement(new_v, value)
+                            doc.Regenerate()
                         existing_xy.append((s_pt.X, s_pt.Y))
+                        injected += 1
             except Exception:
                 continue
+
+    # Force a full regenerate so editor.SlabShapeVertices reflects every injected
+    # point's TRUE post-edit position before we compute anything further from it.
+    doc.Regenerate()
+
+    editor = get_shape_editor(target_elem)
+    if editor is None:
+        return (0, 0, 0, 0.0, 0, "Shape editor lost after point injection.")
 
     # Re-fetch vertices after point injection
     vertices = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
     if not vertices:
-        return (0, 0, 0, 0.0, "No shape edit points found on target.")
+        return (0, 0, 0, 0.0, 0, "No shape edit points found on target.")
 
-    # Dynamic adaptive tolerance
-    SANITY_CEILING = 15.0
-    valid_gaps = []
-    for pt in vertices:
-        pos = pt.Position
-        if not is_near_target_boundary(pos, max_dist=0.5):
-            continue
-        _, dist = get_exact_3d_point_and_dist_2d(ref_curves, pos.X, pos.Y)
-        if dist <= SANITY_CEILING:
-            valid_gaps.append(dist)
+    # STEP 2: FULL 3D SNAP (X, Y, Z) for every vertex, regardless of distance
+    #
+    # IMPORTANT: capture target (X,Y) positions up front, THEN re-fetch the
+    # live editor/vertex list fresh on every single iteration and match by
+    # position — do NOT hold onto SlabShapeVertex objects across a
+    # Regenerate(). Revit does not commit a shape-edit mutation until the
+    # doc is regenerated, and old vertex handles can go stale once it is.
+    #
+    # Attempt a real 3D MoveSubElement first (this DOES work for genuine
+    # shape-edit points — only literal sketch/boundary corner vertices are
+    # XY-locked by Revit). Regenerate, then re-read the actual resulting
+    # position rather than trusting the call — if the XY didn't truly move
+    # (a locked boundary corner), fall back to Z-only, using the proven
+    # absolute-from-ref_z value (never a delta from current position).
+    SANITY_CEILING = 15.0  # ft — a generous error-guard only, not a design cap
+    target_xy_list = [(v.Position.X, v.Position.Y) for v in vertices]
 
-    edge_tolerance = max(1.0, max(valid_gaps) + 0.1) if valid_gaps else 1.0
-
-    # STEP 2: PRECISE 3D SMART-SNAP ALIGNMENT
     moved = 0
     missed = 0
     interior = 0
+    boundary_locked = 0  # XY didn't take (sketch-locked); Z-only was applied instead
 
-    for pt in vertices:
-        pos = pt.Position
+    for (vx, vy) in target_xy_list:
+        editor = get_shape_editor(target_elem)
+        if editor is None:
+            missed += 1
+            continue
+
+        live_verts = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+        if not live_verts:
+            missed += 1
+            continue
+
+        best_v, best_d = None, float("inf")
+        for vv in live_verts:
+            d = (vv.Position.X - vx) ** 2 + (vv.Position.Y - vy) ** 2
+            if d < best_d:
+                best_d, best_v = d, vv
+
+        if best_v is None or best_d > COINCIDENT_TOL_SQ:
+            missed += 1
+            continue
+
+        pos = best_v.Position
+
         if not is_near_target_boundary(pos, max_dist=0.5):
             interior += 1
             continue
 
         best_3d_pt, dist_2d = get_exact_3d_point_and_dist_2d(ref_curves, pos.X, pos.Y)
 
-        if best_3d_pt is None or dist_2d > edge_tolerance:
+        if best_3d_pt is None or dist_2d > SANITY_CEILING:
             missed += 1
             continue
 
         target_z = best_3d_pt.Z + offset_feet
         dx = best_3d_pt.X - pos.X
         dy = best_3d_pt.Y - pos.Y
-        dz = target_z - pos.Z
+        dz = target_z - pos.Z  # OK here — MoveSubElement's vector really is a delta
 
-        # If vertex is close (< 0.35 ft / ~100mm), move in 3D (X,Y,Z) to snap 100% flush
-        if dist_2d <= 0.35 and (abs(dx) > MIN_MOVE or abs(dy) > MIN_MOVE or abs(dz) > MIN_MOVE):
+        did_full_move = False
+        if abs(dx) > MIN_MOVE or abs(dy) > MIN_MOVE or abs(dz) > MIN_MOVE:
             try:
-                editor.MoveSubElement(pt, DB.XYZ(dx, dy, dz))
-                moved += 1
-                continue
+                editor.MoveSubElement(best_v, DB.XYZ(dx, dy, dz))
+                doc.Regenerate()
+                # VERIFY — re-fetch fresh and check the XY actually landed;
+                # Revit clamps the horizontal component for sketch-locked
+                # boundary corners without raising an exception.
+                live_verts2 = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+                check_v, check_d = None, float("inf")
+                for vv in live_verts2:
+                    d = (vv.Position.X - best_3d_pt.X) ** 2 + (vv.Position.Y - best_3d_pt.Y) ** 2
+                    if d < check_d:
+                        check_d, check_v = d, vv
+                if check_v is not None and check_d <= 0.0042:  # within ~20mm: XY genuinely applied
+                    moved += 1
+                    did_full_move = True
+                    best_v = check_v  # for the fallback branch below, if ever needed
             except Exception:
                 pass
 
-        # Fallback: Modify Z elevation only
-        if abs(dz) > MIN_MOVE:
+        if not did_full_move:
+            # XY didn't take (boundary-locked) — Z-only, ABSOLUTE offset from
+            # the probed flat baseline, never a delta from current position.
+            value = target_z - ref_z
             try:
-                editor.ModifySubElement(pt, dz)
+                editor.ModifySubElement(best_v, value)
+                doc.Regenerate()
                 moved += 1
+                boundary_locked += 1
             except Exception:
                 missed += 1
 
-    return (moved, missed, interior, edge_tolerance, None)
+    return (moved, missed, interior, COINCIDENT_TOL, boundary_locked, None)
 
 
 # ==============================================================================
@@ -734,7 +893,7 @@ class AlignEdgesWindow(forms.WPFWindow):
 
         try:
             with revit.Transaction("Align Edges"):
-                moved, missed, interior, tol, err = align_slab(
+                moved, missed, interior, tol, boundary_locked, err = align_slab(
                     self.target_elem, self.source_elems, method, offset_feet
                 )
         except Exception as ex:
@@ -749,17 +908,19 @@ class AlignEdgesWindow(forms.WPFWindow):
             return
 
         if moved > 0 and missed == 0:
-            self._update_status(
-                "Done — aligned {} point(s).  tol {:.2f} ft  |  interior skipped {}".format(
-                    moved, tol, interior
-                )
+            msg = "Done — aligned {} point(s).  tol {:.2f} ft  |  interior skipped {}".format(
+                moved, tol, interior
             )
+            if boundary_locked:
+                msg += "  |  {} pt(s) Z-only (XY sketch-locked)".format(boundary_locked)
+            self._update_status(msg)
         elif moved > 0:
-            self._update_status(
-                "Aligned {}  •  missed {} (too far)  •  tol {:.2f} ft  •  interior {}".format(
-                    moved, missed, tol, interior
-                )
+            msg = "Aligned {}  •  missed {} (too far)  •  tol {:.2f} ft  •  interior {}".format(
+                moved, missed, tol, interior
             )
+            if boundary_locked:
+                msg += "  •  {} Z-only (sketch-locked)".format(boundary_locked)
+            self._update_status(msg)
         else:
             self._update_status(
                 "No points moved. Check shape points exist and sources are nearby.",
