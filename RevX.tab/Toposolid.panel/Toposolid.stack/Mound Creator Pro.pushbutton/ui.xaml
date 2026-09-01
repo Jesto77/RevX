@@ -1,0 +1,508 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Mound Creator Pro v2" Height="800" Width="540"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanResizeWithGrip"
+        Background="#F2F5F3">
+    <Window.Resources>
+        <SolidColorBrush x:Key="Accent" Color="#1E824C"/>
+        <SolidColorBrush x:Key="AccentDark" Color="#145A32"/>
+        <SolidColorBrush x:Key="AccentLight" Color="#E8F8F0"/>
+        <SolidColorBrush x:Key="PanelBg" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="BorderCol" Color="#D5E1D9"/>
+        <SolidColorBrush x:Key="TextDark" Color="#1C2833"/>
+        <SolidColorBrush x:Key="TextMuted" Color="#5D6D7E"/>
+        <SolidColorBrush x:Key="BlueAccent" Color="#2980B9"/>
+
+        <Style x:Key="SectionHeader" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Foreground" Value="{StaticResource AccentDark}"/>
+            <Setter Property="Margin" Value="0,0,0,6"/>
+        </Style>
+
+        <Style x:Key="Card" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource PanelBg}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderCol}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="Margin" Value="0,0,0,10"/>
+        </Style>
+
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}"/>
+            <Setter Property="Margin" Value="0,0,0,3"/>
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderCol}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Background" Value="#FAFCFA"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+
+        <Style x:Key="PrimaryBtn" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource Accent}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="PreviewBtn" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource BlueAccent}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="10,7"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="GhostBtn" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentLight}"/>
+            <Setter Property="Foreground" Value="{StaticResource AccentDark}"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="6"
+                                BorderBrush="{StaticResource Accent}" BorderThickness="1.2">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="MiniBtn" TargetType="Button">
+            <Setter Property="Background" Value="#EAECEE"/>
+            <Setter Property="Foreground" Value="{StaticResource TextDark}"/>
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="4"
+                                BorderBrush="{StaticResource BorderCol}" BorderThickness="1">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="Slider">
+            <Setter Property="Height" Value="22"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="12.5"/>
+        </Style>
+    </Window.Resources>
+
+    <DockPanel Margin="12">
+
+        <!-- Header -->
+        <StackPanel DockPanel.Dock="Top" Margin="2,0,2,8">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                    <TextBlock Text="Mound Creator Pro" FontSize="20" FontWeight="Bold" Foreground="{StaticResource AccentDark}"/>
+                    <TextBlock x:Name="TxtVersionInfo" Text="Revit 2024 - 2027 Toposolid Engine" FontSize="11" Foreground="{StaticResource TextMuted}"/>
+                </StackPanel>
+                <Border Grid.Column="1" Background="{StaticResource AccentLight}" CornerRadius="12" Padding="10,4" VerticalAlignment="Center">
+                    <TextBlock Text="3D PREVIEW" Foreground="{StaticResource AccentDark}" FontWeight="Bold" FontSize="10.5"/>
+                </Border>
+            </Grid>
+        </StackPanel>
+
+        <!-- Status Log -->
+        <Border DockPanel.Dock="Bottom" Style="{StaticResource Card}" Margin="0,8,0,0" Padding="8">
+            <ScrollViewer Height="60" VerticalScrollBarVisibility="Auto">
+                <TextBlock x:Name="TxtLog" FontFamily="Consolas" FontSize="10.5"
+                           Foreground="{StaticResource TextMuted}" TextWrapping="Wrap"
+                           Text="Ready to create or preview mounds."/>
+            </ScrollViewer>
+        </Border>
+
+        <TabControl BorderThickness="0" Background="Transparent">
+
+            <!-- ======================= CREATE TAB ======================= -->
+            <TabItem Header="Create Mound">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+                    <StackPanel>
+
+                        <!-- 1. Source & Boundary -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="1 · BOUNDARY INPUT MODE" Style="{StaticResource SectionHeader}"/>
+                                <ComboBox x:Name="CmbSourceMode" SelectedIndex="0" Margin="0,0,0,8">
+                                    <ComboBoxItem Content="Pick Model / Detail Lines (Boundary Loop)"/>
+                                    <ComboBoxItem Content="Pick Element Footprint (Floor / Toposolid / Pad)"/>
+                                    <ComboBoxItem Content="Center Point — Circular Mound"/>
+                                    <ComboBoxItem Content="Center Point — Rectangular Mound"/>
+                                </ComboBox>
+
+                                <!-- Panel: Pick Lines -->
+                                <StackPanel x:Name="PanelLinesSource">
+                                    <Button x:Name="BtnPickBoundaryLines" Content="Pick Model / Detail Lines..." Style="{StaticResource PrimaryBtn}" HorizontalAlignment="Left"/>
+                                    <TextBlock x:Name="TxtLinesSourceInfo" Text="No lines selected" FontSize="11" Margin="0,6,0,0" Foreground="{StaticResource TextMuted}"/>
+                                </StackPanel>
+
+                                <!-- Panel: Element Footprint -->
+                                <StackPanel x:Name="PanelElementSource" Visibility="Collapsed">
+                                    <Button x:Name="BtnPickSourceElement" Content="Pick Element Footprint..." Style="{StaticResource PrimaryBtn}" HorizontalAlignment="Left"/>
+                                    <TextBlock x:Name="TxtSourceElementInfo" Text="No element selected" FontSize="11" Margin="0,6,0,0" Foreground="{StaticResource TextMuted}"/>
+                                </StackPanel>
+
+                                <!-- Panel: Circle Source -->
+                                <StackPanel x:Name="PanelCircleSource" Visibility="Collapsed">
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Button x:Name="BtnPickCenterPtCircle" Grid.Column="0" Content="Pick Center Point..." Style="{StaticResource GhostBtn}"/>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Radius (mm)" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="TxtCircleRadius" Text="3000"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <TextBlock x:Name="TxtCenterPtCircleInfo" Text="No center point picked" FontSize="11" Foreground="{StaticResource TextMuted}"/>
+                                </StackPanel>
+
+                                <!-- Panel: Rect Source -->
+                                <StackPanel x:Name="PanelRectSource" Visibility="Collapsed">
+                                    <Button x:Name="BtnPickCenterPtRect" Content="Pick Center Point..." Style="{StaticResource GhostBtn}" HorizontalAlignment="Left" Margin="0,0,0,6"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Length X (mm)" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="TxtRectLength" Text="6000"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Width Y (mm)" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="TxtRectWidth" Text="4000"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <TextBlock x:Name="TxtCenterPtRectInfo" Text="No center point picked" FontSize="11" Foreground="{StaticResource TextMuted}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 2. Profile Geometry & 2D Canvas Preview -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="2 · PROFILE &amp; 2D PREVIEW DIAGRAM" Style="{StaticResource SectionHeader}"/>
+                                
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="Mound Shape Profile" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="CmbProfileType" SelectedIndex="0">
+                                            <ComboBoxItem Content="Dome / Smooth Gaussian Hill"/>
+                                            <ComboBoxItem Content="Mesa / Flat-Top Plateau"/>
+                                            <ComboBoxItem Content="Cone / Sharp Peak Hill"/>
+                                            <ComboBoxItem Content="Ridge / Elongated Crest"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- Presets -->
+                                <TextBlock Text="Quick Presets" Style="{StaticResource FieldLabel}"/>
+                                <UniformGrid Columns="4" Margin="0,2,0,6">
+                                    <Button x:Name="BtnPresetGentle" Content="Gentle Knoll" Style="{StaticResource MiniBtn}" Margin="0,0,3,0"/>
+                                    <Button x:Name="BtnPresetSteep" Content="Steep Dome" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnPresetMesa" Content="Flat Mesa" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnPresetPeak" Content="Sharp Peak" Style="{StaticResource MiniBtn}" Margin="3,0,0,0"/>
+                                </UniformGrid>
+
+                                <!-- Mesa Top Ratio Slider -->
+                                <StackPanel x:Name="PanelPlateauRatio" Visibility="Collapsed" Margin="0,2,0,6">
+                                    <TextBlock Text="Flat Top Width (% of footprint)" Style="{StaticResource FieldLabel}"/>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="46"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="SldPlateauRatio" Grid.Column="0" Minimum="10" Maximum="80" Value="40"/>
+                                        <TextBlock x:Name="TxtPlateauRatioVal" Grid.Column="1" Text="40%" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                    </Grid>
+                                </StackPanel>
+
+                                <!-- 2D Cross-Section Preview Canvas -->
+                                <Border Background="#F7FAF8" BorderBrush="{StaticResource BorderCol}" BorderThickness="1" CornerRadius="4" Padding="4" Margin="0,4,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="Cross-Section Profile Curve Preview" FontSize="10" Foreground="{StaticResource TextMuted}" HorizontalAlignment="Center" Margin="0,0,0,2"/>
+                                        <Canvas x:Name="CnvProfilePreview" Height="50" Width="420" HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 3. Peak Height & Quick Boost -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="3 · PEAK HEIGHT &amp; ELEVATION" Style="{StaticResource SectionHeader}"/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Peak Height (mm)" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="TxtPeakHeight" Text="1500"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="— OR Slope Ratio (1 : x)" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="TxtSlopeRatio" Text=""/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock Text="Quick Peak Adjust (mm)" Style="{StaticResource FieldLabel}" Margin="0,4,0,2"/>
+                                <UniformGrid Columns="4">
+                                    <Button x:Name="BtnQuickHeightMinus500" Content="-500" Style="{StaticResource MiniBtn}" Margin="0,0,3,0"/>
+                                    <Button x:Name="BtnQuickHeightMinus100" Content="-100" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnQuickHeightPlus100" Content="+100" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnQuickHeightPlus500" Content="+500" Style="{StaticResource MiniBtn}" Margin="3,0,0,0"/>
+                                </UniformGrid>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 4. Mesh Density & Smoothness -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="4 · MESH RESOLUTION &amp; EDGE LOCK" Style="{StaticResource SectionHeader}"/>
+
+                                <TextBlock Text="Profile Smoothness / Curvature" Style="{StaticResource FieldLabel}"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="46"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SldSmoothness" Grid.Column="0" Minimum="0" Maximum="100" Value="60"/>
+                                    <TextBlock x:Name="TxtSmoothVal" Grid.Column="1" Text="60" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                </Grid>
+
+                                <TextBlock Text="Grid Density (lower = finer detail mesh)" Style="{StaticResource FieldLabel}" Margin="0,6,0,0"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="46"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SldDensity" Grid.Column="0" Minimum="0.5" Maximum="5" Value="1.5" SmallChange="0.1"/>
+                                    <TextBlock x:Name="TxtDensityVal" Grid.Column="1" Text="1.5 ft" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                </Grid>
+
+                                <CheckBox x:Name="ChkLockBase" Content="Keep Base Edges Sealed at Ground Elevation" IsChecked="True" Margin="0,6,0,0" FontSize="11" Foreground="{StaticResource TextDark}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 5. Host & Type -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="5 · REVIT HOST &amp; TOPOSOLID TYPE" Style="{StaticResource SectionHeader}"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Level" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="CmbLevel"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2" x:Name="PanelToposolidType">
+                                        <TextBlock Text="Toposolid Type" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="CmbToposolidType"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock x:Name="TxtHostNote" FontSize="10.5" Foreground="{StaticResource TextMuted}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 3D Preview & Create Buttons -->
+                        <Grid Margin="0,2,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="80"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="BtnPreview3D" Grid.Column="0" Content="👁️ 3D Preview in Revit" Style="{StaticResource PreviewBtn}"/>
+                            <Button x:Name="BtnClearPreview" Grid.Column="2" Content="Clear" Style="{StaticResource MiniBtn}"/>
+                            <Button x:Name="BtnCreateMound" Grid.Column="4" Content="🚀 Create Mound" Style="{StaticResource PrimaryBtn}"/>
+                        </Grid>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ======================= MODIFY TAB ======================= -->
+            <TabItem Header="Modify Existing">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+                    <StackPanel>
+
+                        <!-- Target Selection -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="TARGET TOPOSOLID / TOPOGRAPHY" Style="{StaticResource SectionHeader}"/>
+                                <Button x:Name="BtnPickTarget" Content="Pick Toposolid / Topography..." Style="{StaticResource PrimaryBtn}" HorizontalAlignment="Left"/>
+                                <TextBlock x:Name="TxtPickedTarget" Text="No element selected" FontSize="11" Margin="0,6,0,0" Foreground="{StaticResource TextMuted}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Peak Elevation / Height Sculpting -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="TOP HEIGHT &amp; ELEVATION SCULPTING" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="Quick Boost / Lower Peak Height (mm)" Style="{StaticResource FieldLabel}"/>
+                                <UniformGrid Columns="4" Margin="0,0,0,8">
+                                    <Button x:Name="BtnModPeakMinus1000" Content="-1000" Style="{StaticResource MiniBtn}" Margin="0,0,3,0"/>
+                                    <Button x:Name="BtnModPeakMinus250" Content="-250" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnModPeakPlus250" Content="+250" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnModPeakPlus1000" Content="+1000" Style="{StaticResource MiniBtn}" Margin="3,0,0,0"/>
+                                </UniformGrid>
+
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="100"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Set Peak Height to (mm above base)" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="TxtPeakTarget" Text="1500"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+                                        <Button x:Name="BtnApplyPeak" Content="Set Peak" Style="{StaticResource GhostBtn}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="100"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Offset ALL Points (+ / - mm)" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="TxtHeightOffset" Text="0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+                                        <Button x:Name="BtnApplyOffset" Content="Apply Offset" Style="{StaticResource GhostBtn}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Smoothness Controls -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="SURFACE SMOOTHING &amp; EDGE ANCHOR" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="Softens bumps and hard edges by averaging point elevations with nearby points." Style="{StaticResource FieldLabel}" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="46"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SldSmoothStrength" Grid.Column="0" Minimum="0" Maximum="100" Value="45"/>
+                                    <TextBlock x:Name="TxtSmoothStrengthVal" Grid.Column="1" Text="45" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                </Grid>
+                                <Grid Margin="0,6,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="80"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="Smoothing Passes" VerticalAlignment="Center" Style="{StaticResource FieldLabel}"/>
+                                    <TextBox x:Name="TxtSmoothPasses" Grid.Column="2" Text="2"/>
+                                </Grid>
+                                <CheckBox x:Name="ChkSmoothLockEdges" Content="Lock Perimeter / Edge Points (Preserve Base Boundary)" IsChecked="True" Margin="0,6,0,0" FontSize="11" Foreground="{StaticResource TextDark}"/>
+                                <Button x:Name="BtnApplySmoothing" Content="Apply Surface Smoothing" Style="{StaticResource GhostBtn}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Slope Controls -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="SLOPE &amp; GRADIENT ALIGNMENT" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="Pick a 2-point direction vector, then tilt the surface to a target gradient along that direction." Style="{StaticResource FieldLabel}" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                                <Button x:Name="BtnPickSlopeDir" Content="Pick Slope Direction (2 Points)..." Style="{StaticResource GhostBtn}" HorizontalAlignment="Left"/>
+                                <TextBlock x:Name="TxtSlopeDir" Text="No direction picked" FontSize="11" Margin="0,6,0,8" Foreground="{StaticResource TextMuted}"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="10"/>
+                                        <ColumnDefinition Width="110"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Target Gradient" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="TxtSlopeValue" Text="8.33"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="Unit" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="CmbSlopeUnit" SelectedIndex="0">
+                                            <ComboBoxItem Content="Percent %"/>
+                                            <ComboBoxItem Content="Ratio 1:x"/>
+                                            <ComboBoxItem Content="Degrees °"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                </Grid>
+                                <Button x:Name="BtnApplySlope" Content="Apply Slope Alignment" Style="{StaticResource GhostBtn}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+                            </StackPanel>
+                        </Border>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+        </TabControl>
+    </DockPanel>
+</Window>
