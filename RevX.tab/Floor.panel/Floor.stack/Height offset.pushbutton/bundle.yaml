@@ -1,9 +1,9 @@
-title: "Height Offset (Keep Points)"
+title: "Height offset"
 author: "Jesto Joy"
 tooltip: |
   Adjusts floor/roof/toposolid level height offset while keeping shape-edited points fixed in 3D space.
   
   How to Use:
   • Select floors, roofs, or toposolids.
-  • Run "Height Offset".
+  • Run "Height offset".
   • Enter height offset value in mm. Level offset updates while sub-element 3D elevations remain fixed.

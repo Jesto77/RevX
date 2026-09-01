@@ -1,5 +1,6 @@
 title: "Sheet Export"
 author: "Jesto Joy"
+highlight: new
 tooltip: |
   Batch exports sheets and views to PDF, DWG, DGN, DWF, NWC, IFC, and images with custom naming rules.
   

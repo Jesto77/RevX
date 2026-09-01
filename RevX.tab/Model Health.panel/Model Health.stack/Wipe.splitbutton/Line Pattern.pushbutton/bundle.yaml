@@ -1,8 +1,8 @@
-title: "Wipe Line Patterns"
+title: "Line Pattern"
 author: "Jesto Joy"
 tooltip: |
   Manages and purges unused line patterns from the Revit document.
   
   How to Use:
-  • Click "Wipe Line Patterns".
+  • Click "Line Pattern".
   • Select unused line patterns from UI list and purge.

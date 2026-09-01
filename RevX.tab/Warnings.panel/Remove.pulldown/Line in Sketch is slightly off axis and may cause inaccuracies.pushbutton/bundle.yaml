@@ -1,4 +1,4 @@
-title: "Fix Off-Axis Sketch Lines"
+title: "Line in Sketch is slightly off axis and may cause inaccuracies"
 author: "Jesto Joy"
 tooltip: |
   Scans sketch warnings and automatically snaps slightly off-axis sketch line endpoints to orthogonal axes.

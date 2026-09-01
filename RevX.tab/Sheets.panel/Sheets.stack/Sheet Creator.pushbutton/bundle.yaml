@@ -1,4 +1,4 @@
-title: "Sheet Creator (Sync Excel)"
+title: "Sheet Creator"
 author: "Jesto Joy"
 tooltip: |
   Creates and syncs ViewSheets from an Excel Drawing Register and tags 'Series Range' parameters.

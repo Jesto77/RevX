@@ -1,4 +1,4 @@
-title: "Reset Floor Shapes"
+title: "Reset Shape"
 author: "Jesto Joy"
 tooltip: |
   Resets shape-edited floors back to flat condition by removing slab shape modifications.

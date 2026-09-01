@@ -1,9 +1,9 @@
-title: "Inspect Link Element ID"
+title: "Element ID"
 author: "Jesto Joy"
 tooltip: |
   Interactively picks elements inside a linked Revit model and outputs detailed element IDs and properties.
   
   How to Use:
-  • Click "Element ID Link".
+  • Click "Element ID".
   • Pick elements inside a linked Revit model.
   • Outputs table of linked doc name, element ID, category, family/type name, and bounding box.

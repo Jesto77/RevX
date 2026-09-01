@@ -1,9 +1,9 @@
-title: "Model Health Dashboard"
+title: "Health"
 author: "Jesto Joy"
 tooltip: |
   Audits model health metrics, warnings, unneeded view filters/templates, and unlinked CAD imports.
   
   How to Use:
-  • Run "Model Health".
+  • Run "Health".
   • View health metrics dashboard.
   • Execute one-click cleanup routines.

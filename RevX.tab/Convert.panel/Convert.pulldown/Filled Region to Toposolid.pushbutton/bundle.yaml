@@ -1,4 +1,4 @@
-title: "Filled Region <-> Toposolid"
+title: "Filled Region to Toposolid"
 author: "Jesto Joy"
 tooltip: |
   Bidirectional 1-click converter between Filled Regions and Toposolids (Revit 2024+).

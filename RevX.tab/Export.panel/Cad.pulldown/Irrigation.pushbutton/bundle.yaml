@@ -1,9 +1,9 @@
-title: "Irrigation DWG Export"
+title: "Irrigation"
 author: "Jesto Joy"
 tooltip: |
   Exports irrigation views into a single merged DWG with all lines and hatch patterns set to Grey 253.
   
   How to Use:
   • Open an irrigation layout view.
-  • Run "Irrigation DWG".
+  • Run "Irrigation".
   • The tool exports host and linked elements into a single DWG, converting solid hatch fills into pattern lines in Grey 253.

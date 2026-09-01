@@ -1,4 +1,4 @@
-title: "Get Blocks from CAD"
+title: "Get Blocks"
 author: "Jesto Joy"
 tooltip: |
   Places Revit family instances at AutoCAD POINT coordinates extracted from linked DWG imports.

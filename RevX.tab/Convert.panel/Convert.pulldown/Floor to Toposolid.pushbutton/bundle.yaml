@@ -1,4 +1,4 @@
-title: "Floor <-> Toposolid"
+title: "Floor to Toposolid"
 author: "Jesto Joy"
 tooltip: |
   Bidirectional 1-click converter between Floors and Toposolids (Revit 2024+).

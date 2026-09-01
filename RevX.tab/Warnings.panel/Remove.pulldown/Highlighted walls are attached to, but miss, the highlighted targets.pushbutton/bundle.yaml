@@ -1,4 +1,4 @@
-title: "Highlight Unattached Walls"
+title: "Highlighted walls are attached to, but miss, the highlighted targets"
 author: "Jesto Joy"
 tooltip: |
   Scans warnings for walls attached to missing targets and overrides their graphics in RED in the active view.

@@ -1,8 +1,8 @@
-title: "Wipe Imported CAD"
+title: "Imported Cad"
 author: "Jesto Joy"
 tooltip: |
   Searches and purges unlinked imported CAD DWG/DXF files from the project.
   
   How to Use:
-  • Click "Wipe Imported CAD".
+  • Click "Imported Cad".
   • Select imported CAD instances from checklist UI and confirm delete.

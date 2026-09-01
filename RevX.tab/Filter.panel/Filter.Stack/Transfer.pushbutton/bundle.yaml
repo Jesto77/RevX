@@ -1,9 +1,9 @@
-title: "Transfer View Filters"
+title: "Transfer"
 author: "Jesto Joy"
 tooltip: |
   Transfers view filter definitions between open Revit project files in the same session.
   
   How to Use:
   • Open two or more Revit projects.
-  • Run "Transfer Filters".
+  • Run "Transfer".
   • Pick SOURCE project, DESTINATION project, and select filters to copy.

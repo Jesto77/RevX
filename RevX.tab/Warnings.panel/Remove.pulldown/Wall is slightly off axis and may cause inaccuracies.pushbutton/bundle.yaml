@@ -1,4 +1,4 @@
-title: "Fix Off-Axis Walls"
+title: "Wall is slightly off axis and may cause inaccuracies"
 author: "Jesto Joy"
 tooltip: |
   Scans document warnings for off-axis walls and snaps wall location lines to exact orthogonal angles.

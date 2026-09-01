@@ -1,4 +1,4 @@
-title: "Copy Filter State"
+title: "Copy State"
 author: "Jesto Joy"
 tooltip: |
   Copies view filter visibility and graphic overrides from the active view to memory.

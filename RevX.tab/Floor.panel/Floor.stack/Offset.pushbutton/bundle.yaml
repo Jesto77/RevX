@@ -1,4 +1,4 @@
-title: "Offset Elements"
+title: "Offset"
 author: "Jesto Joy"
 tooltip: |
   Resizes Floors, Ceilings, Roofs, and Toposolids with uniform boundary offsets (+ outward / - inward).

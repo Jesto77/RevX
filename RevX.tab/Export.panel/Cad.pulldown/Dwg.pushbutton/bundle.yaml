@@ -1,9 +1,9 @@
-title: "DWG Export (Merged)"
+title: "Dwg"
 author: "Jesto Joy"
 tooltip: |
   Exports Revit views to DWG merging surface patterns and block geometry into a single combined file.
   
   How to Use:
   • Open the active view to export.
-  • Run "DWG Export".
+  • Run "Dwg".
   • The tool processes floor/roof/toposolid pattern layers into merged block entities in the exported DWG.

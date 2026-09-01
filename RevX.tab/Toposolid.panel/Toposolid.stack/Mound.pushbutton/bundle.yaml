@@ -1,4 +1,4 @@
-title: "Mound Surface Creator"
+title: "Mound"
 author: "Jesto Joy"
 tooltip: |
   Creates Topography or Toposolid surfaces from selected model contour lines and boundary curves.
