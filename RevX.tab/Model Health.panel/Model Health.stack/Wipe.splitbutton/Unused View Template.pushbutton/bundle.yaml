@@ -1,0 +1,8 @@
+title: "Wipe Unused Templates"
+author: "Jesto Joy"
+tooltip: |
+  Purges view templates that are not assigned to any view in the project.
+  
+  How to Use:
+  • Click "Wipe Unused Templates".
+  • Identifies unassigned view templates and purges them.

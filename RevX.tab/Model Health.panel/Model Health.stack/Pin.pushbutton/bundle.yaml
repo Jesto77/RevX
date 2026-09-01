@@ -1,0 +1,8 @@
+title: "Pin Grids, Levels & Links"
+author: "Jesto Joy"
+tooltip: |
+  Pins all Grids, Levels, Revit Links, and CAD Links in the project to prevent accidental movement.
+  
+  How to Use:
+  • Run "Pin".
+  • The tool automatically pins all unpinned grids, levels, revit links, and CAD links and displays a summary.

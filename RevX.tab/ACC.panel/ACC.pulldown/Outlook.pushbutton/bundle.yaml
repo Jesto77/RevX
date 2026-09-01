@@ -1,0 +1,8 @@
+title: "Outlook Web"
+author: "Jesto Joy"
+tooltip: |
+  Opens the Outlook Web App inbox in Google Chrome.
+  
+  How to Use:
+  • Click "Outlook" from the ACC pulldown menu.
+  • Google Chrome launches automatically and opens your Outlook Web inbox (falls back to default browser if Chrome is missing).

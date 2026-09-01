@@ -1,0 +1,9 @@
+title: "Selection Box Link"
+author: "Jesto Joy"
+tooltip: |
+  Creates or updates a 3D section box view cropped around selected linked model elements.
+  
+  How to Use:
+  • Click "Selection Box Link".
+  • Pick an element inside a linked Revit model.
+  • Opens 3D view with section box fitted around linked element geometry.

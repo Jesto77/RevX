@@ -1,0 +1,8 @@
+title: "Revit ID Loop"
+author: "Jesto Joy"
+tooltip: |
+  Opens the Revit ID Loop SharePoint List in your web browser.
+  
+  How to Use:
+  • Click "Revit ID" from the ACC pulldown menu.
+  • Opens the team SharePoint list tracking Revit IDs in your default browser.

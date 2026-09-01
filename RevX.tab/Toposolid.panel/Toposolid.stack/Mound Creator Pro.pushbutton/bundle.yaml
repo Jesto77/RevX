@@ -1,7 +1,9 @@
-title: Mound Creator Pro
-tooltip: >
-  Advanced mound creation & editing tool for Toposolids (Revit 2024-2027)
-  and TopographySurfaces. Supports Dome, Mesa, Cone, and Ridge profiles,
-  footprint or center-point inputs, smoothing, elevation adjustments, and slope controls.
-author: Jesto Joy
-highlight: new
+title: "Mound Creator Pro"
+author: "Jesto Joy"
+tooltip: |
+  Advanced mound creation and editing tool for Toposolids (Revit 2024-2027) & TopographySurfaces.
+  
+  How to Use:
+  • Run "Mound Creator Pro".
+  • Select profile type (Dome, Mesa, Cone, Ridge).
+  • Input footprint curve or center point and set height/slope controls.

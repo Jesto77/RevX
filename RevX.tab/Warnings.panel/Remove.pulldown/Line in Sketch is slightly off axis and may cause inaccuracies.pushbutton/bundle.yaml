@@ -1,0 +1,9 @@
+title: "Fix Off-Axis Sketch Lines"
+author: "Jesto Joy"
+tooltip: |
+  Scans sketch warnings and automatically snaps slightly off-axis sketch line endpoints to orthogonal axes.
+  
+  How to Use:
+  • Click button under Warnings pulldown.
+  • Detects off-axis sketch line warnings.
+  • Snaps line endpoints to 0°, 90°, 180°, 270° and rounds coordinates to clear warning.

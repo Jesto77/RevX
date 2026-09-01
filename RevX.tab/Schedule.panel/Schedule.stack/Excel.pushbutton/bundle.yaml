@@ -1,0 +1,9 @@
+title: "Export Schedule to Excel"
+author: "Jesto Joy"
+tooltip: |
+  Exports Revit Schedule to Excel preserving formatting, text/fill colors, borders, images, and merged cells.
+  
+  How to Use:
+  • Open schedule view or select schedules.
+  • Run "Schedule to Excel".
+  • Exports to Excel matching Revit schedule appearance exactly.

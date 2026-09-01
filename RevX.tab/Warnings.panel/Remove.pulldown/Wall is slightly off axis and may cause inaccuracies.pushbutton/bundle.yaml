@@ -1,0 +1,9 @@
+title: "Fix Off-Axis Walls"
+author: "Jesto Joy"
+tooltip: |
+  Scans document warnings for off-axis walls and snaps wall location lines to exact orthogonal angles.
+  
+  How to Use:
+  • Click button under Warnings pulldown.
+  • Finds walls flagged in "Wall is slightly off axis" warnings.
+  • Snaps wall endpoints to orthogonal orientations to clear warnings.

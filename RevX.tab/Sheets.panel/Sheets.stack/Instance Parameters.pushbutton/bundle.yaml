@@ -1,0 +1,9 @@
+title: "Title Block Parameters"
+author: "Jesto Joy"
+tooltip: |
+  Excel-like DataGridView manager to batch edit title block instance parameters across all project sheets.
+  
+  How to Use:
+  • Click "Title Block Parameters".
+  • View and edit title block parameters in grid table UI with copy-paste support.
+  • Click Apply to update title block parameters across sheets.

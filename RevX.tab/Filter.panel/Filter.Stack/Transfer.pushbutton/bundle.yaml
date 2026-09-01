@@ -1,28 +1,9 @@
-title: Transfer Filters
-author: Jesto Joy
-tooltip: Copy view filter definitions (categories, rules, names) from one open project to another
-
-description: |
-  Transfer Filters - Cross-Project Parameter Filter Transfer
-
-  Description
-  ----------
-  Transfers selected view filters from a source Revit project to a destination project within the same Revit session.
-
-  The tool copies filter definitions including:
-  - Filter categories
-  - Filter rules (element filter logic where supported)
-  - Filter names
-
-  If a filter with the same name already exists in the destination project, it will be skipped automatically to prevent duplicates.
-
-  This tool does not transfer view overrides — only filter definitions.
-
-  How to Use
-  ----------
-  1. Open at least two Revit projects in the same session
-  2. Run "Transfer Filters"
-  3. Select the SOURCE project
-  4. Select the DESTINATION project
-  5. Choose filters to transfer
-  6. Click "Transfer" to copy filter definitions
+title: "Transfer View Filters"
+author: "Jesto Joy"
+tooltip: |
+  Transfers view filter definitions between open Revit project files in the same session.
+  
+  How to Use:
+  • Open two or more Revit projects.
+  • Run "Transfer Filters".
+  • Pick SOURCE project, DESTINATION project, and select filters to copy.

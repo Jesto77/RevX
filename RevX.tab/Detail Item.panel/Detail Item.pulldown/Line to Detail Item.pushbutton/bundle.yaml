@@ -1,0 +1,9 @@
+title: "Line to Detail Item"
+author: "Jesto Joy"
+tooltip: |
+  Converts selected detail lines, model lines, or curve geometry into a new Detail Item family (.rfa).
+  
+  How to Use:
+  • Select detail or model lines in the active view.
+  • Run "Line to Detail Item".
+  • Name the family and save the `.rfa` file.

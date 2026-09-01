@@ -1,0 +1,9 @@
+title: "Copy Link Display"
+author: "Jesto Joy"
+tooltip: |
+  Copies Revit Link Custom display overrides across views and view templates.
+  
+  How to Use:
+  • Run "Copy Link Display".
+  • Pick link and source view with custom display settings.
+  • Select target views or view templates to transfer overrides.

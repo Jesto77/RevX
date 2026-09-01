@@ -1,12 +1,8 @@
-title: Copy State
-
-author: Jesto Joy
-
+title: "Copy Filter State"
+author: "Jesto Joy"
 tooltip: |
-  Copy filter visibility settings and graphic overrides from the active view for use in another view or view template.
-
+  Copies view filter visibility and graphic overrides from the active view to memory.
+  
   How to Use:
-  • Open the source view.
-  • Select the filters to copy.
-  • Click Copy State.
-  • Run Paste State to apply the saved settings.
+  • Open a view with configured view filters.
+  • Run "Copy State" to store filter overrides in memory.

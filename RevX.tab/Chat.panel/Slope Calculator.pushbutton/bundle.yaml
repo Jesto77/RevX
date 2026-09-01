@@ -1,0 +1,9 @@
+title: "Ramp Calculator"
+author: "Jesto Joy"
+tooltip: |
+  Interactive Ramp & Slope Calculator with live unit conversions (percentage, 1:N ratio, degrees, rise/run).
+  
+  How to Use:
+  • Click "Slope Calculator" to launch the calculator window.
+  • Enter known dimensions (rise, run, or slope angle/ratio).
+  • Values recalculate instantly across all slope format representations.

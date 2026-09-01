@@ -1,7 +1,9 @@
-title: Elevation
-author: Jesto Joy
-description: >
-  This tool elevates selected Revit model lines by a user-defined vertical
-  offset.The tool is useful for quickly adjusting elevation of model lines without
-  manual repositioning. It ensures unit-safe conversion and applies changes
-  within a single transaction for consistency.
+title: "Elevate Model Lines"
+author: "Jesto Joy"
+tooltip: |
+  Elevates selected Revit model lines vertically by a user-defined elevation offset in mm.
+  
+  How to Use:
+  • Pick model lines in view.
+  • Enter vertical elevation offset in mm.
+  • Lines move vertically in a single transaction.

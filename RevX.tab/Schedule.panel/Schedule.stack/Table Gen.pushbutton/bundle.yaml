@@ -1,0 +1,9 @@
+title: "TableGen (Excel to Schedule)"
+author: "Jesto Joy"
+tooltip: |
+  Imports Excel spreadsheets (.xlsx) or CSV files directly into native Revit ViewSchedule tables.
+  
+  How to Use:
+  • Click "TableGen".
+  • Select Excel/CSV file.
+  • Creates native Revit schedule preserving cell styles, alignments, and merged cells.

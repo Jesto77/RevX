@@ -1,12 +1,9 @@
-title: In-Place to Loadable
-
-author: Jesto Joy
-
+title: "In-Place to Loadable"
+author: "Jesto Joy"
 tooltip: |
-  Convert an in-place family into a loadable family while preserving its geometry, category, and placement.
-
+  Converts an in-place family instance into a loadable `.rfa` family preserving category, placement, and geometry.
+  
   How to Use:
   • Select an in-place family instance.
-  • Choose whether to keep or delete the original.
-  • The tool creates a loadable family.
-  • Loads and places it in the same location.
+  • Run "In-Place to Loadable".
+  • Choose whether to keep/delete original; builds `.rfa`, loads into project, and replaces instance.

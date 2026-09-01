@@ -1,0 +1,9 @@
+title: "Floor <-> Toposolid"
+author: "Jesto Joy"
+tooltip: |
+  Bidirectional 1-click converter between Floors and Toposolids (Revit 2024+).
+  
+  How to Use:
+  • Select Floors and/or Toposolids in the model.
+  • Run the tool — it converts elements while preserving sketch boundary loops.
+  • Choose target element types and confirm whether to delete original elements.

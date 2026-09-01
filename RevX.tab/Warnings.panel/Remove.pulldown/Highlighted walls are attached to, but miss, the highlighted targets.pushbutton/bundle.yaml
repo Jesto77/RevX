@@ -1,0 +1,9 @@
+title: "Highlight Unattached Walls"
+author: "Jesto Joy"
+tooltip: |
+  Scans warnings for walls attached to missing targets and overrides their graphics in RED in the active view.
+  
+  How to Use:
+  • Click button under Warnings pulldown.
+  • Scans warnings for walls attached to missing targets.
+  • Overrides failing walls in solid RED graphics for quick visual identification.

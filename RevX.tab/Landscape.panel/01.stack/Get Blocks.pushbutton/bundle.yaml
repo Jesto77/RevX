@@ -1,18 +1,9 @@
-title: Get Blocks
-author: Jesto Joy
-tooltip: Place families from AutoCAD POINT data
-description: |
-  Get Blocks - Place Families from AutoCAD POINT Data
-
-  Description
-  ----------
-  Reads POINT objects from a linked AutoCAD import and places Revit family instances at matching coordinates on the active level. The tool filters points by selected CAD layer and converts them into Revit family placements while avoiding duplicates.
-
-  How to Use
-  ----------
-  1. Open a floor plan view in Revit
-  2. Run "Get Blocks"
-  3. Select a family instance (placement type)
-  4. Select the CAD import instance
-  5. Choose the CAD layer containing POINT data
-  6. The tool places families automatically at detected points
+title: "Get Blocks from CAD"
+author: "Jesto Joy"
+tooltip: |
+  Places Revit family instances at AutoCAD POINT coordinates extracted from linked DWG imports.
+  
+  How to Use:
+  • Select family type to place.
+  • Pick linked CAD import instance.
+  • Select CAD layer containing POINT data to place instances automatically.

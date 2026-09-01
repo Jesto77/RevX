@@ -1,0 +1,8 @@
+title: "Wipe Views Not On Sheets"
+author: "Jesto Joy"
+tooltip: |
+  Identifies and purges working views that are not placed on any drawing sheet.
+  
+  How to Use:
+  • Click "Views Not On Sheets".
+  • Select unplaced views from list and delete or archive.

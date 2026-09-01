@@ -1,12 +1,9 @@
-title: Reset Shape
-
-author: Jesto Joy
-
+title: "Reset Floor Shapes"
+author: "Jesto Joy"
 tooltip: |
-  Reset shape-edited floors back to their original flat condition by removing all slab shape modifications.
-
+  Resets shape-edited floors back to flat condition by removing slab shape modifications.
+  
   How to Use:
-  • Select one or more floors.
-  • Run the tool.
-  • Shape-edited floors are reset automatically.
-  • Review the completion summary.
+  • Select one or more shape-edited floors.
+  • Run "Reset Shape".
+  • Resets sub-element points and reports success count.

@@ -1,0 +1,10 @@
+title: "Change Family Category"
+author: "Jesto Joy"
+tooltip: |
+  Re-assigns the category of a loadable family by picking an instance in the view.
+  
+  How to Use:
+  • Click "Category".
+  • Pick a family instance in the open view.
+  • Select a new category from the alphabetical list.
+  • The tool opens the family in the background, updates its category, and reloads it.

@@ -1,0 +1,9 @@
+title: "Sheet Creator (Sync Excel)"
+author: "Jesto Joy"
+tooltip: |
+  Creates and syncs ViewSheets from an Excel Drawing Register and tags 'Series Range' parameters.
+  
+  How to Use:
+  • Click "Sheet Creator".
+  • Select Excel Drawing Register file.
+  • Select title block family; sheets are created and tagged with series range parameters.

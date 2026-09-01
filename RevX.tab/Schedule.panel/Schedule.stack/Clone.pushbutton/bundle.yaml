@@ -1,0 +1,9 @@
+title: "Clone Elements to Sheets"
+author: "Jesto Joy"
+tooltip: |
+  Copies viewports, schedule instances, title blocks, or detail components to other sheets at identical positions.
+  
+  How to Use:
+  • Pick an element directly on a sheet.
+  • Select destination sheets from UI dialog.
+  • Elements are duplicated at exact matching UV sheet coordinates.

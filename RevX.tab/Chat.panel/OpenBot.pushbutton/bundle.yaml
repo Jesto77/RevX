@@ -1,4 +1,8 @@
----
 title: "RevX Bot"
-tooltip: "Opens RevX Bot - Multi-mode AI assistant (Tools, Work, Info) for Revit"
-author: "RevX"
+author: "Jesto Joy"
+tooltip: |
+  Opens RevX Bot — an interactive AI assistant for Revit model automation, query handling, and tool support.
+  
+  How to Use:
+  • Click "RevX Bot" to launch the bot window.
+  • Type questions, request Revit tasks, or interact with built-in commands.

@@ -1,0 +1,9 @@
+title: "Filled Region <-> Floor"
+author: "Jesto Joy"
+tooltip: |
+  Bidirectional 1-click converter between Filled Regions and Floors.
+  
+  How to Use:
+  • Select any combination of Filled Regions and/or Floors in the active view.
+  • Run the tool — it automatically detects element types and converts in the correct direction.
+  • Select target Floor Type or Level if prompted. Boundary geometry transfers seamlessly.

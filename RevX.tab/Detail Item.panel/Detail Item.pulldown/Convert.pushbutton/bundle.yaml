@@ -1,0 +1,10 @@
+title: "Element to Detail Item"
+author: "Jesto Joy"
+tooltip: |
+  Converts selected 3D model element graphics in view into a 2D Detail Item family (.rfa) and re-inserts it.
+  
+  How to Use:
+  • Select a 3D element visible in the active view.
+  • Run "Element to Detail Item".
+  • Enter a name for the new family and select a save location.
+  • The tool exports CAD geometry, builds the detail family, and places it at the exact location.

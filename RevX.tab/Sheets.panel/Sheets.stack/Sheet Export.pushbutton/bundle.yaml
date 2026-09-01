@@ -1,6 +1,9 @@
-title: Sheet Export
-tooltip: >
-  Batch export sheets and views to PDF, DWG, DGN, DWF, NWC, IFC and images
-  with custom file naming rules, saved naming presets and export sets.
-author: Jesto Joy
-highlight: new
+title: "Sheet Export"
+author: "Jesto Joy"
+tooltip: |
+  Batch exports sheets and views to PDF, DWG, DGN, DWF, NWC, IFC, and images with custom naming rules.
+  
+  How to Use:
+  • Select sheets and views.
+  • Choose export format (PDF, DWG, IFC, NWC, etc.).
+  • Apply file naming rules and export presets.

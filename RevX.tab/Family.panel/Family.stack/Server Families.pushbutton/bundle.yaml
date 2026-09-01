@@ -1,0 +1,9 @@
+title: "Server Family Browser"
+author: "Jesto Joy"
+tooltip: |
+  Browses external Revit project files and loads selected families into your active project.
+  
+  How to Use:
+  • Run "Server Families".
+  • Select a source `.rvt` file.
+  • Browse loadable families by category, check desired families, and click Load.

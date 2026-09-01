@@ -1,0 +1,9 @@
+title: "Remove Interior Points"
+author: "Jesto Joy"
+tooltip: |
+  Deletes interior blue shape editing points from Toposolids/Floors while keeping green perimeter points.
+  
+  How to Use:
+  • Select shape-edited Toposolids or Floors.
+  • Run "Remove Interior Points".
+  • Deletes interior points to flatten interior slab region while maintaining edge boundary points.

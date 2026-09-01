@@ -1,24 +1,9 @@
-title: Surface Pattern Region
-author: PyRevit
-tooltip: Generate filled regions with material-based surface patterns
-description: |
-  Surface Pattern Region - Generate Filled Regions with Material-Based Surface Patterns
-
-  Description
-  ----------
-  Creates filled regions from selected Floors, Roofs, Ceilings, or Toposolids and automatically applies matching surface pattern graphics based on the element’s topmost compound structure layer material.
-
-  The tool not only traces element boundaries but also:
-  - Extracts the top surface material from compound structures
-  - Matches foreground and background surface patterns
-  - Creates or reuses Filled Region Types named "<ElementTypeName> (Layout)"
-  - Applies consistent material-based pattern graphics to maintain visual consistency with model elements
-  - Handles complex geometry, curved edges, and sketch inconsistencies using robust fallback methods
-
-  How to Use
-  ----------
-  1. Open a plan, section, elevation, or detail view
-  2. Run "Surface Pattern Region"
-  3. Select Floors, Roofs, Ceilings, or Toposolids
-  4. Click Finish selection
-  5. The tool generates filled regions with matching material surface patterns automatically
+title: "Surface Pattern Region"
+author: "Jesto Joy"
+tooltip: |
+  Generates Filled Regions matching the surface pattern and material graphics of selected elements.
+  
+  How to Use:
+  • Select Floors, Roofs, Ceilings, or Toposolids.
+  • Run "Surface Pattern Region".
+  • Generates filled region boundaries with matching material surface patterns.

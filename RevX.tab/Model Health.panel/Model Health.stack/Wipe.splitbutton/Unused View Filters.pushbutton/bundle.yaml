@@ -1,0 +1,8 @@
+title: "Wipe Unused Filters"
+author: "Jesto Joy"
+tooltip: |
+  Purges view filters that are not assigned to any view or view template.
+  
+  How to Use:
+  • Click "Wipe Unused Filters".
+  • Scans document and purges unassigned view filters.

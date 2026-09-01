@@ -1,0 +1,9 @@
+title: "Filled Region <-> Toposolid"
+author: "Jesto Joy"
+tooltip: |
+  Bidirectional 1-click converter between Filled Regions and Toposolids (Revit 2024+).
+  
+  How to Use:
+  • Select Filled Regions and/or Toposolids in the active view.
+  • Run the tool — it detects element types and converts bidirectionally.
+  • Preserves Z-elevation coordinates relative to target levels.

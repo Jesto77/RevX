@@ -1,0 +1,9 @@
+title: "Family Renamer"
+author: "Jesto Joy"
+tooltip: |
+  Batch renames loadable families by category with live preview and optional Notepad editing.
+  
+  How to Use:
+  • Choose a category to list loaded families.
+  • Apply prefix, suffix, find/replace, or edit all names in Notepad.
+  • Review the live side-by-side preview and click Apply to rename families in one transaction.
