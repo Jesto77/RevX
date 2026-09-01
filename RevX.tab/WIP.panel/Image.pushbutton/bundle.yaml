@@ -1,9 +1,0 @@
-title: "Image to Floors & Toposolids"
-author: "Jesto Joy"
-tooltip: |
-  Converts raster image color regions into native Revit Floor and Toposolid element layouts.
-  
-  How to Use:
-  • Select a raster image in view.
-  • Run "Image to Floors & Toposolids".
-  • Analyzes image pixels, excludes background/shadows, rectifies shapes, and builds floors.
