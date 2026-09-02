@@ -292,26 +292,32 @@ class MoundEditorWindow(forms.WPFWindow):
                 loop.Append(seg)
         return loop
 
-    def _point_inside_boundary(self, x, y, pts):
+    def _point_inside_boundary(self, x, y, pts_xy):
+        # pts_xy: list of plain (x, y) float tuples, not XYZ objects —
+        # avoids repeated .NET interop attribute access inside this
+        # extremely hot inner loop (called once per grid point).
         inside = False
-        j = len(pts) - 1
-        for i in range(len(pts)):
-            xi, yi = pts[i].X, pts[i].Y
-            xj, yj = pts[j].X, pts[j].Y
+        n = len(pts_xy)
+        j = n - 1
+        for i in range(n):
+            xi, yi = pts_xy[i]
+            xj, yj = pts_xy[j]
             if ((yi > y) != (yj > y)) and \
                     (x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-10) + xi):
                 inside = not inside
             j = i
         return inside
 
-    def _nearest_boundary_distance(self, x, y, boundary_pts):
+    def _nearest_boundary_distance(self, x, y, boundary_xy):
         import math
-        min_d = 1e18
-        for p in boundary_pts:
-            d = math.sqrt((p.X - x) ** 2 + (p.Y - y) ** 2)
-            if d < min_d:
-                min_d = d
-        return min_d
+        min_d2 = 1e18  # compare squared distances, sqrt only once at the end
+        for (px, py) in boundary_xy:
+            dx = px - x
+            dy = py - y
+            d2 = dx * dx + dy * dy
+            if d2 < min_d2:
+                min_d2 = d2
+        return math.sqrt(min_d2)
 
     # ---------------- PROFILE MATH ----------------
 
@@ -359,13 +365,28 @@ class MoundEditorWindow(forms.WPFWindow):
         min_x = min(p.X for p in boundary_pts); max_x = max(p.X for p in boundary_pts)
         min_y = min(p.Y for p in boundary_pts); max_y = max(p.Y for p in boundary_pts)
 
+        # Precompute plain (x, y) float tuples ONCE — every grid point does
+        # a point-in-polygon test and a nearest-distance scan against every
+        # entry in this list, so avoiding repeated XYZ.X / XYZ.Y interop
+        # lookups here matters a lot at grid-point-count scale.
+        boundary_xy = [(p.X, p.Y) for p in boundary_pts]
+
+        # SINGLE pass over the grid: for every interior point, do the
+        # (expensive) point-in-polygon test and nearest-boundary-distance
+        # scan exactly ONCE, caching (x, y, d) as we go. The previous
+        # version did a full grid pass just to find max_interior, then
+        # repeated the exact same two checks for every point a second time
+        # to actually build the points — doubling the most expensive part
+        # of this function for no benefit.
+        interior = []
         max_interior = 0.0
         x = min_x
         while x <= max_x + 1e-6:
             y = min_y
             while y <= max_y + 1e-6:
-                if self._point_inside_boundary(x, y, boundary_pts):
-                    d = self._nearest_boundary_distance(x, y, boundary_pts)
+                if self._point_inside_boundary(x, y, boundary_xy):
+                    d = self._nearest_boundary_distance(x, y, boundary_xy)
+                    interior.append((x, y, d))
                     if d > max_interior:
                         max_interior = d
                 y += grid_spacing
@@ -380,19 +401,12 @@ class MoundEditorWindow(forms.WPFWindow):
             for bp in boundary_pts:
                 pts.append(XYZ(bp.X, bp.Y, base_z))
 
-        x = min_x
-        while x <= max_x + 1e-6:
-            y = min_y
-            while y <= max_y + 1e-6:
-                if self._point_inside_boundary(x, y, boundary_pts):
-                    d = self._nearest_boundary_distance(x, y, boundary_pts)
-                    if lock_base and d < (grid_spacing * 0.4):
-                        h = 0.0
-                    else:
-                        h = self._calculate_profile_height(d, max_interior, target_height, profile_type, smoothness, plateau_ratio, x, y, boundary_pts)
-                    pts.append(XYZ(x, y, base_z + h))
-                y += grid_spacing
-            x += grid_spacing
+        for x, y, d in interior:
+            if lock_base and d < (grid_spacing * 0.4):
+                h = 0.0
+            else:
+                h = self._calculate_profile_height(d, max_interior, target_height, profile_type, smoothness, plateau_ratio, x, y, boundary_pts)
+            pts.append(XYZ(x, y, base_z + h))
 
         return pts
 
@@ -593,6 +607,44 @@ class MoundEditorWindow(forms.WPFWindow):
             sub.RollBack()
         return ref_z
 
+    def _ensure_shape_editor_enabled(self, editor):
+        # SlabShapeEditor.SlabShapeVertices returns EMPTY until shape
+        # editing has actually been enabled on that element — this is true
+        # for a Toposolid that's never been shape-edited, and notably for
+        # one that's just had Reset Shape run on it. Without this, every
+        # downstream function (_get_points, _densify_if_flat, Smooth,
+        # Slope, Peak...) sees zero points and fails outright.
+        #
+        # .Enable() modifies the document, so it needs an open transaction —
+        # and every current caller reads points BEFORE opening its own edit
+        # transaction. Wrap it in whatever's appropriate for the moment.
+        if getattr(editor, "IsEnabled", True):
+            return
+        enable = getattr(editor, "Enable", None)
+        if not callable(enable):
+            return
+        doc, uidoc = self.get_doc_and_uidoc()
+        from Autodesk.Revit.DB import Transaction, SubTransaction
+        try:
+            if doc.IsModifiable:
+                sub = SubTransaction(doc)
+                sub.Start()
+                try:
+                    enable()
+                    sub.Commit()
+                except Exception:
+                    sub.RollBack()
+            else:
+                t = Transaction(doc, "Enable Shape Editing")
+                t.Start()
+                try:
+                    enable()
+                    t.Commit()
+                except Exception:
+                    t.RollBack()
+        except Exception:
+            pass
+
     def _get_points(self, el):
         topo_cls = self._get_topography_class()
         if topo_cls is not None and isinstance(el, topo_cls):
@@ -601,6 +653,7 @@ class MoundEditorWindow(forms.WPFWindow):
             from Autodesk.Revit.DB import Toposolid
             if isinstance(el, Toposolid):
                 editor = el.GetSlabShapeEditor()
+                self._ensure_shape_editor_enabled(editor)
                 return [v.Position for v in editor.SlabShapeVertices]
         raise Exception("Unsupported element type for point access.")
 
@@ -617,36 +670,118 @@ class MoundEditorWindow(forms.WPFWindow):
             if isinstance(el, Toposolid):
                 doc, uidoc = self.get_doc_and_uidoc()
                 editor = el.GetSlabShapeEditor()
+                self._ensure_shape_editor_enabled(editor)
                 vertices = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
                 if len(vertices) == len(new_points):
                     ref_z = self._detect_ref_z(doc, el, editor, vertices[0]) if vertices else None
                     if ref_z is None:
                         ref_z = self._get_param_datum_z(el)
 
-                    n = len(vertices)
-                    for i in range(n):
-                        # Re-fetch fresh each time rather than trusting a
-                        # vertex handle held across a Regenerate() — old
-                        # handles can go stale once one is called.
-                        editor = el.GetSlabShapeEditor()
-                        live_verts = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
-                        if i >= len(live_verts):
-                            continue
-                        v = live_verts[i]
-                        value = new_points[i].Z - ref_z  # ABSOLUTE offset from flat baseline
+                    # _detect_ref_z probes via a SubTransaction that
+                    # regenerates internally (then rolls back) — re-fetch
+                    # once here so we're not holding handles from before
+                    # that regenerate.
+                    editor = el.GetSlabShapeEditor()
+                    vertices = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+
+                    # value = target_z - ref_z never depends on any vertex's
+                    # CURRENT position (unlike the earlier Align Edges bug),
+                    # so there is no correctness reason to regenerate between
+                    # every single point — only speed was lost doing that.
+                    # Apply the whole batch, then regenerate once.
+                    for v, new_pt in zip(vertices, new_points):
+                        value = new_pt.Z - ref_z  # ABSOLUTE offset from flat baseline
                         try:
                             editor.ModifySubElement(v, value)
-                            doc.Regenerate()  # commit before the next point is read/matched
                         except Exception:
                             pass
+                    doc.Regenerate()
                 else:
                     for pt in new_points:
                         try:
                             editor.AddPoint(pt)
                         except Exception:
                             pass
+                    doc.Regenerate()
                 return
         raise Exception("Unsupported element type for point editing.")
+
+    def _densify_if_flat(self, el, min_points=20, grid_spacing=None):
+        """Smooth / Slope / Peak all need real interior points to work
+        with. A freshly-created or Reset-Shape'd Toposolid typically only
+        has its boundary/profile corner points as shape-edit vertices —
+        no interior grid at all — so those tools have nothing meaningful
+        to act on (Peak in particular needs max_z - min_z > 0, which is
+        never true on a flat surface). If the target looks too sparse,
+        inject a proper interior grid first, at the CURRENT flat elevation
+        so nothing visually changes yet — then the calling action has
+        real points to smooth/slope/scale.
+        """
+        pts = self._get_points(el)
+        if len(pts) >= min_points:
+            return pts  # already dense enough, nothing to do
+
+        from Autodesk.Revit.DB import Toposolid
+        if not (self._has_toposolid() and isinstance(el, Toposolid)):
+            return pts  # only Toposolid shape points can be freely injected like this
+
+        zs = [p.Z for p in pts]
+        if not zs:
+            return pts
+        avg_z = sum(zs) / len(zs)
+
+        if grid_spacing is None:
+            grid_spacing = self._estimate_spacing(pts) if len(pts) >= 2 else 3.0
+            grid_spacing = max(0.5, min(grid_spacing, 10.0))
+
+        from Autodesk.Revit.DB import XYZ
+        boundary_xy = [(p.X, p.Y) for p in pts]
+        min_x = min(x for x, y in boundary_xy); max_x = max(x for x, y in boundary_xy)
+        min_y = min(y for x, y in boundary_xy); max_y = max(y for x, y in boundary_xy)
+
+        added = []
+        existing_xy = list(boundary_xy)
+        min_gap_sq = (grid_spacing * 0.25) ** 2
+
+        x = min_x
+        while x <= max_x + 1e-6:
+            y = min_y
+            while y <= max_y + 1e-6:
+                if self._point_inside_boundary(x, y, boundary_xy):
+                    too_close = False
+                    for (ex, ey) in existing_xy:
+                        if (ex - x) ** 2 + (ey - y) ** 2 <= min_gap_sq:
+                            too_close = True
+                            break
+                    if not too_close:
+                        added.append(XYZ(x, y, avg_z))
+                        existing_xy.append((x, y))
+                y += grid_spacing
+            x += grid_spacing
+
+        if not added:
+            return pts  # boundary too small/degenerate for this spacing
+
+        doc, uidoc = self.get_doc_and_uidoc()
+        from Autodesk.Revit.DB import Transaction
+        t = Transaction(doc, "Densify Flat Surface")
+        t.Start()
+        try:
+            editor = el.GetSlabShapeEditor()
+            for p in added:
+                try:
+                    editor.AddPoint(p)
+                except Exception:
+                    pass
+            doc.Regenerate()
+            t.Commit()
+            self._log("Flat/sparse surface detected — added {} interior points before editing.".format(len(added)))
+        except Exception as ex:
+            t.RollBack()
+            self._log_error("Densify failed", ex)
+            return pts
+
+        return self._get_points(el)
 
     def _estimate_spacing(self, pts):
         import math
@@ -1191,6 +1326,7 @@ class MoundEditorWindow(forms.WPFWindow):
                     except Exception:
                         ts = Toposolid.Create(doc, boundaries, topo_type.Id, level.Id)
                         editor = ts.GetSlabShapeEditor()
+                        self._ensure_shape_editor_enabled(editor)
                         for pt in grid_pts:
                             try:
                                 editor.AddPoint(pt)
@@ -1215,6 +1351,7 @@ class MoundEditorWindow(forms.WPFWindow):
     def do_smooth_api(self, uiapp):
         import math
         import traceback
+        from Autodesk.Revit.DB import Transaction, XYZ
         doc, uidoc = self.get_doc_and_uidoc(uiapp)
         el = self._require_target()
         if el is None: return
@@ -1224,7 +1361,7 @@ class MoundEditorWindow(forms.WPFWindow):
             try: passes = max(1, int(self.TxtSmoothPasses.Text.strip()))
             except Exception: passes = 1
 
-            pts = self._get_points(el)
+            pts = self._densify_if_flat(el)
             if len(pts) < 3:
                 self._log("Not enough points to smooth.")
                 return
@@ -1247,7 +1384,7 @@ class MoundEditorWindow(forms.WPFWindow):
                     new_z.append(p.Z + (avg - p.Z) * strength)
                 work = [XYZ(p.X, p.Y, z) for p, z in zip(work, new_z)]
 
-            from Autodesk.Revit.DB import Transaction, XYZ
+            from Autodesk.Revit.DB import Transaction
             t = Transaction(doc, "Smooth Surface")
             t.Start()
             try:
@@ -1283,7 +1420,7 @@ class MoundEditorWindow(forms.WPFWindow):
                 return
             ux, uy = dx / length, dy / length
 
-            pts = self._get_points(el)
+            pts = self._densify_if_flat(el)
             projections = [((p.X - p1.X) * ux + (p.Y - p1.Y) * uy) for p in pts]
             min_t, max_t = min(projections), max(projections)
             run = max_t - min_t
@@ -1343,7 +1480,7 @@ class MoundEditorWindow(forms.WPFWindow):
         if el is None: return
         try:
             target_peak_ft = self._mm_to_ft(float(self.TxtPeakTarget.Text.strip()))
-            pts = self._get_points(el)
+            pts = self._densify_if_flat(el)
             min_z = min(p.Z for p in pts)
             max_z = max(p.Z for p in pts)
             current_peak = max_z - min_z
