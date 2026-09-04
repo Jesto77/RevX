@@ -1,9 +1,9 @@
-title: "Cad to Detail Item"
+title: "Line to Detail Item"
 author: "Jesto Joy"
 tooltip: |
-  Converts selected Cad fileinto a new Detail Item family (.rfa).
+  Converts selected Linesinto a new Detail Item family (.rfa).
   
   How to Use:
-  • Select the Linked cad file in the active view.
-  • Run "Cad to Detail Item".
+  • Select the Lines in the active view.
+  • Run "Line to Detail Item".
   • Name the family and save the `.rfa` file.
