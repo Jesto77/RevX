@@ -7,8 +7,10 @@ Author: Jesto Joy
 from pyrevit import revit, DB, forms, script
 from System.Collections.Generic import List
 import os
+import traceback
 
 doc = revit.doc
+output = script.get_output()
 
 # -----------------------------------------------------------------------------
 # CONFIG
@@ -407,11 +409,18 @@ def main():
     pattern_cats, pattern_ids = validate_pattern_categories(
         doc, PATTERN_CATEGORIES)
     if not pattern_cats:
+        output.print_md("**Stopped:** none of the pattern categories "
+                         "(Floors/Roofs/Stairs/Toposolid/Topography) "
+                         "resolved to a valid Category in this document/version.")
         return
 
     titleblock_type_id = get_titleblock_type_id(doc)
     if not titleblock_type_id:
-        return
+        # No title block loaded — that's fine, it's never shown in the
+        # exported DWG anyway (the title block category gets hidden on the
+        # temp sheet regardless). ViewSheet.Create explicitly supports
+        # InvalidElementId to create a sheet with no title block at all.
+        titleblock_type_id = DB.ElementId.InvalidElementId
 
     selected_views = forms.select_views(
         title="Select plan views to export as DWG",
@@ -419,10 +428,12 @@ def main():
     )
 
     if not selected_views:
+        output.print_md("**Stopped:** no views were selected.")
         return
 
     folder = forms.pick_folder(title="Choose export folder")
     if not folder:
+        output.print_md("**Stopped:** no export folder was chosen.")
         return
 
     options             = get_export_options(doc, EXPORT_SETUP_NAME)
@@ -583,10 +594,17 @@ def main():
                 temp_ids = [sheet.Id, pat_view.Id, blk_view.Id] + flat_copies
 
             # EXPORT
-            export_sheet(doc, folder, base_name, sheet.Id, options)
+            result, exported_path = export_sheet(doc, folder, base_name, sheet.Id, options)
+            if exported_path:
+                output.print_md("**{}**: exported to `{}`".format(source_view.Name, exported_path))
+            else:
+                output.print_md("**{}**: export ran but no DWG file was found afterward "
+                                 "(Export() may have failed silently, or MergedViews/sheet "
+                                 "content produced nothing).".format(source_view.Name))
 
         except Exception:
-            pass
+            output.print_md("**{}**: FAILED —".format(source_view.Name))
+            output.print_code(traceback.format_exc())
 
         finally:
             all_to_delete = list(temp_ids) + [
