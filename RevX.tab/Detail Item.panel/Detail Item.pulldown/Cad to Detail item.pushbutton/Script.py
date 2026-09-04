@@ -4,24 +4,7 @@ extract its line/curve geometry (walking nested block instances the same
 way Explode reveals them), rebuild it as native Revit detail lines inside a
 new Detail Item family, let the user name it, and save it as an .rfa file.
 
-This does NOT call Revit's UI "Explode" command (there is no public API for
-it) - instead it walks the CAD import's own geometry tree directly, which
-produces the same practical result: every line/arc/polyline segment inside
-it, at every nesting level, converted into native Curve objects.
-
-Compatible with Revit 2023, 2024, 2025, 2026 and 2027. The API calls used
-here (Options, GeometryInstance, PolyLine, Transform, FamilyCreate,
-NewFamilyDocument, SaveAsOptions, LoadFamily) have been stable since well
-before 2023, so no version branching is needed. Works under both the
-IronPython2 engine and the CPython3 engine - no engine-specific syntax.
-
-COORDINATE HANDLING: CAD files are frequently placed at large real-world
-coordinates (state-plane, survey points, etc.). Building family geometry
-that far from the family's own origin risks Revit's "far from origin"
-instability, so all curves are shifted to be centered near the family
-origin before being built, then the final instance is placed back at that
-same reference point in the project - reproducing the original position
-without ever putting far-away geometry inside the family itself.
+Compatible with Revit 2023, 2024, 2025, 2026 and 2027 (IronPython & CPython3).
 """
 
 __title__ = 'CAD to\nDetail Item'
@@ -31,6 +14,7 @@ __doc__ = ('Select an imported/linked CAD file, then click this button to '
            'that you can name and save.')
 
 import os
+import re
 
 from pyrevit import revit, DB, forms, script
 
@@ -42,20 +26,33 @@ logger = script.get_logger()
 
 
 # --------------------------------------------------------------------------
+# Family Load Options (handles overwrite if family already loaded)
+# --------------------------------------------------------------------------
+class FamilyLoadOption(DB.IFamilyLoadOptions):
+    def OnFamilyFound(self, familyInUse, overwriteParameterValues):
+        overwriteParameterValues.Value = True
+        return True
+
+    def OnSharedFamilyFound(self, sharedFamily, familyInUse, source, overwriteParameterValues):
+        overwriteParameterValues.Value = True
+        return True
+
+
+# --------------------------------------------------------------------------
 # 1. Get selection and extract curve geometry from CAD import(s)
 # --------------------------------------------------------------------------
 def get_curves_from_cad_selection():
     selection = revit.get_selection()
     if not selection:
         forms.alert('Select one or more imported/linked CAD files '
-                     '(DWG/DXF/DGN/SAT) before running this tool.',
-                     exitscript=True)
+                    '(DWG/DXF/DGN/SAT) before running this tool.',
+                    exitscript=True)
 
     cad_elements = [el for el in selection if isinstance(el, DB.ImportInstance)]
     if not cad_elements:
         forms.alert('The current selection does not contain an imported or '
-                     'linked CAD file. Select the CAD import in the view '
-                     'and try again.', exitscript=True)
+                    'linked CAD file. Select the CAD import in the view '
+                    'and try again.', exitscript=True)
 
     opt = DB.Options()
     opt.ComputeReferences = False
@@ -64,15 +61,11 @@ def get_curves_from_cad_selection():
     curves = []
 
     def walk(geo, depth=0):
-        # CAD imports commonly nest several levels of block-reference
-        # GeometryInstances - walk all of them, not just the top level.
         if geo is None or depth > 24:
             return
         for g in geo:
             try:
                 if isinstance(g, DB.PolyLine):
-                    # Most DWG/DXF polylines come through as PolyLine, NOT
-                    # as a Curve subtype - break each into Line segments.
                     coords = list(g.GetCoordinates())
                     for i in range(len(coords) - 1):
                         p0, p1 = coords[i], coords[i + 1]
@@ -82,12 +75,7 @@ def get_curves_from_cad_selection():
                     if g.Length > 1e-9:
                         curves.append(g)
                 elif isinstance(g, DB.GeometryInstance):
-                    # GetInstanceGeometry() returns geometry already
-                    # transformed into the outer coordinate system, so
-                    # curves collected at any depth are directly usable.
                     walk(g.GetInstanceGeometry(), depth + 1)
-                # Solid / Mesh / Point geometry intentionally skipped -
-                # a Detail Item only needs 2D line work.
             except Exception as ex:
                 logger.debug('Skipped a geometry object: {0}'.format(ex))
 
@@ -100,15 +88,15 @@ def get_curves_from_cad_selection():
 
     if not curves:
         forms.alert('No line/curve geometry could be extracted from the '
-                     'selected CAD file(s). It may only contain fills, '
-                     'text, hatches, or 3D solids with no line work.',
-                     exitscript=True)
+                    'selected CAD file(s). It may only contain fills, '
+                    'text, hatches, or 3D solids with no line work.',
+                    exitscript=True)
 
     return curves
 
 
 # --------------------------------------------------------------------------
-# 2. Shift geometry near the family origin (see COORDINATE HANDLING above)
+# 2. Shift geometry near the family origin
 # --------------------------------------------------------------------------
 def compute_reference_point(curves):
     min_x = min_y = min_z = 1e18
@@ -130,9 +118,6 @@ def compute_reference_point(curves):
 
 
 def shift_curve(c, ref_point):
-    """Returns a new curve translated by -ref_point, or None if this
-    particular curve can't be transformed (degenerate/unsupported type) -
-    callers should skip those rather than fail the whole conversion."""
     try:
         transform = DB.Transform.CreateTranslation(ref_point.Negate())
         return c.CreateTransformed(transform)
@@ -142,10 +127,10 @@ def shift_curve(c, ref_point):
 
 
 # --------------------------------------------------------------------------
-# 3. Locate a "Detail Item.rft" template, or let the user browse for one
+# 3. Locate a "Detail Item.rft" template
 # --------------------------------------------------------------------------
 def find_detail_item_template():
-    version = app.VersionNumber  # e.g. "2023", "2024", "2025" ...
+    version = app.VersionNumber
     candidates = [
         r'C:\ProgramData\Autodesk\RVT {0}\Family Templates\English\Detail Item.rft'.format(version),
         r'C:\ProgramData\Autodesk\RVT {0}\Family Templates\English-Imperial\Detail Item.rft'.format(version),
@@ -159,15 +144,15 @@ def find_detail_item_template():
             return path
 
     picked = forms.pick_file(file_ext='rft',
-                              title='Select the Detail Item.rft template')
+                             title='Select the Detail Item.rft template')
     if not picked:
         forms.alert('A Detail Item family template is required.',
-                     exitscript=True)
+                    exitscript=True)
     return picked
 
 
 # --------------------------------------------------------------------------
-# 4. Build the (already-shifted) curves in the family document
+# 4. Build curves in family document
 # --------------------------------------------------------------------------
 def create_detail_curves(fam_doc, curves):
     collector = DB.FilteredElementCollector(fam_doc).OfClass(DB.View)
@@ -183,7 +168,7 @@ def create_detail_curves(fam_doc, curves):
                 break
     if not view:
         forms.alert('No usable view was found in the family template.',
-                     exitscript=True)
+                    exitscript=True)
 
     created, skipped = 0, 0
     with DB.Transaction(fam_doc, 'Create Detail Lines') as t:
@@ -201,14 +186,9 @@ def create_detail_curves(fam_doc, curves):
 
 
 # --------------------------------------------------------------------------
-# Main
+# 5. Place Instance
 # --------------------------------------------------------------------------
 def place_instance_at_point(fam_name, insertion_point):
-    """Find the newly loaded family's symbol and place one instance at
-    insertion_point (the SAME reference point the geometry was shifted by
-    before being built) - reproducing the CAD content's original position
-    in the project, without ever putting far-from-origin geometry inside
-    the family itself."""
     symbol = None
     collector = DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol)
     for s in collector:
@@ -229,6 +209,37 @@ def place_instance_at_point(fam_name, insertion_point):
         t.Commit()
 
 
+# --------------------------------------------------------------------------
+# 6. Safe SaveAs (handles locked files and name collisions)
+# --------------------------------------------------------------------------
+def safe_save_family(fam_doc, folder, base_name):
+    """Saves the family, auto-incrementing the name if the file is locked by
+    another process or Revit instance."""
+    save_opts = DB.SaveAsOptions()
+    save_opts.OverwriteExistingFile = True
+
+    candidate_name = base_name
+    counter = 1
+
+    while counter <= 100:
+        save_path = os.path.join(folder, '{0}.rfa'.format(candidate_name))
+        try:
+            fam_doc.SaveAs(save_path, save_opts)
+            return candidate_name
+        except (DB.FileAccessException, Exception) as ex:
+            # If locked or access denied, try appending a numerical suffix
+            candidate_name = '{0}_{1}'.format(base_name, counter)
+            counter += 1
+
+    forms.alert('Could not save family file to the chosen folder because files '
+                'with that name are currently locked by Revit or another program.',
+                title='Save Warning')
+    return base_name
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 def main():
     curves = get_curves_from_cad_selection()
 
@@ -241,7 +252,7 @@ def main():
 
     if not shifted_curves:
         forms.alert('Could not process the extracted CAD geometry.',
-                     exitscript=True)
+                    exitscript=True)
 
     fam_name = forms.ask_for_string(
         default='New Detail Item',
@@ -250,29 +261,34 @@ def main():
     )
     if not fam_name:
         script.exit()
-    fam_name = fam_name.strip()
+
+    # Sanitize family name for file system
+    fam_name = re.sub(r'[\\/*?:"<>|]', '', fam_name.strip())
+    if not fam_name:
+        fam_name = 'Detail_Item'
 
     template_path = find_detail_item_template()
-
     fam_doc = app.NewFamilyDocument(template_path)
 
-    created, skipped = create_detail_curves(fam_doc, shifted_curves)
-    if created == 0:
-        fam_doc.Close(False)
-        script.exit()
+    try:
+        created, skipped = create_detail_curves(fam_doc, shifted_curves)
+        if created == 0:
+            forms.alert('No detail curves could be created from the geometry.',
+                        exitscript=True)
 
-    save_folder = forms.pick_folder(title='Select a folder to save the new family')
-    if save_folder:
-        save_path = os.path.join(save_folder, '{0}.rfa'.format(fam_name))
-        save_opts = DB.SaveAsOptions()
-        save_opts.OverwriteExistingFile = True
-        fam_doc.SaveAs(save_path, save_opts)
+        save_folder = forms.pick_folder(title='Select a folder to save the new family')
+        if save_folder:
+            fam_name = safe_save_family(fam_doc, save_folder, fam_name)
 
-    # LoadFamily must be called while the target document (doc) has no open
-    # transaction - it manages loading internally, so do NOT wrap this in a
-    # Transaction of our own (that caused the InvalidOperationException).
-    fam_doc.LoadFamily(doc)
-    fam_doc.Close(False)
+        # Load into document with overload that supports overwriting
+        fam_doc.LoadFamily(doc, FamilyLoadOption())
+
+    finally:
+        # ALWAYS ensure fam_doc is closed to release file locks
+        try:
+            fam_doc.Close(False)
+        except Exception:
+            pass
 
     place_instance_at_point(fam_name, ref_point)
 
