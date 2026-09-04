@@ -1,4 +1,4 @@
-title: "Convert"
+title: "Cad to Detail item"
 author: "Jesto Joy"
 tooltip: |
   Converts selected 3D model element graphics in view into a 2D Detail Item family (.rfa) and re-inserts it.
