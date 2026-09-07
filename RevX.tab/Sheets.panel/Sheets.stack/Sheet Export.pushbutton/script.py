@@ -394,7 +394,6 @@ def build_name(item, tokens, separator, prefix, suffix,
     return name
 
 
-
 # --------------------------------------------------------------------------- #
 #  Custom File Name dialog (modal, opened from the Selection tab)
 # --------------------------------------------------------------------------- #
@@ -2051,6 +2050,13 @@ class SheetExportWindow(forms.WPFWindow):
                      "ANSI C", "ANSI D", "ANSI E", "ARCH D", "ARCH E1", "Letter"):
             self.CmbPaperSize.Items.Add(size)
         self.CmbPaperSize.SelectedIndex = 1
+
+        # Default NWC options (Convert Linked CAD -> Off, Convert Linked RVT -> On)
+        try:
+            self.ChkNwcLinkedCAD.IsChecked = False
+            self.ChkNwcExportLinks.IsChecked = True
+        except Exception:
+            pass
 
     def _load_3d_views(self):
         """Fill the NWC / IFC 3D-view pickers.
