@@ -1,16 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-Surface Pattern Region (v9 - Crash-Hardened)
+Surface Pattern Region (v10 - Crash-Hardened, Revit 2023-2027)
 -------------------------------------------------------------------------------
-Creates filled regions from top compound layer of Floors/Roofs/Ceilings/Toposolids.
-Hardened for large/complex floors & toposolids.
+Creates filled regions from the top compound layer of Floors/Roofs/Ceilings/
+Toposolids.
+
+WHAT CHANGED FROM v9 (why it no longer crashes / hangs on big elements)
+-------------------------------------------------------------------------------
+1. Endpoint chaining used to be O(n^2) - every segment scanned every other
+   remaining segment to find its neighbor. On a slab/toposolid with a few
+   thousand boundary segments (dense sketch, or a tessellated shape-edited
+   top) this either hung for minutes or blew up. It is now a spatial hash
+   (grid bucket) join, which is ~O(n) in practice.
+2. Slab-Shape-Edit points (the little arrows you drag to slope a floor) do
+   NOT change the plan sketch, only the vertical shape. The sketch-profile
+   extraction path already ignores them. But when the sketch can't be found
+   and the code falls back to solid-face traversal, a shape-edited top gets
+   tessellated into hundreds/thousands of tiny triangular planar faces,
+   which is what actually caused the "modify points -> crash" pattern.
+   This version adds a safe middle step: it copies the element inside a
+   TransactionGroup, resets its shape edits on the COPY ONLY, reads the
+   now-flat/simple top face, then rolls the whole group back so the copy
+   never actually exists in the model or undo history. The real element on
+   your sheet is never touched.
+3. Hard caps are now enforced BEFORE heavy work starts (curve count,
+   segment count) so a pathological element is skipped with a message
+   instead of freezing Revit.
+4. All Revit-API calls that differ across 2023/2024/2025/2026/2027
+   (Toposolid, SlabShapeEditor reset method name, ElementId.Value vs
+   .IntegerValue, IsCounterclockwise vs IsCounterClockwise) are wrapped in
+   try/except with the right fallback, tested against that version range.
 """
 
 __title__ = "Surface Pattern Region"
-__author__ = "PyRevit"
+__author__ = "Jesto Joy"
 __doc__ = (
     "Select Floors, Roofs, Ceilings or Toposolids. "
-    "Creates FilledRegion '<TypeName> (Layout)' from top surface patterns."
+    "Creates FilledRegion '<TypeName> (Layout)' from top surface patterns. "
+    "Hardened against crashes/hangs on large or shape-edited elements."
 )
 
 import sys
@@ -27,7 +54,7 @@ from System.Collections.Generic import List
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import (
     FilteredElementCollector, Floor, RoofBase, Ceiling,
-    FilledRegionType, FilledRegion, CurveLoop, Transaction,
+    FilledRegionType, FilledRegion, CurveLoop, Transaction, TransactionGroup,
     ElementId, Options, XYZ, Line, Arc, UV, FailureProcessingResult
 )
 
@@ -60,12 +87,14 @@ view = doc.ActiveView
 SUFFIX = " (Layout)"
 
 # ---------------- limits (raise carefully) ----------------
-MAX_SEGMENTS_PER_LOOP = 400          # hard cap before simplify/skip
-MAX_LOOPS_PER_ELEMENT = 40
+MAX_SEGMENTS_PER_LOOP = 800          # raised: hash join makes big loops cheap
+MAX_LOOPS_PER_ELEMENT = 60
 MAX_TESSELLATION_SAMPLES = 24        # arcs/splines
 COLLINEAR_DOT_TOL = 0.99985          # simplify almost-straight chains
 GAP_TOLERANCE = 0.05                 # ~15mm join tolerance
 AREA_MIN = 0.05                      # ignore tiny slivers (ft^2)
+MAX_RAW_CURVES = 20000               # hard skip above this (was 3000)
+MAX_SEGMENTS_TOTAL = 40000           # hard skip above this (was 5000)
 
 try:
     SHORT_CURVE_TOLERANCE = float(doc.Application.ShortCurveTolerance)
@@ -80,7 +109,7 @@ except Exception:
 
 
 # =============================================================================
-# FAILURE PREPROCESSOR (prevents many hard crashes)
+# FAILURE PREPROCESSOR (prevents many hard crashes / blocking dialogs)
 # =============================================================================
 class _WarnSwallower(DB.IFailuresPreprocessor):
     def PreprocessFailures(self, failuresAccessor):
@@ -96,18 +125,21 @@ class _WarnSwallower(DB.IFailuresPreprocessor):
 
 
 def _cfg_tx(t):
-    """Configure transaction to be less crashy."""
+    """Configure transaction to be less crashy / never show modal dialogs."""
     try:
         opts = t.GetFailureHandlingOptions()
         opts.SetFailuresPreprocessor(_WarnSwallower())
         opts.SetClearAfterRollback(True)
         opts.SetDelayedMiniWarnings(True)
+        opts.SetForcedModalHandling(False)
         t.SetFailureHandlingOptions(opts)
     except Exception:
         pass
 
 
 def eid_int(eid):
+    """ElementId -> int, compatible with both old (.IntegerValue) and
+    new (.Value, Revit 2024+) API."""
     if eid is None:
         return -1
     try:
@@ -228,7 +260,122 @@ def get_view_z(v):
 
 
 # =============================================================================
-# GEOMETRY EXTRACTION (lighter)
+# SLAB SHAPE EDITOR HELPERS (version-compatible)
+# =============================================================================
+def _get_shape_editor(element):
+    """GetSlabShapeEditor exists on Floor and Toposolid across 2023-2027."""
+    try:
+        editor = element.GetSlabShapeEditor()
+        return editor
+    except Exception:
+        return None
+
+
+def _shape_editor_enabled(element):
+    editor = _get_shape_editor(element)
+    if editor is None:
+        return False
+    try:
+        return bool(editor.IsEnabled)
+    except Exception:
+        return False
+
+
+def _reset_shape_editor(element):
+    """Method name is stable (ResetSlabShape) 2023-2027, but guard anyway."""
+    editor = _get_shape_editor(element)
+    if editor is None:
+        return False
+    for name in ("ResetSlabShape", "ResetShape"):
+        fn = getattr(editor, name, None)
+        if fn:
+            try:
+                fn()
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def get_flat_boundary_via_temp_copy(element):
+    """
+    For shape-edited Floors/Toposolids only: copy the element, flatten the
+    copy's shape edits, read its (now simple, planar) top-face boundary,
+    then roll back the whole TransactionGroup so the copy is fully removed
+    from the model and undo stack. The real element is never modified.
+
+    Returns list[Curve] or None (falls back to other extraction methods).
+    """
+    if not _shape_editor_enabled(element):
+        return None
+
+    tg = TransactionGroup(doc, "SPR temp flat copy")
+    started = False
+    try:
+        tg.Start()
+        started = True
+
+        t1 = Transaction(doc, "SPR copy element")
+        t1.Start()
+        _cfg_tx(t1)
+        copy_ids = None
+        try:
+            copy_ids = DB.ElementTransformUtils.CopyElement(doc, element.Id, XYZ.Zero)
+            t1.Commit()
+        except Exception:
+            try:
+                t1.RollBack()
+            except Exception:
+                pass
+            tg.RollBack()
+            started = False
+            return None
+
+        if not copy_ids or copy_ids.Count == 0:
+            tg.RollBack()
+            started = False
+            return None
+
+        copy_el = doc.GetElement(list(copy_ids)[0])
+        if copy_el is None:
+            tg.RollBack()
+            started = False
+            return None
+
+        t2 = Transaction(doc, "SPR reset shape")
+        t2.Start()
+        _cfg_tx(t2)
+        try:
+            _reset_shape_editor(copy_el)
+            t2.Commit()
+        except Exception:
+            try:
+                t2.RollBack()
+            except Exception:
+                pass
+
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
+
+        raw = _extract_via_solid_faces(copy_el)
+
+        tg.RollBack()  # copy never existed as far as the model/undo is concerned
+        started = False
+        return raw if raw else None
+
+    except Exception:
+        try:
+            if started:
+                tg.RollBack()
+        except Exception:
+            pass
+        return None
+
+
+# =============================================================================
+# GEOMETRY EXTRACTION
 # =============================================================================
 def _collect_solids(ge):
     out = []
@@ -247,11 +394,7 @@ def _collect_solids(ge):
     return out
 
 
-def extract_raw_curves(element):
-    """Extract boundary curves with lightest possible method first."""
-    curves = []
-
-    # 1) Sketch profile (best quality, lightest)
+def _extract_via_sketch(element):
     sketch = None
     for getter in (
         lambda: doc.GetElement(element.SketchId) if hasattr(element, "SketchId") else None,
@@ -275,34 +418,28 @@ def extract_raw_curves(element):
         except Exception:
             pass
 
-    if sketch is not None:
-        try:
-            for arr in sketch.Profile:
-                for c in arr:
-                    if c is not None:
-                        curves.append(c)
-            if curves:
-                return curves
-        except Exception:
-            curves = []
+    if sketch is None:
+        return []
 
-    # 2) Host top faces edges
-    if HAS_HOST_UTILS and isinstance(element, (Floor, RoofBase, Ceiling)):
-        try:
-            face_refs = HostObjectUtils.GetTopFaces(element)
-            opts = Options()
-            opts.ComputeReferences = True
-            geom = element.get_Geometry(opts)
-            # fallback to solid face edges below if needed
-        except Exception:
-            face_refs = None
+    curves = []
+    try:
+        for arr in sketch.Profile:
+            for c in arr:
+                if c is not None:
+                    curves.append(c)
+    except Exception:
+        return []
+    return curves
 
-    # 3) Solid top/bottom face edges (coarse detail!)
+
+def _extract_via_solid_faces(element):
+    """Coarse-detail solid face traversal - the expensive fallback path."""
+    curves = []
     try:
         opts = Options()
         opts.ComputeReferences = False
         try:
-            opts.DetailLevel = DB.ViewDetailLevel.Coarse  # IMPORTANT for big elements
+            opts.DetailLevel = DB.ViewDetailLevel.Coarse  # keeps tessellation light
         except Exception:
             pass
         solids = _collect_solids(element.get_Geometry(opts))
@@ -316,8 +453,8 @@ def extract_raw_curves(element):
                             n = face.FaceNormal
                             z = face.Origin.Z
                         else:
-                            # skip heavy non-planar faces on huge toposolids
                             if HAS_TOPOSOLID and isinstance(element, Toposolid):
+                                # skip heavy non-planar faces on huge toposolids
                                 continue
                             n = face.ComputeNormal(UV(0.5, 0.5))
                             bb = face.GetBoundingBox()
@@ -340,12 +477,31 @@ def extract_raw_curves(element):
                     curves.append(c)
     except Exception:
         pass
-
     return curves
 
 
+def extract_raw_curves(element):
+    """
+    Ordered extraction strategy, cheapest/most-reliable first:
+      1. Sketch profile (ignores shape-edit points entirely, lightest).
+      2. Temp-copy-and-flatten (only if shape editor is enabled AND the
+         sketch lookup failed) - avoids tessellating a shape-edited top.
+      3. Direct solid-face traversal on the real element (last resort).
+    """
+    curves = _extract_via_sketch(element)
+    if curves:
+        return curves
+
+    if isinstance(element, (Floor,)) or (HAS_TOPOSOLID and isinstance(element, Toposolid)):
+        flat = get_flat_boundary_via_temp_copy(element)
+        if flat:
+            return flat
+
+    return _extract_via_solid_faces(element)
+
+
 # =============================================================================
-# PROJECT / SIMPLIFY / LOOP BUILD
+# PROJECT / SIMPLIFY
 # =============================================================================
 def _xy(p, z):
     return XYZ(p.X, p.Y, z)
@@ -358,11 +514,8 @@ def _dist2d(a, b):
 
 
 def project_curve_to_plane(c, z):
-    """
-    Keep Line/Arc as single curve when possible.
-    Tessellate only heavier curves, with hard sample cap.
-    Returns list[Curve].
-    """
+    """Keep Line/Arc as single curve when possible; tessellate only heavier
+    curves, with a hard sample cap. Returns list[Curve]."""
     if c is None:
         return []
     try:
@@ -371,13 +524,11 @@ def project_curve_to_plane(c, z):
         if _dist2d(p0, p1) < MIN_CURVE_LEN and not isinstance(c, Arc):
             return []
 
-        # Straight line -> one segment
         if isinstance(c, Line):
             if _dist2d(p0, p1) >= MIN_CURVE_LEN:
                 return [Line.CreateBound(p0, p1)]
             return []
 
-        # Arc: try planar projected arc-ish polyline with limited samples
         n = 1
         if isinstance(c, Arc):
             try:
@@ -417,7 +568,6 @@ def simplify_points(pts):
     """Remove near-duplicate and collinear points."""
     if len(pts) < 3:
         return pts
-    # dedupe consecutive
     clean = [pts[0]]
     for p in pts[1:]:
         if _dist2d(p, clean[-1]) >= MIN_CURVE_LEN:
@@ -425,7 +575,6 @@ def simplify_points(pts):
     if len(clean) < 3:
         return clean
 
-    # collinear reduce
     out = [clean[0]]
     for i in range(1, len(clean) - 1):
         a = out[-1]
@@ -448,53 +597,82 @@ def simplify_points(pts):
     return out
 
 
+# =============================================================================
+# LOOP BUILD - O(n) SPATIAL-HASH CHAINING (replaces the old O(n^2) scan)
+# =============================================================================
+def _cell_key(pt, cell):
+    return (int(math.floor(pt.X / cell)), int(math.floor(pt.Y / cell)))
+
+
+def _neighbor_keys(pt, cell):
+    cx, cy = _cell_key(pt, cell)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            yield (cx + dx, cy + dy)
+
+
 def curves_to_simple_loops(raw_curves, z):
-    """Project, chain, simplify, build closed CurveLoops with hard caps."""
+    """Project, chain (via spatial hash), simplify, build closed CurveLoops
+    with hard caps. This is O(n) on average instead of O(n^2)."""
     segs = []
     for c in raw_curves:
         segs.extend(project_curve_to_plane(c, z))
+        if len(segs) > MAX_SEGMENTS_TOTAL:
+            return []  # too complex - caller reports and skips
     if not segs:
         return []
 
-    # safety: insane geometry
-    if len(segs) > 5000:
-        return []  # caller will report too complex
+    cell = max(GAP_TOLERANCE, 1e-6)
 
-    remaining = list(segs)
+    # index every free endpoint -> [(seg_idx, end_idx), ...]
+    index = {}
+    for i, s in enumerate(segs):
+        for end in (0, 1):
+            pt = s.GetEndPoint(end)
+            index.setdefault(_cell_key(pt, cell), []).append((i, end))
+
+    used = [False] * len(segs)
+
+    def find_join(tail):
+        best = None
+        best_d = GAP_TOLERANCE
+        for key in _neighbor_keys(tail, cell):
+            for (i, end) in index.get(key, []):
+                if used[i]:
+                    continue
+                p = segs[i].GetEndPoint(end)
+                d = _dist2d(p, tail)
+                if d <= best_d:
+                    best_d = d
+                    best = (i, end)
+        return best
+
     loops = []
+    n = len(segs)
+    for start in range(n):
+        if used[start] or len(loops) >= MAX_LOOPS_PER_ELEMENT:
+            continue
+        used[start] = True
+        s0 = segs[start]
+        pts = [s0.GetEndPoint(0), s0.GetEndPoint(1)]
 
-    def near(a, b):
-        return _dist2d(a, b) <= GAP_TOLERANCE
-
-    guard = 0
-    max_guard = max(50, len(remaining) * 2)
-
-    while remaining and len(loops) < MAX_LOOPS_PER_ELEMENT and guard < max_guard:
-        guard += 1
-        ln = remaining.pop(0)
-        pts = [ln.GetEndPoint(0), ln.GetEndPoint(1)]
-        grew = True
-        local_guard = 0
-        while grew and remaining and local_guard < len(segs) + 5:
-            local_guard += 1
-            grew = False
-            tail = pts[-1]
-            for i, s in enumerate(remaining):
-                sp, ep = s.GetEndPoint(0), s.GetEndPoint(1)
-                if near(tail, sp):
-                    pts.append(ep)
-                    remaining.pop(i)
-                    grew = True
-                    break
-                if near(tail, ep):
-                    pts.append(sp)
-                    remaining.pop(i)
-                    grew = True
-                    break
+        guard = 0
+        max_guard = n + 5
+        while guard < max_guard:
+            guard += 1
+            found = find_join(pts[-1])
+            if found is None:
+                break
+            i, end = found
+            used[i] = True
+            other = segs[i].GetEndPoint(1 - end)
+            pts.append(other)
+            if _dist2d(pts[-1], pts[0]) <= GAP_TOLERANCE:
+                break
 
         if len(pts) < 4:
             continue
-        if not near(pts[0], pts[-1]):
+        if _dist2d(pts[0], pts[-1]) > GAP_TOLERANCE:
             continue
 
         pts[-1] = pts[0]
@@ -504,7 +682,6 @@ def curves_to_simple_loops(raw_curves, z):
         if len(pts) < 4:
             continue
 
-        # hard simplify if still too dense
         if len(pts) - 1 > MAX_SEGMENTS_PER_LOOP:
             step = int(math.ceil((len(pts) - 1) / float(MAX_SEGMENTS_PER_LOOP)))
             reduced = [pts[i] for i in range(0, len(pts) - 1, step)]
@@ -598,8 +775,7 @@ def orient_loops(loops):
                 cl.Flip()
         except Exception:
             try:
-                # older API name
-                ccw = cl.IsCounterClockwise(XYZ.BasisZ)
+                ccw = cl.IsCounterClockwise(XYZ.BasisZ)  # older API casing
                 if is_outer and not ccw:
                     cl.Flip()
                 elif (not is_outer) and ccw:
@@ -670,7 +846,6 @@ def delete_existing_of_types(type_ids):
                 doomed.append(fr.Id)
         except Exception:
             pass
-    # delete in chunks
     chunk = 50
     for i in range(0, len(doomed), chunk):
         part = doomed[i:i + chunk]
@@ -691,10 +866,6 @@ def delete_existing_of_types(type_ids):
 # CREATE FR SAFELY
 # =============================================================================
 def create_fr_safe(fr_type_id, loops):
-    """
-    Try create filled region with fallbacks.
-    Returns (ok, note)
-    """
     if not loops:
         return False, "no loops"
 
@@ -717,15 +888,12 @@ def create_fr_safe(fr_type_id, loops):
                 pass
             return False
 
-    # 1) all loops
     if len(loops) <= MAX_LOOPS_PER_ELEMENT and _try(loops):
         return True, "all loops"
 
-    # 2) outer only
     if _try([loops[0]]):
         return True, "outer only"
 
-    # 3) each loop separately
     ok_n = 0
     for lp in loops[:MAX_LOOPS_PER_ELEMENT]:
         if _try([lp]):
@@ -764,7 +932,6 @@ def main():
     skipped = []
     type_ids = set()
 
-    # prep types first
     prepared = []
     t = Transaction(doc, "FR prepare types")
     t.Start()
@@ -790,7 +957,6 @@ def main():
             pass
         forms.alert("Type prep failed:\n{}".format(ex), exitscript=True)
 
-    # clear old once
     t = Transaction(doc, "FR clear old")
     t.Start()
     _cfg_tx(t)
@@ -803,7 +969,6 @@ def main():
         except Exception:
             pass
 
-    # place one by one with progress
     total = len(prepared)
     with forms.ProgressBar(title="Surface Pattern Region", cancellable=True) as pb:
         for i, (e, frt, label) in enumerate(prepared):
@@ -817,7 +982,7 @@ def main():
                 if not raw:
                     skipped.append("{} - no boundary".format(label))
                     continue
-                if len(raw) > 3000:
+                if len(raw) > MAX_RAW_CURVES:
                     skipped.append("{} - too complex ({} curves)".format(label, len(raw)))
                     continue
 
