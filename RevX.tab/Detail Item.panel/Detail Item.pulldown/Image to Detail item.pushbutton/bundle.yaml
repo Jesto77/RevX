@@ -1,7 +1,11 @@
-title: Image to\nDetail Item
-tooltip: Pick a linked or imported image in the active view to trace it into a Detail Item family with detail lines and arcs.
-author: Jesto Joy
+title: "Image to\nDetail Item"
+
+author: "Jesto Joy"
+
+tooltip: |
+  Pick a linked or imported image in the active view to trace it into a Detail Item family with detail lines and arcs.
+
   How to Use:
   • Select the Linked or Imported Image file in the active view.
   • Run "Image to Detail Item".
-  • Name the family and save the `.rfa` file.
+  • Name the family and save the .rfa file.
