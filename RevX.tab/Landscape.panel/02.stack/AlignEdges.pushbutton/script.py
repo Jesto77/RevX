@@ -439,6 +439,15 @@ def align_slab(target_elem, adjacent_elements, align_method, offset_feet):
     if ref_z is None:
         ref_z = get_param_datum_z(target_elem)  # fallback if the probe failed
 
+    # detect_ref_z() ran a Regenerate() + RollBack() inside a SubTransaction —
+    # both invalidate any SlabShapeVertex handles fetched before it, including
+    # existing_verts0. Re-fetch fresh handles now, or the next .Position access
+    # throws "Can not get a valid positon of the vertex."
+    editor = get_shape_editor(target_elem)
+    if editor is None:
+        return (0, 0, 0, 0.0, 0, "Shape editor lost after baseline probe.")
+    existing_verts0 = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+
     # "Coincident in the XY dimension" tolerance — Align Edges only Z-corrects
     # points that are ALREADY at (or very near) the source edge in plan.
     # Defined here (before injection) so the SAME radius is used both to skip
