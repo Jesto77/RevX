@@ -1,0 +1,12 @@
+title: "Palette"
+author: "Jesto Joy"
+tooltip: |
+  Divides a picked view area into dynamic grid lines and optionally populates them with linked plant palette images and text labels.
+  
+  How to Use:
+  • Click "Palette".
+  • Select a Line Style for the grid lines.
+  • Pick two opposite corners in the active view to define the area.
+  • Set Row/Column patterns (use Custom Pattern with 3 sizes for image legends: Header, Image, Label).
+  • Click "Create Lines Only" or "Link Images".
+  • If linking images, select your main folder and choose images from the category subfolders.

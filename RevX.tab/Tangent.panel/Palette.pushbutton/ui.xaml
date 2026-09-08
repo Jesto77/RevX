@@ -1,0 +1,82 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Divide Area - Grid Lines" Height="620" Width="480"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- ROWS -->
+            <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                <TextBlock Text="Rows" FontWeight="Bold" Margin="0,0,0,4"/>
+                <RadioButton x:Name="RowEqualRadio" Content="Equal" GroupName="RowMode" IsChecked="True" Checked="row_mode_changed"/>
+                <RadioButton x:Name="RowCustomRadio" Content="Custom pattern" GroupName="RowMode" Checked="row_mode_changed"/>
+
+                <StackPanel x:Name="RowEqualPanel" Margin="0,6,0,0">
+                    <TextBlock Text="Number of rows"/>
+                    <TextBox x:Name="RowsBox" Height="26" VerticalContentAlignment="Center" FontSize="14"/>
+                </StackPanel>
+
+                <StackPanel x:Name="RowCustomPanel" Margin="0,6,0,0" Visibility="Collapsed">
+                    <TextBlock x:Name="RowUnitLabel" Text="Sizes (comma-separated)" TextWrapping="Wrap" FontSize="11"/>
+                    <TextBox x:Name="RowSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="200, 1000, 200"/>
+                    <TextBlock Text="Repeat count" Margin="0,6,0,0"/>
+                    <TextBox x:Name="RowRepeatBox" Height="26" VerticalContentAlignment="Center" FontSize="14" Text="3"/>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- COLUMNS -->
+            <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                <TextBlock Text="Columns" FontWeight="Bold" Margin="0,0,0,4"/>
+                <RadioButton x:Name="ColEqualRadio" Content="Equal" GroupName="ColMode" IsChecked="True" Checked="col_mode_changed"/>
+                <RadioButton x:Name="ColCustomRadio" Content="Custom pattern" GroupName="ColMode" Checked="col_mode_changed"/>
+
+                <StackPanel x:Name="ColEqualPanel" Margin="0,6,0,0">
+                    <TextBlock Text="Number of columns"/>
+                    <TextBox x:Name="ColsBox" Height="26" VerticalContentAlignment="Center" FontSize="14"/>
+                </StackPanel>
+
+                <StackPanel x:Name="ColCustomPanel" Margin="0,6,0,0" Visibility="Collapsed">
+                    <TextBlock x:Name="ColUnitLabel" Text="Sizes (comma-separated)" TextWrapping="Wrap" FontSize="11"/>
+                    <TextBox x:Name="ColSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="600, 300, 300"/>
+                    <TextBlock Text="Repeat count" Margin="0,6,0,0"/>
+                    <TextBox x:Name="ColRepeatBox" Height="26" VerticalContentAlignment="Center" FontSize="14" Text="3"/>
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+
+        <TextBlock Grid.Row="1"
+                   Text="Live preview - updates as you type. 'Link Images' requires Custom Rows set to exactly 3 sizes (Header, Image, Label)."
+                   FontStyle="Italic" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+        <Border Grid.Row="2" BorderBrush="#CCCCCC" BorderThickness="1" Background="White"
+                HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Canvas x:Name="PreviewCanvas" Width="400" Height="220" Background="White"/>
+        </Border>
+
+        <TextBlock x:Name="SummaryText" Grid.Row="3" Margin="0,10,0,4"
+                   HorizontalAlignment="Center" FontWeight="Bold" FontSize="12" TextWrapping="Wrap"/>
+
+        <TextBlock x:Name="ErrorText" Grid.Row="4" Margin="0,0,0,6"
+                   HorizontalAlignment="Center" Foreground="Red" FontSize="12" TextWrapping="Wrap"/>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="CancelBtn" Content="Cancel" Width="80" Height="30" Margin="0,0,10,0" Click="cancel_click"/>
+            <Button x:Name="CreateBtn" Content="Create Lines Only" Width="120" Height="30" Margin="0,0,10,0" Click="create_click"/>
+            <Button x:Name="LinkImgBtn" Content="Link Images" Width="100" Height="30" FontWeight="Bold" Click="link_images_click"/>
+        </StackPanel>
+    </Grid>
+</Window>
