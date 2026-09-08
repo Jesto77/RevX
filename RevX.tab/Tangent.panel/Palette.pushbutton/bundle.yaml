@@ -6,7 +6,7 @@ tooltip: |
   How to Use:
   • Click "Palette".
   • Select a Line Style for the grid lines.
-  • Pick two opposite corners in the active view to define the area.
+  • Pick two opposite corners of the boundary in the active view to define the area.
   • Set Row/Column patterns (use Custom Pattern with 3 sizes for image legends: Header, Image, Label).
   • Click "Create Lines Only" or "Link Images".
   • If linking images, select your main folder and choose images from the category subfolders.

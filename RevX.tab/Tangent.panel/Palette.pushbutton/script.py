@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Grid Divider & Image Linker
+Grid Divider & Image Linker for Palette
 -------------------------------------------------------------------------------
-Creates dynamic grid lines and populates them with Images and Text labels.
+Custom sizes are ACTUAL project units by default.
+Adjust checkboxes (ON by default) scale the pattern to fill the picked box.
 """
 
 __title__ = "Palette"
@@ -85,7 +86,7 @@ def pick_line_style():
 
 def pick_two_corners():
     try:
-        p1 = uidoc.Selection.PickPoint("Pick the FIRST corner of the area to divide")
+        p1 = uidoc.Selection.PickPoint("Pick the FIRST corner (top-left recommended)")
         p2 = uidoc.Selection.PickPoint("Pick the OPPOSITE corner")
     except OperationCanceledException:
         sys.exit()
@@ -96,7 +97,7 @@ def rect_from_points(p1, p2):
     min_x, max_x = min(p1.X, p2.X), max(p1.X, p2.X)
     min_y, max_y = min(p1.Y, p2.Y), max(p1.Y, p2.Y)
     z = p1.Z
-    if (max_x - min_x) < 1e-6 or (max_y - min_y) < 1e-6:
+    if (max_x - min_x) < 1e-9 or (max_y - min_y) < 1e-9:
         forms.alert("Invalid rectangle picked.", exitscript=True)
     return min_x, min_y, max_x, max_y, z
 
@@ -115,6 +116,20 @@ def get_unit_label(unit_type_id):
         return "units"
 
 
+def to_internal(value_display, unit_type_id):
+    try:
+        return DB.UnitUtils.ConvertToInternalUnits(float(value_display), unit_type_id)
+    except Exception:
+        return float(value_display) / 304.8
+
+
+def to_display(value_internal, unit_type_id):
+    try:
+        return DB.UnitUtils.ConvertFromInternalUnits(float(value_internal), unit_type_id)
+    except Exception:
+        return float(value_internal) * 304.8
+
+
 def parse_sizes(text):
     parts = [p.strip() for p in text.split(",") if p.strip()]
     if not parts:
@@ -128,34 +143,46 @@ def parse_sizes(text):
     return vals
 
 
-def equal_fractions(count):
+def equal_strip_lengths(total_length, count):
     if count < 1:
         count = 1
-    return [float(i) / count for i in range(1, count)]
+    if total_length <= 0:
+        raise ValueError("Length must be > 0.")
+    step = total_length / float(count)
+    return [step] * count
 
 
-def custom_fractions(sizes_display, repeat_count):
+def custom_strip_lengths(sizes_display, repeat_count, unit_type_id, adjust, target_length_internal):
     if repeat_count < 1:
         repeat_count = 1
-    band_sum = sum(sizes_display)
-    if band_sum <= 0:
-        raise ValueError("Pattern sizes must sum to > 0.")
-    total = band_sum * repeat_count
-    cum, running = [], 0.0
+    sizes_internal = [to_internal(s, unit_type_id) for s in sizes_display]
+    strips = []
     for _ in range(repeat_count):
-        for s in sizes_display:
-            running += s
-            cum.append(running / total)
-    return cum[:-1]
+        strips.extend(sizes_internal)
+
+    total = sum(strips)
+    if total <= 0:
+        raise ValueError("Pattern sizes must sum to > 0.")
+
+    if adjust:
+        if target_length_internal <= 0:
+            raise ValueError("Target length must be > 0 for Adjust.")
+        scale = target_length_internal / total
+        strips = [s * scale for s in strips]
+
+    return strips
+
+
+def edges_from_strips(start, strips, descending=False):
+    edges = [start]
+    pos = start
+    for length in strips:
+        pos = pos - length if descending else pos + length
+        edges.append(pos)
+    return edges
 
 
 def clean_header_name(name):
-    """
-    '01 - PALMS'        -> 'PALMS'
-    '02 - TREES'        -> 'TREES'
-    '03 - LARGE SHRUBS' -> 'LARGE SHRUBS'
-    '07-GRASS'          -> 'GRASS'
-    """
     if not name:
         return name
     s = str(name).strip()
@@ -172,12 +199,22 @@ def mm_to_internal(mm):
     except Exception:
         pass
     try:
-        return DB.UnitUtils.ConvertToInternalUnits(
-            float(mm), DB.DisplayUnitType.DUT_MILLIMETERS
-        )
+        return DB.UnitUtils.ConvertToInternalUnits(float(mm), DB.DisplayUnitType.DUT_MILLIMETERS)
     except Exception:
         pass
-    return float(mm) / 304.8  # feet fallback
+    return float(mm) / 304.8
+
+
+def format_strips_display(strips_internal, unit_type_id, unit_label, adjusted=False):
+    vals = [to_display(v, unit_type_id) for v in strips_internal]
+    txt = ", ".join("{:g}".format(round(v, 3)) for v in vals[:12])
+    if len(vals) > 12:
+        txt += ", ..."
+    total = to_display(sum(strips_internal), unit_type_id)
+    mode = "adjusted to fit" if adjusted else "exact"
+    return "{} {}  | total {:g} {} ({})".format(
+        txt, unit_label, round(total, 3), unit_label, mode
+    )
 
 
 # =============================================================================
@@ -195,12 +232,34 @@ class DivideWindow(forms.WPFWindow):
         self.result_ok = False
         self.link_images = False
         self.max_capacity = 0
-        self.row_fracs, self.col_fracs = [], []
+        self.adjust_rows = False
+        self.adjust_cols = False
+
+        self.row_strips = []
+        self.col_strips = []
 
         self.RowsBox.Text = "9"
         self.ColsBox.Text = "5"
-        self.RowUnitLabel.Text = "Sizes in {} (comma-separated)".format(self.unit_label)
-        self.ColUnitLabel.Text = "Sizes in {} (comma-separated)".format(self.unit_label)
+        self.RowUnitLabel.Text = "ACTUAL sizes in {} (e.g. 20, 100, 20)".format(self.unit_label)
+        self.ColUnitLabel.Text = "ACTUAL sizes in {} (e.g. 60, 60, 60)".format(self.unit_label)
+
+        try:
+            self.RowSizesBox.Text = "20, 100, 20"
+            self.ColSizesBox.Text = "60, 60, 60"
+            self.RowRepeatBox.Text = "3"
+            self.ColRepeatBox.Text = "1"
+        except Exception:
+            pass
+
+        # Ensure Adjust defaults to ON even if XAML missed IsChecked
+        try:
+            self.RowAdjustCheck.IsChecked = True
+        except Exception:
+            pass
+        try:
+            self.ColAdjustCheck.IsChecked = True
+        except Exception:
+            pass
 
         for box in (self.RowsBox, self.ColsBox, self.RowSizesBox,
                     self.RowRepeatBox, self.ColSizesBox, self.ColRepeatBox):
@@ -210,7 +269,27 @@ class DivideWindow(forms.WPFWindow):
         self.RowCustomRadio.Checked += self.row_mode_changed
         self.ColEqualRadio.Checked += self.col_mode_changed
         self.ColCustomRadio.Checked += self.col_mode_changed
+
+        if hasattr(self, "RowAdjustCheck"):
+            self.RowAdjustCheck.Checked += self.on_change
+            self.RowAdjustCheck.Unchecked += self.on_change
+        if hasattr(self, "ColAdjustCheck"):
+            self.ColAdjustCheck.Checked += self.on_change
+            self.ColAdjustCheck.Unchecked += self.on_change
+
         self.draw_preview()
+
+    def _row_adjust(self):
+        try:
+            return bool(self.RowAdjustCheck.IsChecked)
+        except Exception:
+            return True  # default ON
+
+    def _col_adjust(self):
+        try:
+            return bool(self.ColAdjustCheck.IsChecked)
+        except Exception:
+            return True  # default ON
 
     def row_mode_changed(self, sender, args):
         custom = bool(self.RowCustomRadio.IsChecked)
@@ -233,38 +312,50 @@ class DivideWindow(forms.WPFWindow):
         except Exception:
             return fallback
 
-    def get_row_fractions(self):
+    def get_row_strips(self):
         if self.RowEqualRadio.IsChecked:
             c = self._get_int(self.RowsBox, 3)
-            return equal_fractions(c), None, "Rows: {} equal".format(c)
+            strips = equal_strip_lengths(self.height_internal, c)
+            return strips, None, "Rows: {} equal over picked height".format(c), False
         try:
-            s = parse_sizes(self.RowSizesBox.Text)
-            r = self._get_int(self.RowRepeatBox, 1)
-            return custom_fractions(s, r), None, "Rows: pattern x{}".format(r)
+            sizes = parse_sizes(self.RowSizesBox.Text)
+            rep = self._get_int(self.RowRepeatBox, 1)
+            adj = self._row_adjust()
+            strips = custom_strip_lengths(
+                sizes, rep, self.unit_type_id, adj, self.height_internal
+            )
+            msg = "Rows: " + format_strips_display(strips, self.unit_type_id, self.unit_label, adj)
+            return strips, None, msg, adj
         except Exception as e:
-            return [], str(e), ""
+            return [], str(e), "", False
 
-    def get_col_fractions(self):
+    def get_col_strips(self):
         if self.ColEqualRadio.IsChecked:
             c = self._get_int(self.ColsBox, 3)
-            return equal_fractions(c), None, "Cols: {} equal".format(c)
+            strips = equal_strip_lengths(self.width_internal, c)
+            return strips, None, "Cols: {} equal over picked width".format(c), False
         try:
-            s = parse_sizes(self.ColSizesBox.Text)
-            r = self._get_int(self.ColRepeatBox, 1)
-            return custom_fractions(s, r), None, "Cols: pattern x{}".format(r)
+            sizes = parse_sizes(self.ColSizesBox.Text)
+            rep = self._get_int(self.ColRepeatBox, 1)
+            adj = self._col_adjust()
+            strips = custom_strip_lengths(
+                sizes, rep, self.unit_type_id, adj, self.width_internal
+            )
+            msg = "Cols: " + format_strips_display(strips, self.unit_type_id, self.unit_label, adj)
+            return strips, None, msg, adj
         except Exception as e:
-            return [], str(e), ""
+            return [], str(e), "", False
 
     def draw_preview(self):
         import System.Windows.Shapes as Shapes
 
-        rf, r_err, r_sum = self.get_row_fractions()
-        cf, c_err, c_sum = self.get_col_fractions()
+        rs, r_err, r_sum, r_adj = self.get_row_strips()
+        cs, c_err, c_sum, c_adj = self.get_col_strips()
         errors = [e for e in (r_err, c_err) if e]
         self.ErrorText.Text = " | ".join(errors)
         self.SummaryText.Text = "{}   {}".format(r_sum, c_sum)
 
-        valid = (len(errors) == 0)
+        valid = (len(errors) == 0 and len(rs) > 0 and len(cs) > 0)
         self.CreateBtn.IsEnabled = valid
         self.LinkImgBtn.IsEnabled = valid
 
@@ -273,9 +364,12 @@ class DivideWindow(forms.WPFWindow):
         if not valid:
             return
 
+        total_w = sum(cs)
+        total_h = sum(rs)
+        ar = (total_w / total_h) if total_h > 0 else 1.0
+
         cw, ch, margin = float(canvas.Width), float(canvas.Height), 12.0
         avail_w, avail_h = cw - 2 * margin, ch - 2 * margin
-        ar = self.aspect_ratio
         if (avail_w / avail_h) > ar:
             rect_h, rect_w = avail_h, avail_h * ar
         else:
@@ -293,40 +387,47 @@ class DivideWindow(forms.WPFWindow):
         add_line(ox + rect_w, oy, ox + rect_w, oy + rect_h, 1.5)
         add_line(ox + rect_w, oy + rect_h, ox, oy + rect_h, 1.5)
         add_line(ox, oy + rect_h, ox, oy, 1.5)
-        for f in cf:
-            add_line(ox + rect_w * f, oy, ox + rect_w * f, oy + rect_h, 1.0)
-        for f in rf:
-            add_line(ox, oy + rect_h * f, ox + rect_w, oy + rect_h * f, 1.0)
+
+        x = ox
+        for L in cs[:-1]:
+            x += rect_w * (L / total_w)
+            add_line(x, oy, x, oy + rect_h, 1.0)
+
+        y = oy
+        for L in rs[:-1]:
+            y += rect_h * (L / total_h)
+            add_line(ox, y, ox + rect_w, y, 1.0)
+
+    def _store_results(self, link):
+        rs, re, _, r_adj = self.get_row_strips()
+        cs, ce, _, c_adj = self.get_col_strips()
+        if re or ce or not rs or not cs:
+            return False
+        self.row_strips = rs
+        self.col_strips = cs
+        self.adjust_rows = r_adj
+        self.adjust_cols = c_adj
+        self.result_ok = True
+        self.link_images = link
+        if link:
+            if len(rs) % 3 != 0:
+                forms.alert(
+                    "Link Images needs rows in groups of 3 (Header, Image, Label).\n"
+                    "Example: 20, 100, 20 with Repeat N.",
+                    warn_icon=True
+                )
+                self.result_ok = False
+                return False
+            self.max_capacity = (len(rs) // 3) * len(cs)
+        return True
 
     def create_click(self, sender, args):
-        rf, re, _ = self.get_row_fractions()
-        cf, ce, _ = self.get_col_fractions()
-        if re or ce:
-            return
-        self.row_fracs, self.col_fracs = rf, cf
-        self.result_ok = True
-        self.link_images = False
-        self.Close()
+        if self._store_results(False):
+            self.Close()
 
     def link_images_click(self, sender, args):
-        rf, re, _ = self.get_row_fractions()
-        cf, ce, _ = self.get_col_fractions()
-        if re or ce:
-            return
-        total_rows = len(rf) + 1
-        total_cols = len(cf) + 1
-        if total_rows % 3 != 0:
-            forms.alert(
-                "Link Images needs a layout with a multiple of 3 rows (Header, Image, Label).\n"
-                "Use a Custom Row Pattern with 3 sizes (e.g. 200, 1000, 200).",
-                warn_icon=True
-            )
-            return
-        self.max_capacity = (total_rows // 3) * total_cols
-        self.row_fracs, self.col_fracs = rf, cf
-        self.result_ok = True
-        self.link_images = True
-        self.Close()
+        if self._store_results(True):
+            self.Close()
 
     def cancel_click(self, sender, args):
         self.result_ok = False
@@ -385,11 +486,9 @@ class ImageSelectorWindow(W.Window):
         bottom.Children.Add(_btn("Select All", self._select_all))
         bottom.Children.Add(_btn("Clear", self._clear))
         bottom.Children.Add(_btn("Invert", self._invert))
-
         spacer = Controls.TextBlock()
         spacer.Width = 20
         bottom.Children.Add(spacer)
-
         ok = _btn("OK", self._ok, 90)
         ok.FontWeight = W.FontWeights.Bold
         bottom.Children.Add(ok)
@@ -397,7 +496,6 @@ class ImageSelectorWindow(W.Window):
         root.Children.Add(bottom)
 
         scroll = Controls.ScrollViewer()
-        # FIX: correct enum is ScrollBarVisibility.Auto
         scroll.VerticalScrollBarVisibility = Controls.ScrollBarVisibility.Auto
         root.Children.Add(scroll)
 
@@ -407,20 +505,16 @@ class ImageSelectorWindow(W.Window):
 
         for cat in sorted(grouped.keys()):
             items = grouped[cat]
-
             header = Controls.Border()
             header.Background = Media.BrushConverter().ConvertFromString("#FF4A90D9")
             header.Padding = W.Thickness(8, 5, 8, 5)
             header.Margin = W.Thickness(0, 6, 0, 0)
-
             hdr_sp = Controls.StackPanel()
             hdr_sp.Orientation = Controls.Orientation.Horizontal
-
             grp_cb = Controls.CheckBox()
             grp_cb.VerticalAlignment = W.VerticalAlignment.Center
             grp_cb.Margin = W.Thickness(0, 0, 8, 0)
             hdr_sp.Children.Add(grp_cb)
-
             hdr_txt = Controls.TextBlock()
             hdr_txt.Text = "{}  ({} items)".format(cat, len(items))
             hdr_txt.Foreground = Media.Brushes.White
@@ -436,7 +530,6 @@ class ImageSelectorWindow(W.Window):
                 row.BorderBrush = Media.BrushConverter().ConvertFromString("#FFEEEEEE")
                 row.BorderThickness = W.Thickness(0, 0, 0, 1)
                 row.Padding = W.Thickness(28, 4, 8, 4)
-
                 cb = Controls.CheckBox()
                 cb.Content = it.name
                 cb.FontSize = 12
@@ -460,7 +553,6 @@ class ImageSelectorWindow(W.Window):
                     self._bulk_updating = False
                     self._update_counter()
                 return handler
-
             grp_cb.Checked += _make_grp_handler(cat_checks, grp_cb)
             grp_cb.Unchecked += _make_grp_handler(cat_checks, grp_cb)
 
@@ -485,10 +577,7 @@ class ImageSelectorWindow(W.Window):
             return
         if sender.IsChecked and len(self._selected_items()) > self._max_cap:
             sender.IsChecked = False
-            forms.alert(
-                "Grid capacity is {} images.\nUncheck another item first.".format(self._max_cap),
-                title="Capacity Reached"
-            )
+            forms.alert("Grid capacity is {} images.".format(self._max_cap), title="Capacity Reached")
         self._update_counter()
 
     def _select_all(self, sender, args):
@@ -530,54 +619,36 @@ class ImageSelectorWindow(W.Window):
 
 
 def get_image_data_workflow(max_cap):
-    root_folder = pick_folder_dialog(
-        "Select Main Folder (grid capacity: {} images)".format(max_cap)
-    )
+    root_folder = pick_folder_dialog("Select Main Folder (grid capacity: {} images)".format(max_cap))
     if not root_folder:
         return []
-
-    subdirs = sorted(
-        [d for d in os.listdir(root_folder)
-         if os.path.isdir(os.path.join(root_folder, d))]
-    )
+    subdirs = sorted([d for d in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, d))])
     if not subdirs:
         forms.alert("No subfolders found in the selected folder.")
         return []
-
     grouped = {}
     for cat in subdirs:
         cat_path = os.path.join(root_folder, cat)
-        files = sorted([
-            f for f in os.listdir(cat_path)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))
-        ])
+        files = sorted([f for f in os.listdir(cat_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))])
         if files:
-            grouped[cat] = [
-                ImgItem(cat, os.path.join(cat_path, f), f) for f in files
-            ]
-
+            grouped[cat] = [ImgItem(cat, os.path.join(cat_path, f), f) for f in files]
     if not grouped:
         forms.alert("No images found inside the subfolders.")
         return []
-
     win = ImageSelectorWindow(grouped, max_cap)
     win.ShowDialog()
     if not win.selected:
         return []
-
-    return [
-        {
-            'category': s.category,
-            'header': clean_header_name(s.category),
-            'path': s.filepath,
-            'label': s.label
-        }
-        for s in win.selected
-    ]
+    return [{
+        'category': s.category,
+        'header': clean_header_name(s.category),
+        'path': s.filepath,
+        'label': s.label
+    } for s in win.selected]
 
 
 # =============================================================================
-# IMAGE TYPE CREATION  (Prioritizes LINKing over Importing)
+# IMAGE TYPE CREATION
 # =============================================================================
 def _get_image_resource_type():
     try:
@@ -595,10 +666,8 @@ def _get_image_resource_type():
 
 
 def _get_image_type_sources():
-    """Returns image sources prioritizing 'Link' FIRST so images are referenced."""
     sources = []
     if hasattr(DB, "ImageTypeSource"):
-        # Prioritize LINK over Import!
         for name in ("Link", "Import", "Internal"):
             if hasattr(DB.ImageTypeSource, name):
                 sources.append(getattr(DB.ImageTypeSource, name))
@@ -615,38 +684,27 @@ def _get_image_type_sources():
 def _make_local_external_ref(filepath):
     filepath = os.path.abspath(str(filepath))
     mp = DB.ModelPathUtils.ConvertUserVisiblePathToModelPath(filepath)
-
     res_type = _get_image_resource_type()
     if res_type is None:
         raise Exception("Could not resolve BuiltInExternalResourceTypes.Image")
-
     last_ex = None
     for ptype_name in ("Absolute", "Relative"):
         try:
             ptype = getattr(DB.PathType, ptype_name)
-            return DB.ExternalResourceReference.CreateLocalResource(
-                doc, res_type, mp, ptype
-            )
+            return DB.ExternalResourceReference.CreateLocalResource(doc, res_type, mp, ptype)
         except Exception as ex:
             last_ex = ex
     raise Exception("CreateLocalResource failed: {}".format(last_ex))
 
 
 def create_image_type(filepath):
-    """
-    Create ImageType as a LINK for current Revit version.
-    """
     filepath = os.path.abspath(str(filepath))
     if not os.path.isfile(filepath):
         raise Exception("File not found:\n{}".format(filepath))
-
     errors = []
     sources = _get_image_type_sources()
-
-    # ------ PRIMARY: ExternalResourceReference + ImageTypeSource (Link first) ------
     try:
         ext_ref = _make_local_external_ref(filepath)
-
         for src in sources:
             try:
                 opts = DB.ImageTypeOptions(ext_ref, src)
@@ -655,7 +713,6 @@ def create_image_type(filepath):
                     return img
             except Exception as ex:
                 errors.append("Options(ExtRef, {}): {}".format(src, ex))
-
         try:
             opts = DB.ImageTypeOptions(ext_ref)
             img = DB.ImageType.Create(doc, opts)
@@ -663,18 +720,15 @@ def create_image_type(filepath):
                 return img
         except Exception as ex:
             errors.append("Options(ExtRef): {}".format(ex))
-
         try:
             img = DB.ImageType.Create(doc, ext_ref)
             if img:
                 return img
         except Exception as ex:
             errors.append("Create(ExtRef): {}".format(ex))
-
     except Exception as ex:
         errors.append("Build ExtRef: {}".format(ex))
 
-    # ------ FALLBACKS for older APIs ------
     sys_path = System.String(filepath)
     for p in (filepath, sys_path):
         for src in sources:
@@ -685,7 +739,6 @@ def create_image_type(filepath):
                     return img
             except Exception as ex:
                 errors.append("Options({}, {}): {}".format(type(p).__name__, src, ex))
-
     try:
         mp = DB.ModelPathUtils.ConvertUserVisiblePathToModelPath(filepath)
         for src in sources:
@@ -698,17 +751,12 @@ def create_image_type(filepath):
                 errors.append("Options(ModelPath, {}): {}".format(src, ex))
     except Exception as ex:
         errors.append("ModelPath fallback: {}".format(ex))
-
-    raise Exception(
-        "Cannot create ImageType for '{}':\n{}".format(filepath, "\n".join(errors))
-    )
+    raise Exception("Cannot create ImageType for '{}':\n{}".format(filepath, "\n".join(errors)))
 
 
 def find_or_create_image_type(filepath):
-    """Reuse an already-loaded ImageType when possible."""
     filepath = os.path.abspath(str(filepath))
     filename = os.path.basename(filepath)
-
     for img_type in FilteredElementCollector(doc).OfClass(DB.ImageType):
         try:
             if img_type.Name.lower() == filename.lower():
@@ -718,24 +766,23 @@ def find_or_create_image_type(filepath):
                 return img_type
         except Exception:
             pass
-
     return create_image_type(filepath)
 
 
 # =============================================================================
-# GEOMETRY & PLACEMENT LOGIC
+# GEOMETRY & PLACEMENT
 # =============================================================================
-def get_grid_cells(min_x, min_y, max_x, max_y, z, row_fracs, col_fracs):
-    w, h = max_x - min_x, max_y - min_y
-    x_coords = [min_x] + [min_x + w * f for f in col_fracs] + [max_x]
-    y_coords = [max_y] + [max_y - h * f for f in row_fracs] + [min_y]
-
+def get_grid_cells_from_edges(x_edges, y_edges, z):
     cells = []
-    for r in range(len(y_coords) - 1):
+    for r in range(len(y_edges) - 1):
         row_cells = []
-        for c in range(len(x_coords) - 1):
-            left, right = x_coords[c], x_coords[c + 1]
-            top, bottom = y_coords[r], y_coords[r + 1]
+        top, bottom = y_edges[r], y_edges[r + 1]
+        if bottom > top:
+            top, bottom = bottom, top
+        for c in range(len(x_edges) - 1):
+            left, right = x_edges[c], x_edges[c + 1]
+            if right < left:
+                left, right = right, left
             row_cells.append({
                 'left': left, 'right': right, 'top': top, 'bottom': bottom,
                 'cx': (left + right) / 2.0, 'cy': (top + bottom) / 2.0, 'z': z,
@@ -759,21 +806,16 @@ def place_text(cell, text_string, is_header):
     tid = get_default_text_type_id()
     if tid != ElementId.InvalidElementId:
         opt.TypeId = tid
-
     if is_header:
         opt.HorizontalAlignment = DB.HorizontalTextAlignment.Left
-        pt = XYZ(cell['left'] + cell['w'] * 0.05,
-                 cell['bottom'] + cell['h'] * 0.20,
-                 cell['z'])
+        pt = XYZ(cell['left'] + cell['w'] * 0.05, cell['bottom'] + cell['h'] * 0.20, cell['z'])
     else:
         opt.HorizontalAlignment = DB.HorizontalTextAlignment.Center
         pt = XYZ(cell['cx'], cell['cy'], cell['z'])
-
     TextNote.Create(doc, view.Id, pt, text_string, opt)
 
 
 def _recenter_image(img_inst, cx, cy):
-    """Move image so its bounding box center lands on (cx, cy)."""
     try:
         bb = img_inst.get_BoundingBox(view)
         if not bb:
@@ -789,52 +831,37 @@ def _recenter_image(img_inst, cx, cy):
 
 
 def place_image(cell, filepath):
-    """
-    Unchecks 'Lock Proportions' and resizes the image to fit the exact target box
-    (cell minus 20mm total buffer), guaranteeing 10mm margins on all 4 sides.
-    """
     img_type = find_or_create_image_type(filepath)
-
     buffer = mm_to_internal(10.0)
-
-    # Exact target dimensions (10mm margin on top, bottom, left, and right)
     target_w = max(cell['w'] - 2.0 * buffer, 0.01)
     target_h = max(cell['h'] - 2.0 * buffer, 0.01)
-
     cx, cy, cz = cell['cx'], cell['cy'], cell['z']
 
-    place_opts = DB.ImagePlacementOptions(
-        XYZ(cx, cy, cz),
-        DB.BoxPlacement.Center
-    )
+    place_opts = DB.ImagePlacementOptions(XYZ(cx, cy, cz), DB.BoxPlacement.Center)
     img_inst = DB.ImageInstance.Create(doc, view, img_type.Id, place_opts)
 
-    # ---- 1. UNCHECK "LOCK PROPORTIONS" ----
     p_lock = None
     try:
         p_lock = img_inst.get_Parameter(DB.BuiltInParameter.RASTER_LOCK_PROPORTIONS)
     except Exception:
         pass
-
     if not p_lock:
         try:
             for p in img_inst.Parameters:
-                if p.Definition and "lock" in p.Definition.Name.lower() and "proportion" in p.Definition.Name.lower():
+                n = p.Definition.Name.lower() if p.Definition else ""
+                if "lock" in n and "proportion" in n:
                     p_lock = p
                     break
         except Exception:
             pass
-
     if p_lock and not p_lock.IsReadOnly:
         try:
-            p_lock.Set(0)  # 0 = False / Unchecked
+            p_lock.Set(0)
         except Exception:
             pass
 
-    # ---- 2. SET WIDTH AND HEIGHT INDEPENDENTLY ----
     pw = img_inst.get_Parameter(DB.BuiltInParameter.RASTER_SYMBOL_WIDTH)
     ph = img_inst.get_Parameter(DB.BuiltInParameter.RASTER_SYMBOL_HEIGHT)
-
     if pw and not pw.IsReadOnly:
         try:
             pw.Set(target_w)
@@ -845,7 +872,6 @@ def place_image(cell, filepath):
             ph.Set(target_h)
         except Exception:
             pass
-
     try:
         if hasattr(img_inst, "Width"):
             img_inst.Width = target_w
@@ -854,17 +880,7 @@ def place_image(cell, filepath):
     except Exception:
         pass
 
-    try:
-        if hasattr(img_inst, "SetWidth"):
-            img_inst.SetWidth(target_w)
-        if hasattr(img_inst, "SetHeight"):
-            img_inst.SetHeight(target_h)
-    except Exception:
-        pass
-
-    # ---- 3. RE-CENTER IMAGE ----
     _recenter_image(img_inst, cx, cy)
-
     return img_inst
 
 
@@ -875,40 +891,27 @@ def populate_grid(cells, image_data):
     last_cat = None
     placed = 0
     failures = []
-
     for b in range(num_blocks):
-        r_head = b * 3
-        r_img = b * 3 + 1
-        r_lbl = b * 3 + 2
+        r_head, r_img, r_lbl = b * 3, b * 3 + 1, b * 3 + 2
         for c in range(num_cols):
             if idx >= len(image_data):
                 return placed
             item = image_data[idx]
-
             try:
                 if item['category'] != last_cat:
                     header_txt = item.get('header') or clean_header_name(item['category'])
                     place_text(cells[r_head][c], header_txt, True)
                     last_cat = item['category']
-
                 place_image(cells[r_img][c], item['path'])
                 place_text(cells[r_lbl][c], item['label'], False)
                 placed += 1
             except Exception as ex:
                 failures.append("{} -> {}".format(item['path'], ex))
                 logger.error("Failed to place image {}: {}".format(item['path'], ex))
-
             idx += 1
-
     if failures:
-        forms.alert(
-            "Some images failed to place ({}):\n\n{}".format(
-                len(failures),
-                "\n".join(failures[:5])
-            ),
-            title="Placement Issues",
-            warn_icon=True
-        )
+        forms.alert("Some images failed ({}):\n\n{}".format(len(failures), "\n".join(failures[:5])),
+                    title="Placement Issues", warn_icon=True)
     return placed
 
 
@@ -923,12 +926,22 @@ def main():
     width = max_x - min_x
     height = max_y - min_y
     aspect_ratio = width / height if height else 1.0
+    unit_type_id = get_length_unit_type_id()
 
     xaml_file = os.path.join(os.path.dirname(__file__), "ui.xaml")
-    win = DivideWindow(xaml_file, aspect_ratio, width, height, get_length_unit_type_id())
+    win = DivideWindow(xaml_file, aspect_ratio, width, height, unit_type_id)
     win.ShowDialog()
     if not win.result_ok:
         sys.exit()
+
+    row_strips = win.row_strips
+    col_strips = win.col_strips
+
+    x_edges = edges_from_strips(min_x, col_strips, descending=False)
+    y_edges = edges_from_strips(max_y, row_strips, descending=True)
+
+    grid_min_x, grid_max_x = min(x_edges), max(x_edges)
+    grid_min_y, grid_max_y = min(y_edges), max(y_edges)
 
     image_data = []
     if win.link_images:
@@ -936,44 +949,33 @@ def main():
         if not image_data:
             forms.alert("No images selected — creating empty grid only.")
 
-    x_coords = [min_x] + [min_x + width * f for f in win.col_fracs] + [max_x]
-    y_coords = [max_y] + [max_y - height * f for f in win.row_fracs] + [min_y]
-
     lines = [
-        Line.CreateBound(XYZ(min_x, min_y, z), XYZ(max_x, min_y, z)),
-        Line.CreateBound(XYZ(max_x, min_y, z), XYZ(max_x, max_y, z)),
-        Line.CreateBound(XYZ(max_x, max_y, z), XYZ(min_x, max_y, z)),
-        Line.CreateBound(XYZ(min_x, max_y, z), XYZ(min_x, min_y, z)),
+        Line.CreateBound(XYZ(grid_min_x, grid_min_y, z), XYZ(grid_max_x, grid_min_y, z)),
+        Line.CreateBound(XYZ(grid_max_x, grid_min_y, z), XYZ(grid_max_x, grid_max_y, z)),
+        Line.CreateBound(XYZ(grid_max_x, grid_max_y, z), XYZ(grid_min_x, grid_max_y, z)),
+        Line.CreateBound(XYZ(grid_min_x, grid_max_y, z), XYZ(grid_min_x, grid_min_y, z)),
     ]
-    for x in x_coords[1:-1]:
-        lines.append(Line.CreateBound(XYZ(x, min_y, z), XYZ(x, max_y, z)))
-    for y in y_coords[1:-1]:
-        lines.append(Line.CreateBound(XYZ(min_x, y, z), XYZ(max_x, y, z)))
+    for x in x_edges[1:-1]:
+        lines.append(Line.CreateBound(XYZ(x, grid_min_y, z), XYZ(x, grid_max_y, z)))
+    for y in y_edges[1:-1]:
+        lines.append(Line.CreateBound(XYZ(grid_min_x, y, z), XYZ(grid_max_x, y, z)))
 
     t = Transaction(doc, "Create Grid and Images")
     t.Start()
     try:
-        n_lines = 0
         for ln in lines:
             dc = doc.Create.NewDetailCurve(view, ln)
             try:
                 dc.LineStyle = line_style
             except Exception:
                 pass
-            n_lines += 1
 
-        n_items = 0
         if win.link_images and image_data:
-            cells = get_grid_cells(
-                min_x, min_y, max_x, max_y, z, win.row_fracs, win.col_fracs
-            )
-            n_items = populate_grid(cells, image_data)
+            cells = get_grid_cells_from_edges(x_edges, y_edges, z)
+            populate_grid(cells, image_data)
 
         t.Commit()
-        msg = "Created {} line(s).".format(n_lines)
-        if win.link_images:
-            msg += "\nPlaced {} image/label set(s).".format(n_items)
-        forms.alert(msg, title="Grid Divider")
+        # No success popup — finishes silently
     except Exception as ex:
         t.RollBack()
         forms.alert("Failed:\n{}".format(ex))

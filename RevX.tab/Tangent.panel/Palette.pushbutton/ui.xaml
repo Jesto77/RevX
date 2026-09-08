@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Divide Area - Grid Lines" Height="620" Width="480"
+        Title="Divide Area - Grid Lines" Height="680" Width="500"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize">
     <Grid Margin="12">
@@ -31,10 +31,15 @@
                 </StackPanel>
 
                 <StackPanel x:Name="RowCustomPanel" Margin="0,6,0,0" Visibility="Collapsed">
-                    <TextBlock x:Name="RowUnitLabel" Text="Sizes (comma-separated)" TextWrapping="Wrap" FontSize="11"/>
-                    <TextBox x:Name="RowSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="200, 1000, 200"/>
+                    <TextBlock x:Name="RowUnitLabel" Text="ACTUAL sizes (project units)" TextWrapping="Wrap" FontSize="11"/>
+                    <TextBox x:Name="RowSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="20, 100, 20"/>
                     <TextBlock Text="Repeat count" Margin="0,6,0,0"/>
                     <TextBox x:Name="RowRepeatBox" Height="26" VerticalContentAlignment="Center" FontSize="14" Text="3"/>
+                    <CheckBox x:Name="RowAdjustCheck"
+                              Content="Adjust to fit picked height"
+                              IsChecked="True"
+                              Margin="0,8,0,0"
+                              ToolTip="OFF = exact sizes in project units. ON = scale pattern to exactly fill picked height."/>
                 </StackPanel>
             </StackPanel>
 
@@ -50,21 +55,26 @@
                 </StackPanel>
 
                 <StackPanel x:Name="ColCustomPanel" Margin="0,6,0,0" Visibility="Collapsed">
-                    <TextBlock x:Name="ColUnitLabel" Text="Sizes (comma-separated)" TextWrapping="Wrap" FontSize="11"/>
-                    <TextBox x:Name="ColSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="600, 300, 300"/>
+                    <TextBlock x:Name="ColUnitLabel" Text="ACTUAL sizes (project units)" TextWrapping="Wrap" FontSize="11"/>
+                    <TextBox x:Name="ColSizesBox" Height="26" VerticalContentAlignment="Center" FontSize="13" Text="60, 60, 60"/>
                     <TextBlock Text="Repeat count" Margin="0,6,0,0"/>
-                    <TextBox x:Name="ColRepeatBox" Height="26" VerticalContentAlignment="Center" FontSize="14" Text="3"/>
+                    <TextBox x:Name="ColRepeatBox" Height="26" VerticalContentAlignment="Center" FontSize="14" Text="1"/>
+                    <CheckBox x:Name="ColAdjustCheck"
+                              Content="Adjust to fit picked width"
+                              IsChecked="True"
+                              Margin="0,8,0,0"
+                              ToolTip="OFF = exact sizes in project units. ON = scale pattern to exactly fill picked width."/>
                 </StackPanel>
             </StackPanel>
         </Grid>
 
         <TextBlock Grid.Row="1"
-                   Text="Live preview - updates as you type. 'Link Images' requires Custom Rows set to exactly 3 sizes (Header, Image, Label)."
+                   Text="Custom sizes are ACTUAL project units (e.g. mm). Adjust is ON by default (fills picked box). Turn OFF for exact sizes. Link Images needs 3-size row groups: Header, Image, Label."
                    FontStyle="Italic" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,8"/>
 
         <Border Grid.Row="2" BorderBrush="#CCCCCC" BorderThickness="1" Background="White"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
-            <Canvas x:Name="PreviewCanvas" Width="400" Height="220" Background="White"/>
+            <Canvas x:Name="PreviewCanvas" Width="420" Height="230" Background="White"/>
         </Border>
 
         <TextBlock x:Name="SummaryText" Grid.Row="3" Margin="0,10,0,4"
