@@ -1,0 +1,9 @@
+title: "Key Plan"
+author: "Jesto Joy"
+tooltip: |
+  Exports the views into a single merged DWG with all lines set to Grey 253.
+  
+  How to Use:
+  • Open any layout view.
+  • Run "Key Plan".
+  • The tool exports host and linked elements into a single DWG, converting Lineain Grey 253 and also will remove hatch patterns to make the cad clear.
