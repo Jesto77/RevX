@@ -49,14 +49,13 @@ EXPORT_SETUP_NAME = None
 TEMP_PAT_SUFFIX = "_TMP_PAT"
 TEMP_BLK_SUFFIX = "_TMP_BLK"
 
-GREY_RGB = (128, 128, 128)   # change this to lighten/darken the grey
+GREY_RGB = (128, 128, 128)
 
-# Set to True to force all elements and categories to export as grey.
-APPLY_GREY_OVERRIDE = True
+# Set to False to preserve all original Revit view colors, planting greens,
+# and material hatches exactly as drawn in your project.
+APPLY_GREY_OVERRIDE = False
 
-# Marker written to every flat-copy element's Comments parameter, and used
-# to find/remove any of our temp views or copies left behind by a prior
-# run that didn't clean up properly (crash, cancel, older script version).
+# Marker written to every flat-copy element's Comments parameter
 COPY_MARKER = "RevX_DWG_TEMP_COPY"
 
 
@@ -144,7 +143,7 @@ def extend_pat_view_range(pat_view, min_z_offset):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - GREY OVERRIDE
+# HELPERS - GREY OVERRIDE (OPTIONAL)
 # -----------------------------------------------------------------------------
 
 def build_grey_override():
@@ -168,33 +167,32 @@ def build_grey_override():
     except Exception:
         pass
 
-    # Turn the BACKGROUND pattern off instead of coloring it. Many floor/
-    # material patterns have a solid background fill behind the hatch
-    # (normally invisible) - coloring it grey turns it into a solid grey
-    # block that buries the actual pattern lines. Disabling it leaves
-    # clean grey line work only.
-    try:
-        ogs.SetSurfaceBackgroundPatternVisible(False)
-    except Exception:
-        pass
-    try:
-        ogs.SetCutBackgroundPatternVisible(False)
-    except Exception:
-        pass
-
     return ogs
 
 
-def apply_grey_to_categories(view, categories, ogs):
-    for cat in categories:
+def apply_grey_override_to_all_categories_and_subcategories(view, document, ogs):
+    for cat in document.Settings.Categories:
         try:
-            view.SetCategoryOverrides(cat.Id, ogs)
+            if cat.get_AllowsVisibilityControl(view):
+                view.SetCategoryOverrides(cat.Id, ogs)
+        except Exception:
+            pass
+
+        try:
+            subcats = cat.SubCategories
+            if subcats:
+                for subcat in subcats:
+                    try:
+                        if subcat.get_AllowsVisibilityControl(view):
+                            view.SetCategoryOverrides(subcat.Id, ogs)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - FILE / EXPORT (shared by both the per-view export and the merge)
+# HELPERS - FILE / EXPORT
 # -----------------------------------------------------------------------------
 
 def safe_filename(name):
@@ -245,14 +243,9 @@ def get_export_options(document, setup_name=None):
     else:
         opts = DB.DWGExportOptions()
 
-    # MergedViews merges multiple views into one file via XRefs (Autodesk's
-    # own documented wording). Because these are direct VIEW exports (not a
-    # sheet), the geometry uses real project coordinates, so pattern and
-    # blocks land in the correct position automatically.
     opts.MergedViews = True
 
-    # Use true/RGB color so the grey overrides come through as-drawn,
-    # rather than being remapped to the nearest AutoCAD index color.
+    # Use true RGB color so original view colors and hatches come through exactly
     try:
         opts.Colors = DB.ExportColorMode.TrueColorPerView
     except Exception:
@@ -301,10 +294,6 @@ def duplicate_view(view, new_name):
 
 
 def detach_view_template(view):
-    # If the source view has a View Template applied, category visibility
-    # can be locked by the template, so our SetCategoryHidden() calls
-    # silently fail to take effect (caught by the try/except and ignored).
-    # Detaching first guarantees our overrides actually apply.
     try:
         view.ViewTemplateId = DB.ElementId.InvalidElementId
     except Exception:
@@ -370,13 +359,7 @@ def validate_pattern_categories(document, bic_list):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - EXPORT (merged-view export, no sheet needed) - one call per
-# source view. With MergedViews=True and 2 view ids, Revit does NOT
-# inline the second view's geometry into the first file - it links it in
-# as an external reference, so this one call leaves TWO physical DWG
-# files in `folder` (a master + an xref, the xref typically named after
-# the second view). We return every file that appeared as a result of
-# this export call so the merge step can flatten all of them.
+# HELPERS - EXPORT
 # -----------------------------------------------------------------------------
 
 def export_views_raw(document, folder, export_name, candidate_names, view_ids, options):
@@ -433,8 +416,7 @@ def verify_and_hide_originals(document, pat_view, copied_elements_map, flat_copi
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - MERGE STEP (imports the two per-view DWGs into a blank scratch
-# document at their original coordinates, then re-exports as one file)
+# HELPERS - MERGE STEP
 # -----------------------------------------------------------------------------
 
 def get_scratch_plan_view_family_type(document):
@@ -463,22 +445,15 @@ def hide_all_categories_scratch(view, document):
 def import_dwg_to_scratch(document, view, path):
     options = DB.DWGImportOptions()
     try:
-        # Origin-to-origin placement: puts the imported geometry back at
-        # the exact real-world coordinates it was exported from, so the
-        # two files land in the correct position relative to each other
-        # automatically - no manual nudging.
         options.Placement = DB.ImportPlacement.Origin
     except Exception:
         pass
     try:
-        # Changed to True: importing as a view-specific 2D element allows 
-        # Revit to control its visual overlay Draw Order (Send to Back / Bring to Front)
         options.ThisViewOnly = True
     except Exception:
         pass
     try:
-        # Keep exact RGB values on import instead of snapping to the
-        # nearest AutoCAD Color Index (ACI) palette entry.
+        # Preserve original RGB colors on import
         options.ColorMode = DB.ImportColorMode.Preserved
     except Exception:
         pass
@@ -489,11 +464,6 @@ def import_dwg_to_scratch(document, view, path):
 
 
 def merge_two_dwgs(paths, save_path, original_options):
-    """Imports the two files in `paths` into a blank scratch document at
-    their original real-world coordinates, sorts their drawing order, 
-    exports the combined content as a single DWG named after `save_path`
-    using copied configuration settings, then closes the scratch document
-    without saving."""
     folder     = os.path.dirname(save_path)
     final_name = safe_filename(os.path.splitext(os.path.basename(save_path))[0])
 
@@ -507,7 +477,6 @@ def merge_two_dwgs(paths, save_path, original_options):
                              "floor plan view type / level to host the merge.")
             return None
 
-        # Sort paths to identify pattern DWG vs blocks DWG
         pat_path = None
         blk_path = None
         for path in paths:
@@ -517,7 +486,6 @@ def merge_two_dwgs(paths, save_path, original_options):
             else:
                 pat_path = path
 
-        # Fallback if identification name logic fails to separate them
         if (not pat_path or not blk_path) and len(paths) >= 2:
             pat_path = paths[0]
             blk_path = paths[1]
@@ -525,7 +493,7 @@ def merge_two_dwgs(paths, save_path, original_options):
         t = DB.Transaction(scratch_doc, "Merge DWGs - import")
         t.Start()
         try:
-            # 1. Copy DWG Export Settings from source project to scratch project.
+            # Copy DWG Export Settings from source project to scratch project
             try:
                 source_settings = DB.FilteredElementCollector(doc).OfClass(DB.ExportDWGSettings).ToElementIds()
                 if source_settings.Count > 0:
@@ -540,20 +508,18 @@ def merge_two_dwgs(paths, save_path, original_options):
             pat_id = None
             blk_id = None
 
-            # 2. Import Pattern (Floors, Topography etc.)
+            # 1. Import Pattern (Floors, Topography, etc.)
             if pat_path:
                 pat_id = import_dwg_to_scratch(scratch_doc, temp_view, pat_path)
 
-            # 3. Import Blocks (Walls, detail items, annotations, etc.)
+            # 2. Import Blocks (Walls, planting, details, annotations, etc.)
             if blk_path:
                 blk_id = import_dwg_to_scratch(scratch_doc, temp_view, blk_path)
 
-            # 4. Explicit Draw Order Manipulation
+            # 3. Correct Draw Order Alignment (Pattern bottom, Blocks top)
             if pat_id and blk_id:
                 try:
-                    # Push pattern drawing (Floors/Topography) to the back
                     DB.DetailElementOrderUtils.SendToBack(scratch_doc, temp_view, pat_id)
-                    # Pull blocks/linework drawing to the front
                     DB.DetailElementOrderUtils.BringToFront(scratch_doc, temp_view, blk_id)
                 except Exception:
                     pass
@@ -564,7 +530,6 @@ def merge_two_dwgs(paths, save_path, original_options):
             t.RollBack()
             raise
 
-        # 5. Build match-mapped export options for the scratch doc
         exp_options = None
         if EXPORT_SETUP_NAME:
             try:
@@ -576,11 +541,6 @@ def merge_two_dwgs(paths, save_path, original_options):
 
         if not exp_options:
             exp_options = DB.DWGExportOptions()
-            # Map configuration properties from our source run to avoid color conversion issues
-            try:
-                exp_options.Colors = original_options.Colors
-            except Exception:
-                exp_options.Colors = DB.ExportColorMode.TrueColorPerView
             try:
                 exp_options.FileVersion = original_options.FileVersion
             except Exception:
@@ -594,7 +554,9 @@ def merge_two_dwgs(paths, save_path, original_options):
             except Exception:
                 pass
 
-        exp_options.MergedViews = False  # Keep single view flat file representation
+        # Preserve exact RGB TrueColors on export
+        exp_options.Colors = DB.ExportColorMode.TrueColorPerView
+        exp_options.MergedViews = False
 
         ids = List[DB.ElementId]()
         ids.Add(temp_view.Id)
@@ -625,7 +587,6 @@ def merge_two_dwgs(paths, save_path, original_options):
         return None
 
     finally:
-        # Close without saving
         try:
             scratch_doc.Close(False)
         except Exception:
@@ -662,9 +623,6 @@ def main():
     options  = get_export_options(doc, EXPORT_SETUP_NAME)
     grey_ogs = build_grey_override()
 
-    # For each selected view: export it (producing a master file + an
-    # xref file), then immediately flatten that pair into one standalone
-    # DWG and delete the two originals, before moving to the next view.
     for source_view in selected_views:
         base_name = safe_filename(source_view.Name)
 
@@ -676,14 +634,12 @@ def main():
             with revit.Transaction(
                     "Create temp export views: " + source_view.Name):
 
-                # PATTERN VIEW - floors/roofs/stairs/toposolid pattern fill
+                # PATTERN VIEW - floors/roofs/stairs/toposolid
                 pat_view = duplicate_view(
                     source_view, source_view.Name + TEMP_PAT_SUFFIX)
                 detach_view_template(pat_view)
                 prepare_overlay_view(source_view, pat_view)
 
-                # Collect categories from the DETACHED temp view, not the
-                # (possibly template-locked) source view.
                 model_cats = collect_categories(
                     doc, pat_view, DB.CategoryType.Model)
                 anno_cats  = collect_categories(
@@ -698,8 +654,7 @@ def main():
                 hide_categories_by_ids(pat_view, block_ids, model_cats)
                 hide_categories(pat_view, anno_cats)
 
-                # BLOCKS VIEW - everything else, kept separate so it never
-                # visually cuts the pattern fill on export
+                # BLOCKS VIEW - everything else
                 blk_view = duplicate_view(
                     source_view, source_view.Name + TEMP_BLK_SUFFIX)
                 detach_view_template(blk_view)
@@ -710,20 +665,10 @@ def main():
                     pass
                 hide_categories_by_ids(blk_view, pattern_ids, model_cats)
 
-                # GREY OVERRIDE - Loops through all available categories in the 
-                # document to guarantee absolutely every visible element is greyed out.
+                # GREY OVERRIDE - Only active if APPLY_GREY_OVERRIDE is True
                 if APPLY_GREY_OVERRIDE:
-                    for cat in doc.Settings.Categories:
-                        try:
-                            if cat.get_AllowsVisibilityControl(pat_view):
-                                pat_view.SetCategoryOverrides(cat.Id, grey_ogs)
-                        except Exception:
-                            pass
-                        try:
-                            if cat.get_AllowsVisibilityControl(blk_view):
-                                blk_view.SetCategoryOverrides(cat.Id, grey_ogs)
-                        except Exception:
-                            pass
+                    apply_grey_override_to_all_categories_and_subcategories(pat_view, doc, grey_ogs)
+                    apply_grey_override_to_all_categories_and_subcategories(blk_view, doc, grey_ogs)
 
                 # SCAN & COPY SHAPE-EDITED ELEMENTS
                 for cat in pattern_cats:
@@ -797,7 +742,7 @@ def main():
 
                 temp_ids = [pat_view.Id, blk_view.Id] + flat_copies
 
-            # EXPORT - both temp views exported together with MergedViews True.
+            # EXPORT
             view_ids_to_export = [pat_view.Id, blk_view.Id]
             raw_paths, export_ok = export_views_raw(
                 doc, folder, base_name,
@@ -811,9 +756,7 @@ def main():
                         source_view.Name, export_ok, folder))
                 continue
 
-            # MERGE - flatten whatever files that export produced into one
-            # standalone DWG named after the view, then delete the
-            # originals. Runs in a throwaway scratch document.
+            # MERGE
             final_target = os.path.join(folder, base_name + ".dwg")
             merged_path = merge_two_dwgs(raw_paths, final_target, options)
 
