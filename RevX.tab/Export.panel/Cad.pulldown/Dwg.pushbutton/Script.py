@@ -1,15 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-DWG Export - Pattern + Blocks merged into single file
+Export & Merge DWG (one button)
+For each selected plan view: exports it as a merged-view DWG (Pattern +
+Blocks). Because Revit's multi-view merged export links the second view
+in as an external reference instead of inlining it, this step actually
+leaves TWO physical DWG files on disk for that one view (a master file
++ an xref file). This tool then automatically imports both of those
+files into a blank scratch document at their original real-world
+coordinates and re-exports them as a single standalone DWG with no
+external references, deleting the two originals afterward - so you end
+up with one flattened file per view, with no manual second step. Your
+live project is never touched by the merge step.
 Author: Jesto Joy
 """
 
 from pyrevit import revit, DB, forms, script
 from System.Collections.Generic import List
+import clr
 import os
 import traceback
 
 doc = revit.doc
+app = doc.Application
 output = script.get_output()
 
 # -----------------------------------------------------------------------------
@@ -34,9 +46,18 @@ except Exception:
 
 EXPORT_SETUP_NAME = None
 
-TEMP_PAT_SUFFIX   = "_TMP_PAT"
-TEMP_BLK_SUFFIX   = "_TMP_BLK"
-TEMP_SHEET_PREFIX  = "TMP_DWG_"
+TEMP_PAT_SUFFIX = "_TMP_PAT"
+TEMP_BLK_SUFFIX = "_TMP_BLK"
+
+GREY_RGB = (128, 128, 128)   # change this to lighten/darken the grey
+
+# Set to True to force all elements and categories to export as grey.
+APPLY_GREY_OVERRIDE = True
+
+# Marker written to every flat-copy element's Comments parameter, and used
+# to find/remove any of our temp views or copies left behind by a prior
+# run that didn't clean up properly (crash, cancel, older script version).
+COPY_MARKER = "RevX_DWG_TEMP_COPY"
 
 
 # -----------------------------------------------------------------------------
@@ -123,7 +144,57 @@ def extend_pat_view_range(pat_view, min_z_offset):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - FILE / EXPORT
+# HELPERS - GREY OVERRIDE
+# -----------------------------------------------------------------------------
+
+def build_grey_override():
+    grey = DB.Color(GREY_RGB[0], GREY_RGB[1], GREY_RGB[2])
+    ogs = DB.OverrideGraphicSettings()
+
+    try:
+        ogs.SetProjectionLineColor(grey)
+    except Exception:
+        pass
+    try:
+        ogs.SetCutLineColor(grey)
+    except Exception:
+        pass
+    try:
+        ogs.SetSurfaceForegroundPatternColor(grey)
+    except Exception:
+        pass
+    try:
+        ogs.SetCutForegroundPatternColor(grey)
+    except Exception:
+        pass
+
+    # Turn the BACKGROUND pattern off instead of coloring it. Many floor/
+    # material patterns have a solid background fill behind the hatch
+    # (normally invisible) - coloring it grey turns it into a solid grey
+    # block that buries the actual pattern lines. Disabling it leaves
+    # clean grey line work only.
+    try:
+        ogs.SetSurfaceBackgroundPatternVisible(False)
+    except Exception:
+        pass
+    try:
+        ogs.SetCutBackgroundPatternVisible(False)
+    except Exception:
+        pass
+
+    return ogs
+
+
+def apply_grey_to_categories(view, categories, ogs):
+    for cat in categories:
+        try:
+            view.SetCategoryOverrides(cat.Id, ogs)
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# HELPERS - FILE / EXPORT (shared by both the per-view export and the merge)
 # -----------------------------------------------------------------------------
 
 def safe_filename(name):
@@ -174,8 +245,16 @@ def get_export_options(document, setup_name=None):
     else:
         opts = DB.DWGExportOptions()
 
+    # MergedViews merges multiple views into one file via XRefs (Autodesk's
+    # own documented wording). Because these are direct VIEW exports (not a
+    # sheet), the geometry uses real project coordinates, so pattern and
+    # blocks land in the correct position automatically.
+    opts.MergedViews = True
+
+    # Use true/RGB color so the grey overrides come through as-drawn,
+    # rather than being remapped to the nearest AutoCAD index color.
     try:
-        opts.MergedViews = True
+        opts.Colors = DB.ExportColorMode.TrueColorPerView
     except Exception:
         pass
 
@@ -219,6 +298,17 @@ def duplicate_view(view, new_name):
             i += 1
             test_name = "{}_{}".format(new_name, i)
     return new_view
+
+
+def detach_view_template(view):
+    # If the source view has a View Template applied, category visibility
+    # can be locked by the template, so our SetCategoryHidden() calls
+    # silently fail to take effect (caught by the try/except and ignored).
+    # Detaching first guarantees our overrides actually apply.
+    try:
+        view.ViewTemplateId = DB.ElementId.InvalidElementId
+    except Exception:
+        pass
 
 
 def prepare_overlay_view(source_view, target_view):
@@ -280,89 +370,30 @@ def validate_pattern_categories(document, bic_list):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - SHEETS / VIEWPORTS
+# HELPERS - EXPORT (merged-view export, no sheet needed) - one call per
+# source view. With MergedViews=True and 2 view ids, Revit does NOT
+# inline the second view's geometry into the first file - it links it in
+# as an external reference, so this one call leaves TWO physical DWG
+# files in `folder` (a master + an xref, the xref typically named after
+# the second view). We return every file that appeared as a result of
+# this export call so the merge step can flatten all of them.
 # -----------------------------------------------------------------------------
 
-def get_titleblock_type_id(document):
-    tbs = (DB.FilteredElementCollector(document)
-           .OfCategory(DB.BuiltInCategory.OST_TitleBlocks)
-           .WhereElementIsElementType()
-           .ToElements())
-    if tbs:
-        return tbs[0].Id
-    return None
+def export_views_raw(document, folder, export_name, candidate_names, view_ids, options):
+    for name in [export_name] + list(candidate_names):
+        safe_delete(os.path.join(folder, safe_filename(name) + ".dwg"))
 
-
-def get_unique_sheet_number(document, prefix):
-    existing = set()
-    for s in DB.FilteredElementCollector(document).OfClass(DB.ViewSheet):
-        try:
-            existing.add(s.SheetNumber)
-        except Exception:
-            pass
-    i = 1
-    while True:
-        num = "{}{}".format(prefix, i)
-        if num not in existing:
-            return num
-        i += 1
-
-
-def create_temp_sheet(document, titleblock_type_id, name_hint):
-    sheet = DB.ViewSheet.Create(document, titleblock_type_id)
-    sheet.SheetNumber = get_unique_sheet_number(document, TEMP_SHEET_PREFIX)
-    try:
-        sheet.Name = "TMP {}".format(name_hint)
-    except Exception:
-        pass
-    return sheet
-
-
-def get_sheet_center(sheet):
-    o = sheet.Outline
-    u = (o.Min.U + o.Max.U) / 2.0
-    v = (o.Min.V + o.Max.V) / 2.0
-    return DB.XYZ(u, v, 0)
-
-
-def get_no_title_viewport_type_id(document):
-    vp_cat = get_category(document, DB.BuiltInCategory.OST_Viewports)
-    if not vp_cat:
-        return None
-    for et in DB.FilteredElementCollector(document).WhereElementIsElementType():
-        try:
-            if et.Category and et.Category.Id == vp_cat.Id:
-                n = et.Name or ""
-                if "No Title" in n or "No title" in n:
-                    return et.Id
-        except Exception:
-            pass
-    return None
-
-
-def export_sheet(document, folder, export_name, sheet_id, options):
-    before      = list_dwgs(folder)
-    target_path = os.path.join(folder, export_name + ".dwg")
-    safe_delete(target_path)
+    before = list_dwgs(folder)
 
     ids = List[DB.ElementId]()
-    ids.Add(sheet_id)
+    for vid in view_ids:
+        ids.Add(vid)
 
-    result = document.Export(folder, export_name, ids, options)
+    export_ok = document.Export(folder, export_name, ids, options)
 
-    if os.path.exists(target_path):
-        return result, target_path
-
-    new_dwg = get_newest_new_dwg(folder, before)
-    if new_dwg and os.path.exists(new_dwg):
-        try:
-            safe_delete(target_path)
-            os.rename(new_dwg, target_path)
-            return result, target_path
-        except Exception:
-            return result, new_dwg
-
-    return result, None
+    after      = list_dwgs(folder)
+    new_files  = sorted(after - before)
+    return [os.path.join(folder, f) for f in new_files], export_ok
 
 
 # -----------------------------------------------------------------------------
@@ -402,6 +433,206 @@ def verify_and_hide_originals(document, pat_view, copied_elements_map, flat_copi
 
 
 # -----------------------------------------------------------------------------
+# HELPERS - MERGE STEP (imports the two per-view DWGs into a blank scratch
+# document at their original coordinates, then re-exports as one file)
+# -----------------------------------------------------------------------------
+
+def get_scratch_plan_view_family_type(document):
+    for vft in DB.FilteredElementCollector(document).OfClass(DB.ViewFamilyType):
+        if vft.ViewFamily == DB.ViewFamily.FloorPlan:
+            return vft.Id
+    return None
+
+
+def get_scratch_level(document):
+    levels = DB.FilteredElementCollector(document).OfClass(DB.Level).ToElements()
+    if levels:
+        return levels[0]
+    return None
+
+
+def hide_all_categories_scratch(view, document):
+    for cat in document.Settings.Categories:
+        try:
+            if cat.get_AllowsVisibilityControl(view):
+                view.SetCategoryHidden(cat.Id, True)
+        except Exception:
+            pass
+
+
+def import_dwg_to_scratch(document, view, path):
+    options = DB.DWGImportOptions()
+    try:
+        # Origin-to-origin placement: puts the imported geometry back at
+        # the exact real-world coordinates it was exported from, so the
+        # two files land in the correct position relative to each other
+        # automatically - no manual nudging.
+        options.Placement = DB.ImportPlacement.Origin
+    except Exception:
+        pass
+    try:
+        # Changed to True: importing as a view-specific 2D element allows 
+        # Revit to control its visual overlay Draw Order (Send to Back / Bring to Front)
+        options.ThisViewOnly = True
+    except Exception:
+        pass
+    try:
+        # Keep exact RGB values on import instead of snapping to the
+        # nearest AutoCAD Color Index (ACI) palette entry.
+        options.ColorMode = DB.ImportColorMode.Preserved
+    except Exception:
+        pass
+
+    ref = clr.Reference[DB.ElementId]()
+    document.Import(path, options, view, ref)
+    return ref.Value
+
+
+def merge_two_dwgs(paths, save_path, original_options):
+    """Imports the two files in `paths` into a blank scratch document at
+    their original real-world coordinates, sorts their drawing order, 
+    exports the combined content as a single DWG named after `save_path`
+    using copied configuration settings, then closes the scratch document
+    without saving."""
+    folder     = os.path.dirname(save_path)
+    final_name = safe_filename(os.path.splitext(os.path.basename(save_path))[0])
+
+    scratch_doc = app.NewProjectDocument(DB.UnitSystem.Metric)
+
+    try:
+        vft_id = get_scratch_plan_view_family_type(scratch_doc)
+        level  = get_scratch_level(scratch_doc)
+        if not vft_id or not level:
+            output.print_md("**Merge stopped:** the blank scratch document has no "
+                             "floor plan view type / level to host the merge.")
+            return None
+
+        # Sort paths to identify pattern DWG vs blocks DWG
+        pat_path = None
+        blk_path = None
+        for path in paths:
+            filename = os.path.basename(path).lower()
+            if "blk" in filename or "temp_blk" in filename:
+                blk_path = path
+            else:
+                pat_path = path
+
+        # Fallback if identification name logic fails to separate them
+        if (not pat_path or not blk_path) and len(paths) >= 2:
+            pat_path = paths[0]
+            blk_path = paths[1]
+
+        t = DB.Transaction(scratch_doc, "Merge DWGs - import")
+        t.Start()
+        try:
+            # 1. Copy DWG Export Settings from source project to scratch project.
+            try:
+                source_settings = DB.FilteredElementCollector(doc).OfClass(DB.ExportDWGSettings).ToElementIds()
+                if source_settings.Count > 0:
+                    copy_opts = DB.CopyPasteOptions()
+                    DB.ElementTransformUtils.CopyElements(doc, source_settings, scratch_doc, DB.Transform.Identity, copy_opts)
+            except Exception:
+                pass
+
+            temp_view = DB.ViewPlan.Create(scratch_doc, vft_id, level.Id)
+            hide_all_categories_scratch(temp_view, scratch_doc)
+
+            pat_id = None
+            blk_id = None
+
+            # 2. Import Pattern (Floors, Topography etc.)
+            if pat_path:
+                pat_id = import_dwg_to_scratch(scratch_doc, temp_view, pat_path)
+
+            # 3. Import Blocks (Walls, detail items, annotations, etc.)
+            if blk_path:
+                blk_id = import_dwg_to_scratch(scratch_doc, temp_view, blk_path)
+
+            # 4. Explicit Draw Order Manipulation
+            if pat_id and blk_id:
+                try:
+                    # Push pattern drawing (Floors/Topography) to the back
+                    DB.DetailElementOrderUtils.SendToBack(scratch_doc, temp_view, pat_id)
+                    # Pull blocks/linework drawing to the front
+                    DB.DetailElementOrderUtils.BringToFront(scratch_doc, temp_view, blk_id)
+                except Exception:
+                    pass
+
+            scratch_doc.Regenerate()
+            t.Commit()
+        except Exception:
+            t.RollBack()
+            raise
+
+        # 5. Build match-mapped export options for the scratch doc
+        exp_options = None
+        if EXPORT_SETUP_NAME:
+            try:
+                names = [s.Name for s in DB.FilteredElementCollector(scratch_doc).OfClass(DB.ExportDWGSettings)]
+                if EXPORT_SETUP_NAME in names:
+                    exp_options = DB.DWGExportOptions.GetPredefinedOptions(scratch_doc, EXPORT_SETUP_NAME)
+            except Exception:
+                pass
+
+        if not exp_options:
+            exp_options = DB.DWGExportOptions()
+            # Map configuration properties from our source run to avoid color conversion issues
+            try:
+                exp_options.Colors = original_options.Colors
+            except Exception:
+                exp_options.Colors = DB.ExportColorMode.TrueColorPerView
+            try:
+                exp_options.FileVersion = original_options.FileVersion
+            except Exception:
+                pass
+            try:
+                exp_options.LineScaling = original_options.LineScaling
+            except Exception:
+                pass
+            try:
+                exp_options.TargetUnit = original_options.TargetUnit
+            except Exception:
+                pass
+
+        exp_options.MergedViews = False  # Keep single view flat file representation
+
+        ids = List[DB.ElementId]()
+        ids.Add(temp_view.Id)
+
+        before      = list_dwgs(folder)
+        target_path = os.path.join(folder, final_name + ".dwg")
+        safe_delete(target_path)
+
+        scratch_doc.Export(folder, final_name, ids, exp_options)
+
+        if os.path.exists(target_path):
+            return target_path
+
+        new_dwg = get_newest_new_dwg(folder, before)
+        if new_dwg and os.path.exists(new_dwg):
+            try:
+                safe_delete(target_path)
+                os.rename(new_dwg, target_path)
+                return target_path
+            except Exception:
+                return new_dwg
+
+        return None
+
+    except Exception:
+        output.print_md("**Merge FAILED** —")
+        output.print_code(traceback.format_exc())
+        return None
+
+    finally:
+        # Close without saving
+        try:
+            scratch_doc.Close(False)
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 
@@ -413,14 +644,6 @@ def main():
                          "(Floors/Roofs/Stairs/Toposolid/Topography) "
                          "resolved to a valid Category in this document/version.")
         return
-
-    titleblock_type_id = get_titleblock_type_id(doc)
-    if not titleblock_type_id:
-        # No title block loaded — that's fine, it's never shown in the
-        # exported DWG anyway (the title block category gets hidden on the
-        # temp sheet regardless). ViewSheet.Create explicitly supports
-        # InvalidElementId to create a sheet with no title block at all.
-        titleblock_type_id = DB.ElementId.InvalidElementId
 
     selected_views = forms.select_views(
         title="Select plan views to export as DWG",
@@ -436,9 +659,12 @@ def main():
         output.print_md("**Stopped:** no export folder was chosen.")
         return
 
-    options             = get_export_options(doc, EXPORT_SETUP_NAME)
-    no_title_vp_type_id = get_no_title_viewport_type_id(doc)
+    options  = get_export_options(doc, EXPORT_SETUP_NAME)
+    grey_ogs = build_grey_override()
 
+    # For each selected view: export it (producing a master file + an
+    # xref file), then immediately flatten that pair into one standalone
+    # DWG and delete the two originals, before moving to the next view.
     for source_view in selected_views:
         base_name = safe_filename(source_view.Name)
 
@@ -447,36 +673,57 @@ def main():
         temp_ids            = []
 
         try:
-            model_cats = collect_categories(
-                doc, source_view, DB.CategoryType.Model)
-            anno_cats  = collect_categories(
-                doc, source_view, DB.CategoryType.Annotation)
-
-            block_ids = set()
-            for cat in model_cats:
-                cid = eid_val(cat.Id)
-                if cid not in pattern_ids:
-                    block_ids.add(cid)
-
             with revit.Transaction(
-                    "Create temp export objects: " + source_view.Name):
+                    "Create temp export views: " + source_view.Name):
 
-                # PATTERN VIEW
+                # PATTERN VIEW - floors/roofs/stairs/toposolid pattern fill
                 pat_view = duplicate_view(
                     source_view, source_view.Name + TEMP_PAT_SUFFIX)
+                detach_view_template(pat_view)
                 prepare_overlay_view(source_view, pat_view)
+
+                # Collect categories from the DETACHED temp view, not the
+                # (possibly template-locked) source view.
+                model_cats = collect_categories(
+                    doc, pat_view, DB.CategoryType.Model)
+                anno_cats  = collect_categories(
+                    doc, pat_view, DB.CategoryType.Annotation)
+
+                block_ids = set()
+                for cat in model_cats:
+                    cid = eid_val(cat.Id)
+                    if cid not in pattern_ids:
+                        block_ids.add(cid)
+
                 hide_categories_by_ids(pat_view, block_ids, model_cats)
                 hide_categories(pat_view, anno_cats)
 
-                # BLOCKS VIEW
+                # BLOCKS VIEW - everything else, kept separate so it never
+                # visually cuts the pattern fill on export
                 blk_view = duplicate_view(
                     source_view, source_view.Name + TEMP_BLK_SUFFIX)
+                detach_view_template(blk_view)
                 prepare_overlay_view(source_view, blk_view)
                 try:
                     blk_view.DetailLevel = DB.ViewDetailLevel.Fine
                 except Exception:
                     pass
                 hide_categories_by_ids(blk_view, pattern_ids, model_cats)
+
+                # GREY OVERRIDE - Loops through all available categories in the 
+                # document to guarantee absolutely every visible element is greyed out.
+                if APPLY_GREY_OVERRIDE:
+                    for cat in doc.Settings.Categories:
+                        try:
+                            if cat.get_AllowsVisibilityControl(pat_view):
+                                pat_view.SetCategoryOverrides(cat.Id, grey_ogs)
+                        except Exception:
+                            pass
+                        try:
+                            if cat.get_AllowsVisibilityControl(blk_view):
+                                blk_view.SetCategoryOverrides(cat.Id, grey_ogs)
+                        except Exception:
+                            pass
 
                 # SCAN & COPY SHAPE-EDITED ELEMENTS
                 for cat in pattern_cats:
@@ -546,61 +793,45 @@ def main():
                         except Exception:
                             pass
 
-                # TEMP SHEET
-                sheet = create_temp_sheet(
-                    doc, titleblock_type_id, base_name)
-
-                try:
-                    tb_cat = get_category(
-                        doc, DB.BuiltInCategory.OST_TitleBlocks)
-                    if tb_cat:
-                        sheet.SetCategoryHidden(tb_cat.Id, True)
-                except Exception:
-                    pass
-
-                center = get_sheet_center(sheet)
-
-                if not DB.Viewport.CanAddViewToSheet(
-                        doc, sheet.Id, pat_view.Id):
-                    raise Exception(
-                        "Pattern view cannot be added to temp sheet.")
-                if not DB.Viewport.CanAddViewToSheet(
-                        doc, sheet.Id, blk_view.Id):
-                    raise Exception(
-                        "Blocks view cannot be added to temp sheet.")
-
-                vp1 = DB.Viewport.Create(
-                    doc, sheet.Id, pat_view.Id, center)
-                vp2 = DB.Viewport.Create(
-                    doc, sheet.Id, blk_view.Id, center)
-
-                if no_title_vp_type_id:
-                    try:
-                        vp1.ChangeTypeId(no_title_vp_type_id)
-                    except Exception:
-                        pass
-                    try:
-                        vp2.ChangeTypeId(no_title_vp_type_id)
-                    except Exception:
-                        pass
-
                 doc.Regenerate()
 
-                try:
-                    vp2.SetBoxCenter(vp1.GetBoxCenter())
-                except Exception:
-                    pass
+                temp_ids = [pat_view.Id, blk_view.Id] + flat_copies
 
-                temp_ids = [sheet.Id, pat_view.Id, blk_view.Id] + flat_copies
+            # EXPORT - both temp views exported together with MergedViews True.
+            view_ids_to_export = [pat_view.Id, blk_view.Id]
+            raw_paths, export_ok = export_views_raw(
+                doc, folder, base_name,
+                [pat_view.Name, blk_view.Name],
+                view_ids_to_export, options)
 
-            # EXPORT
-            result, exported_path = export_sheet(doc, folder, base_name, sheet.Id, options)
-            if exported_path:
-                output.print_md("**{}**: exported to `{}`".format(source_view.Name, exported_path))
+            if not raw_paths:
+                output.print_md(
+                    "**{}**: Export() returned {} but no DWG file was found "
+                    "in `{}` afterward.".format(
+                        source_view.Name, export_ok, folder))
+                continue
+
+            # MERGE - flatten whatever files that export produced into one
+            # standalone DWG named after the view, then delete the
+            # originals. Runs in a throwaway scratch document.
+            final_target = os.path.join(folder, base_name + ".dwg")
+            merged_path = merge_two_dwgs(raw_paths, final_target, options)
+
+            if merged_path:
+                output.print_md("**{}**: merged file exported to `{}`".format(
+                    source_view.Name, merged_path))
+                for p in raw_paths:
+                    try:
+                        if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(merged_path):
+                            os.remove(p)
+                    except Exception:
+                        output.print_md("Could not delete intermediate file: `{}`".format(p))
             else:
-                output.print_md("**{}**: export ran but no DWG file was found afterward "
-                                 "(Export() may have failed silently, or MergedViews/sheet "
-                                 "content produced nothing).".format(source_view.Name))
+                output.print_md(
+                    "**{}**: merge FAILED - the original exported file(s) "
+                    "are still on disk, nothing was deleted:".format(source_view.Name))
+                for p in raw_paths:
+                    output.print_md("- `{}`".format(p))
 
         except Exception:
             output.print_md("**{}**: FAILED —".format(source_view.Name))
