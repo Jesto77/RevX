@@ -392,16 +392,74 @@
                         <!-- Target Selection -->
                         <Border Style="{StaticResource Card}">
                             <StackPanel>
-                                <TextBlock Text="TARGET TOPOSOLID / TOPOGRAPHY" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="1 · TARGET TOPOSOLID / TOPOGRAPHY" Style="{StaticResource SectionHeader}"/>
                                 <Button x:Name="BtnPickTarget" Content="Pick Toposolid / Topography..." Style="{StaticResource PrimaryBtn}" HorizontalAlignment="Left"/>
                                 <TextBlock x:Name="TxtPickedTarget" Text="No element selected" FontSize="11" Margin="0,6,0,0" Foreground="{StaticResource TextMuted}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Profile Shape & 2D Preview (mirrors Create Mound tab) -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="2 · PROFILE SHAPE &amp; 2D PREVIEW DIAGRAM" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="Rebuilds the target's ENTIRE shape from its real footprint (adds a fresh grid of points), sculpted to the profile below and scaled to the peak height set under Top Height &amp; Elevation Sculpting." Style="{StaticResource FieldLabel}" TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                                <TextBlock Text="Mound Shape Profile" Style="{StaticResource FieldLabel}"/>
+                                <ComboBox x:Name="CmbProfileTypeMod" SelectedIndex="0" Margin="0,0,0,6">
+                                    <ComboBoxItem Content="Dome / Smooth Gaussian Hill"/>
+                                    <ComboBoxItem Content="Mesa / Flat-Top Plateau"/>
+                                    <ComboBoxItem Content="Cone / Sharp Peak Hill"/>
+                                    <ComboBoxItem Content="Ridge / Elongated Crest"/>
+                                </ComboBox>
+
+                                <!-- Presets -->
+                                <TextBlock Text="Quick Presets" Style="{StaticResource FieldLabel}"/>
+                                <UniformGrid Columns="4" Margin="0,2,0,6">
+                                    <Button x:Name="BtnPresetGentleMod" Content="Gentle Knoll" Style="{StaticResource MiniBtn}" Margin="0,0,3,0"/>
+                                    <Button x:Name="BtnPresetSteepMod" Content="Steep Dome" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnPresetMesaMod" Content="Flat Mesa" Style="{StaticResource MiniBtn}" Margin="2,0,2,0"/>
+                                    <Button x:Name="BtnPresetPeakMod" Content="Sharp Peak" Style="{StaticResource MiniBtn}" Margin="3,0,0,0"/>
+                                </UniformGrid>
+
+                                <TextBlock Text="Profile Smoothness / Curvature" Style="{StaticResource FieldLabel}"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="46"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SldSmoothnessMod" Grid.Column="0" Minimum="0" Maximum="100" Value="60"/>
+                                    <TextBlock x:Name="TxtSmoothValMod" Grid.Column="1" Text="60" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                </Grid>
+
+                                <!-- Mesa Top Ratio Slider -->
+                                <StackPanel x:Name="PanelPlateauRatioMod" Visibility="Collapsed" Margin="0,6,0,0">
+                                    <TextBlock Text="Flat Top Width (% of footprint)" Style="{StaticResource FieldLabel}"/>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="46"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Slider x:Name="SldPlateauRatioMod" Grid.Column="0" Minimum="10" Maximum="80" Value="40"/>
+                                        <TextBlock x:Name="TxtPlateauRatioValMod" Grid.Column="1" Text="40%" VerticalAlignment="Center" HorizontalAlignment="Right" FontFamily="Consolas"/>
+                                    </Grid>
+                                </StackPanel>
+
+                                <!-- 2D Cross-Section Preview Canvas -->
+                                <Border Background="#F7FAF8" BorderBrush="{StaticResource BorderCol}" BorderThickness="1" CornerRadius="4" Padding="4" Margin="0,6,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="Cross-Section Profile Curve Preview" FontSize="10" Foreground="{StaticResource TextMuted}" HorizontalAlignment="Center" Margin="0,0,0,2"/>
+                                        <Canvas x:Name="CnvProfilePreviewMod" Height="50" Width="420" HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <Button x:Name="BtnApplyProfileShape" Content="Apply Profile Shape to Target" Style="{StaticResource GhostBtn}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
                             </StackPanel>
                         </Border>
 
                         <!-- Peak Elevation / Height Sculpting -->
                         <Border Style="{StaticResource Card}">
                             <StackPanel>
-                                <TextBlock Text="TOP HEIGHT &amp; ELEVATION SCULPTING" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="3 · TOP HEIGHT &amp; ELEVATION SCULPTING" Style="{StaticResource SectionHeader}"/>
                                 <TextBlock Text="Quick Boost / Lower Peak Height (mm)" Style="{StaticResource FieldLabel}"/>
                                 <UniformGrid Columns="4" Margin="0,0,0,8">
                                     <Button x:Name="BtnModPeakMinus1000" Content="-1000" Style="{StaticResource MiniBtn}" Margin="0,0,3,0"/>
@@ -445,7 +503,7 @@
                         <!-- Smoothness Controls -->
                         <Border Style="{StaticResource Card}">
                             <StackPanel>
-                                <TextBlock Text="SURFACE SMOOTHING &amp; EDGE ANCHOR" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="4 · SURFACE SMOOTHING &amp; EDGE ANCHOR" Style="{StaticResource SectionHeader}"/>
                                 <TextBlock Text="Softens bumps and hard edges by averaging point elevations with nearby points." Style="{StaticResource FieldLabel}" TextWrapping="Wrap" Margin="0,0,0,6"/>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
@@ -472,7 +530,7 @@
                         <!-- Slope Controls -->
                         <Border Style="{StaticResource Card}">
                             <StackPanel>
-                                <TextBlock Text="SLOPE &amp; GRADIENT ALIGNMENT" Style="{StaticResource SectionHeader}"/>
+                                <TextBlock Text="5 · SLOPE &amp; GRADIENT ALIGNMENT" Style="{StaticResource SectionHeader}"/>
                                 <TextBlock Text="Pick a 2-point direction vector, then tilt the surface to a target gradient along that direction." Style="{StaticResource FieldLabel}" TextWrapping="Wrap" Margin="0,0,0,6"/>
                                 <Button x:Name="BtnPickSlopeDir" Content="Pick Slope Direction (2 Points)..." Style="{StaticResource GhostBtn}" HorizontalAlignment="Left"/>
                                 <TextBlock x:Name="TxtSlopeDir" Text="No direction picked" FontSize="11" Margin="0,6,0,8" Foreground="{StaticResource TextMuted}"/>

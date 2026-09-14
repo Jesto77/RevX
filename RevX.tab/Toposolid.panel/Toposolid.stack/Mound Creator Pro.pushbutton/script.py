@@ -119,6 +119,9 @@ class MoundEditorWindow(forms.WPFWindow):
         self._handler_peak = MoundApiHandler(self.do_peak_api, "Peak", log_fn=self._log)
         self._event_peak = ExternalEvent.Create(self._handler_peak)
 
+        self._handler_reshape = MoundApiHandler(self.do_reshape_profile_api, "ReshapeProfile", log_fn=self._log)
+        self._event_reshape = ExternalEvent.Create(self._handler_reshape)
+
         doc, uidoc = self.get_doc_and_uidoc()
         version = self._get_version(doc)
         has_toposolid = self._has_toposolid()
@@ -129,10 +132,13 @@ class MoundEditorWindow(forms.WPFWindow):
         self._load_levels_and_types()
         self._wire_events()
 
-        self.Loaded += lambda s, e: self.update_2d_preview()
+        self.Loaded += lambda s, e: (self.update_2d_preview(), self.update_2d_preview_modify())
         if hasattr(self, 'CnvProfilePreview') and self.CnvProfilePreview is not None:
             self.CnvProfilePreview.Loaded += lambda s, e: self.update_2d_preview()
             self.CnvProfilePreview.SizeChanged += lambda s, e: self.update_2d_preview()
+        if hasattr(self, 'CnvProfilePreviewMod') and self.CnvProfilePreviewMod is not None:
+            self.CnvProfilePreviewMod.Loaded += lambda s, e: self.update_2d_preview_modify()
+            self.CnvProfilePreviewMod.SizeChanged += lambda s, e: self.update_2d_preview_modify()
 
     # ---------------- DOCUMENT & API ACCESS HELPERS ----------------
 
@@ -706,6 +712,72 @@ class MoundEditorWindow(forms.WPFWindow):
                 return
         raise Exception("Unsupported element type for point editing.")
 
+    def _rebuild_shape_points(self, el, grid_pts):
+        """Wipes whatever shape-edit points the target currently has and
+        lays down a brand new set — boundary + interior grid, exactly what
+        Create Mound would produce on a fresh element. Used by Apply
+        Profile Shape, which needs a full rebuild rather than an edit of
+        whatever sparse points happen to already exist (a flat/round
+        surface may have as few as 0-2 real shape-edit vertices, which
+        isn't enough to reshape point-by-point).
+
+        Returns the number of points actually accepted by the editor, and
+        raises if that number is 0 — silently swallowing every AddPoint
+        failure previously let this report "applied" while changing
+        nothing at all."""
+        from System.Collections.Generic import List
+        from Autodesk.Revit.DB import XYZ
+        topo_cls = self._get_topography_class()
+        if topo_cls is not None and isinstance(el, topo_cls):
+            old_pts = list(el.GetPoints())
+            if old_pts:
+                el.DeletePoints(List[XYZ](old_pts))
+            el.AddPoints(List[XYZ](grid_pts))
+            return len(grid_pts)
+        if self._has_toposolid():
+            from Autodesk.Revit.DB import Toposolid
+            if isinstance(el, Toposolid):
+                doc, uidoc = self.get_doc_and_uidoc()
+                editor = el.GetSlabShapeEditor()
+                self._ensure_shape_editor_enabled(editor)
+                reset_ok = False
+                try:
+                    editor.ResetSlabShape()
+                    doc.Regenerate()
+                    reset_ok = True
+                except Exception as ex:
+                    self._log("Reset shape before rebuild failed ({}) — old and new points may mix.".format(ex))
+
+                # CRITICAL: ResetSlabShape() disables shape editing again
+                # (same quirk _ensure_shape_editor_enabled documents for a
+                # never-edited surface) — without re-enabling here, every
+                # AddPoint below throws and the old bare "except: pass"
+                # swallowed all of them, so the transaction still committed
+                # and the log still claimed success while nothing changed.
+                editor = el.GetSlabShapeEditor()
+                self._ensure_shape_editor_enabled(editor)
+
+                added, failed, last_err = 0, 0, None
+                for pt in grid_pts:
+                    try:
+                        editor.AddPoint(pt)
+                        added += 1
+                    except Exception as ex:
+                        failed += 1
+                        last_err = ex
+                doc.Regenerate()
+
+                if added == 0:
+                    raise Exception(
+                        "0 of {} points were accepted by the shape editor "
+                        "(reset {}; last error: {}).".format(
+                            len(grid_pts), "ok" if reset_ok else "failed", last_err))
+                if failed:
+                    self._log("Note: {} of {} points were rejected by the shape editor.".format(
+                        failed, len(grid_pts)))
+                return added
+        raise Exception("Unsupported element type for shape rebuild.")
+
     def _densify_if_flat(self, el, min_points=20, grid_spacing=None):
         """Smooth / Slope / Peak all need real interior points to work
         with. A freshly-created or Reset-Shape'd Toposolid typically only
@@ -869,6 +941,22 @@ class MoundEditorWindow(forms.WPFWindow):
 
         # Modify Tab
         self.BtnPickTarget.Click += self.on_pick_target
+
+        self.CmbProfileTypeMod.SelectionChanged += lambda s, e: (
+            self.on_profile_type_changed_mod(s, e), self.update_2d_preview_modify())
+        self.SldSmoothnessMod.ValueChanged += lambda s, e: (
+            self._sync_label(self.TxtSmoothValMod, self.SldSmoothnessMod, "{:.0f}"),
+            self.update_2d_preview_modify())
+        self.SldPlateauRatioMod.ValueChanged += lambda s, e: (
+            self._sync_label(self.TxtPlateauRatioValMod, self.SldPlateauRatioMod, "{:.0f}%"),
+            self.update_2d_preview_modify())
+        self.BtnApplyProfileShape.Click += self.on_apply_profile_shape
+
+        self.BtnPresetGentleMod.Click += lambda s, e: self._apply_preset_mod(30, 1200, 0)
+        self.BtnPresetSteepMod.Click += lambda s, e: self._apply_preset_mod(75, 2200, 0)
+        self.BtnPresetMesaMod.Click += lambda s, e: self._apply_preset_mod(50, 1800, 1)
+        self.BtnPresetPeakMod.Click += lambda s, e: self._apply_preset_mod(90, 2500, 2)
+
         self.BtnModPeakMinus1000.Click += lambda s, e: self._adjust_mod_peak(-1000)
         self.BtnModPeakMinus250.Click += lambda s, e: self._adjust_mod_peak(-250)
         self.BtnModPeakPlus250.Click += lambda s, e: self._adjust_mod_peak(250)
@@ -905,19 +993,18 @@ class MoundEditorWindow(forms.WPFWindow):
 
     # ---------------- 2D PROFILE CANVAS DRAWING ----------------
 
-    def update_2d_preview(self):
+    def _draw_profile_preview(self, canvas, profile_type, smoothness, plateau_ratio):
+        """Draws the cross-section curve for the given profile settings onto
+        the given Canvas. Shared by the Create Mound and Modify Existing
+        tabs so both preview canvases stay in sync with their own controls."""
         try:
-            if not hasattr(self, 'CnvProfilePreview') or self.CnvProfilePreview is None:
+            if canvas is None:
                 return
-            self.CnvProfilePreview.Children.Clear()
-            w = self.CnvProfilePreview.ActualWidth if self.CnvProfilePreview.ActualWidth > 20 else 420.0
-            h = self.CnvProfilePreview.ActualHeight if self.CnvProfilePreview.ActualHeight > 10 else 50.0
+            canvas.Children.Clear()
+            w = canvas.ActualWidth if canvas.ActualWidth > 20 else 420.0
+            h = canvas.ActualHeight if canvas.ActualHeight > 10 else 50.0
             margin_y = 6.0
             usable_h = h - margin_y * 2
-
-            profile_type = self.CmbProfileType.SelectedIndex
-            smoothness = self.SldSmoothness.Value
-            plateau_ratio = self.SldPlateauRatio.Value
 
             from System.Windows.Shapes import Polyline, Line as WpfLine
             from System.Windows.Media import SolidColorBrush, Color
@@ -926,7 +1013,7 @@ class MoundEditorWindow(forms.WPFWindow):
             base_line.X2 = w - 10; base_line.Y2 = h - margin_y
             base_line.Stroke = SolidColorBrush(Color.FromRgb(200, 210, 205))
             base_line.StrokeThickness = 1
-            self.CnvProfilePreview.Children.Add(base_line)
+            canvas.Children.Add(base_line)
 
             polyline = Polyline()
             polyline.Stroke = SolidColorBrush(Color.FromRgb(30, 130, 76))
@@ -944,9 +1031,32 @@ class MoundEditorWindow(forms.WPFWindow):
                 py = (h - margin_y) - rel_h * usable_h
                 polyline.Points.Add(Point(px, py))
 
-            self.CnvProfilePreview.Children.Add(polyline)
+            canvas.Children.Add(polyline)
         except Exception:
             pass
+
+    def update_2d_preview(self):
+        if not hasattr(self, 'CnvProfilePreview') or self.CnvProfilePreview is None:
+            return
+        self._draw_profile_preview(
+            self.CnvProfilePreview,
+            self.CmbProfileType.SelectedIndex,
+            self.SldSmoothness.Value,
+            self.SldPlateauRatio.Value,
+        )
+
+    def update_2d_preview_modify(self):
+        """Modify Existing tab's own preview canvas, driven by its own
+        Profile Shape controls (CmbProfileTypeMod / SldSmoothnessMod /
+        SldPlateauRatioMod) rather than the Create Mound tab's."""
+        if not hasattr(self, 'CnvProfilePreviewMod') or self.CnvProfilePreviewMod is None:
+            return
+        self._draw_profile_preview(
+            self.CnvProfilePreviewMod,
+            self.CmbProfileTypeMod.SelectedIndex,
+            self.SldSmoothnessMod.Value,
+            self.SldPlateauRatioMod.Value,
+        )
 
     # ---------------- UI EVENT HELPERS ----------------
 
@@ -963,12 +1073,27 @@ class MoundEditorWindow(forms.WPFWindow):
         profile = self.CmbProfileType.SelectedIndex
         self.PanelPlateauRatio.Visibility = Visibility.Visible if profile == 1 else Visibility.Collapsed
 
+    def on_profile_type_changed_mod(self, sender, args):
+        from System.Windows import Visibility
+        profile = self.CmbProfileTypeMod.SelectedIndex
+        self.PanelPlateauRatioMod.Visibility = Visibility.Visible if profile == 1 else Visibility.Collapsed
+
     def _apply_preset(self, smoothness, density_x10, height_mm, profile_idx):
         self.SldSmoothness.Value = smoothness
         self.TxtPeakHeight.Text = str(height_mm)
         self.CmbProfileType.SelectedIndex = profile_idx
         self.update_2d_preview()
         self._log("Applied preset profile.")
+
+    def _apply_preset_mod(self, smoothness, height_mm, profile_idx):
+        """Modify tab's own Quick Presets row — same idea as _apply_preset,
+        but drives the Mod controls (and TxtPeakTarget instead of
+        TxtPeakHeight, since that's the height field this tab uses)."""
+        self.SldSmoothnessMod.Value = smoothness
+        self.TxtPeakTarget.Text = str(height_mm)
+        self.CmbProfileTypeMod.SelectedIndex = profile_idx
+        self.update_2d_preview_modify()
+        self._log("Applied preset profile (Modify tab).")
 
     def _adjust_peak_height(self, delta_mm):
         try:
@@ -1203,6 +1328,9 @@ class MoundEditorWindow(forms.WPFWindow):
 
     def on_apply_peak(self, sender, args):
         self._event_peak.Raise()
+
+    def on_apply_profile_shape(self, sender, args):
+        self._event_reshape.Raise()
 
     def on_window_closed(self, sender, args):
         self._event_clear_preview.Raise()
@@ -1480,27 +1608,141 @@ class MoundEditorWindow(forms.WPFWindow):
         if el is None: return
         try:
             target_peak_ft = self._mm_to_ft(float(self.TxtPeakTarget.Text.strip()))
+            original_boundary = self._get_points(el)  # true sketch/profile corners, before densify
             pts = self._densify_if_flat(el)
             min_z = min(p.Z for p in pts)
             max_z = max(p.Z for p in pts)
             current_peak = max_z - min_z
-            if current_peak < 1e-6:
-                self._log("Surface is flat - nothing to scale.")
-                return
-            scale = target_peak_ft / current_peak
+
             from Autodesk.Revit.DB import XYZ, Transaction
-            new_pts = [XYZ(p.X, p.Y, min_z + (p.Z - min_z) * scale) for p in pts]
+
+            if current_peak < 1e-6:
+                # Nothing to rescale — every point starts at the same Z, so
+                # "min_z + (p.Z - min_z) * scale" is 0 for every point no
+                # matter what scale is. Sculpt a fresh dome up to the
+                # target height instead, using the same profile math
+                # Create Mound uses.
+                boundary_xy = [(p.X, p.Y) for p in original_boundary]
+                self._log("Diag: boundary pts={}  densified pts={}".format(
+                    len(boundary_xy), len(pts)))
+                if len(boundary_xy) < 3:
+                    self._log("Not enough boundary points to build a peak on this surface.")
+                    return
+                base_z = min_z
+                dists = [self._nearest_boundary_distance(p.X, p.Y, boundary_xy) for p in pts]
+                max_interior = max(dists) if dists else 0.0
+                self._log("Diag: max_interior={:.4f} ft".format(max_interior))
+                if max_interior <= 0:
+                    self._log("Not enough boundary points to build a peak on this surface.")
+                    return
+                new_pts = []
+                for p, d in zip(pts, dists):
+                    h = self._calculate_profile_height(
+                        d, max_interior, target_peak_ft,
+                        0, 50, 0,  # Dome profile, mid smoothness, no plateau
+                        p.X, p.Y, original_boundary
+                    )
+                    new_pts.append(XYZ(p.X, p.Y, base_z + h))
+                self._log("Flat surface — building a new peak up to {} mm.".format(
+                    self.TxtPeakTarget.Text.strip()))
+            else:
+                scale = target_peak_ft / current_peak
+                new_pts = [XYZ(p.X, p.Y, min_z + (p.Z - min_z) * scale) for p in pts]
+
             t = Transaction(doc, "Set Peak Elevation")
             t.Start()
             try:
                 self._set_points(el, new_pts, pts)
                 t.Commit()
-                self._log("Peak elevation scaled to {} mm above base.".format(self.TxtPeakTarget.Text.strip()))
+                self._log("Peak elevation set to {} mm above base.".format(self.TxtPeakTarget.Text.strip()))
             except Exception as ex:
                 t.RollBack()
                 self._log_error("Set peak failed", ex)
         except Exception as ex:
             self._log_error("Set peak failed", ex)
+
+    def do_reshape_profile_api(self, uiapp):
+        """Modify Existing tab's 'Apply Profile Shape' button. Unlike Smooth
+        / Slope / Offset / Peak, which nudge whatever shape-edit points the
+        target already has, this reads the target's REAL footprint from its
+        solid geometry (so it works even on a flat disc with only a couple
+        of sparse shape-edit vertices), builds a full boundary+interior grid
+        with the chosen profile — the same point-generation Create Mound
+        uses — and rebuilds the target's shape from scratch with it."""
+        import math
+        doc, uidoc = self.get_doc_and_uidoc(uiapp)
+        el = self._require_target()
+        if el is None: return
+        try:
+            target_height_ft = self._mm_to_ft(float(self.TxtPeakTarget.Text.strip()))
+
+            raw_curves = self._get_element_footprint_curves(el)
+            if not raw_curves:
+                self._log("Could not read this target's boundary geometry.")
+                return
+
+            curves = []
+            for crv in raw_curves:
+                curves.extend(self._ensure_bound_curve_segments(crv))
+            if not curves:
+                self._log("Could not process this target's boundary curves.")
+                return
+
+            boundary_pts = []
+            for c in curves:
+                if not c.IsBound: continue
+                try:
+                    for i in range(31):
+                        boundary_pts.append(c.Evaluate(i / 30.0, True))
+                except Exception:
+                    boundary_pts.extend(c.Tessellate())
+            if len(boundary_pts) < 3:
+                self._log("Not enough boundary points to reshape this surface.")
+                return
+
+            # Start from wherever this mound already sits rather than
+            # whatever Z the footprint curves themselves evaluated to.
+            try:
+                existing_pts = self._get_points(el)
+                base_z = min(p.Z for p in existing_pts) if existing_pts else min(p.Z for p in boundary_pts)
+            except Exception:
+                base_z = min(p.Z for p in boundary_pts)
+
+            profile_type = self.CmbProfileTypeMod.SelectedIndex
+            smoothness = self.SldSmoothnessMod.Value
+            plateau_ratio = self.SldPlateauRatioMod.Value
+
+            # Auto grid spacing scaled to the footprint size, since this tab
+            # has no density slider of its own.
+            min_x = min(p.X for p in boundary_pts); max_x = max(p.X for p in boundary_pts)
+            min_y = min(p.Y for p in boundary_pts); max_y = max(p.Y for p in boundary_pts)
+            diag = math.hypot(max_x - min_x, max_y - min_y)
+            grid_spacing = max(0.5, min(diag / 20.0, 5.0)) if diag > 0 else 1.5
+
+            grid_pts = self._create_mound_points(
+                boundary_pts, base_z, target_height_ft, grid_spacing,
+                profile_type, smoothness, plateau_ratio, lock_base=True
+            )
+            if len(grid_pts) < 3:
+                self._log("Boundary footprint too small to reshape at this density.")
+                return
+
+            from Autodesk.Revit.DB import Transaction
+            profile_names = ["Dome", "Mesa", "Cone", "Ridge"]
+            profile_label = profile_names[profile_type] if 0 <= profile_type < len(profile_names) else "Profile"
+
+            t = Transaction(doc, "Apply Profile Shape")
+            t.Start()
+            try:
+                added_count = self._rebuild_shape_points(el, grid_pts)
+                t.Commit()
+                self._log("Profile shape applied ({}, {} mm peak, {} points).".format(
+                    profile_label, self.TxtPeakTarget.Text.strip(), added_count))
+            except Exception as ex:
+                t.RollBack()
+                self._log_error("Apply profile shape failed", ex)
+        except Exception as ex:
+            self._log_error("Apply profile shape failed", ex)
 
 
 # Launch UI
