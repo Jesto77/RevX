@@ -11,7 +11,7 @@ clr.AddReference("RevitAPIUI")
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import (
     Floor, RoofBase, Ceiling,
-    Transaction, SubTransaction, XYZ,
+    Transaction, XYZ,
     Options,
 )
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
@@ -22,9 +22,20 @@ from pyrevit import forms, revit, script
 doc = revit.doc
 uidoc = revit.uidoc
 
-MM_TO_FT  = 1.0 / 304.8
-DEDUP_TOL = 0.15      # ~45 mm — much faster, still very dense
-GRID_CELL = 2.0       # ft — spatial hash cell size for triangles
+MM_TO_FT   = 1.0 / 304.8
+DEDUP_TOL  = 0.15      # ~45 mm — grid-bucket dedupe tolerance
+GRID_CELL  = 2.0       # ft — spatial hash cell size for triangles
+EDGE_STEP_MM = 750.0    # sampling step along crease/naked edges
+
+# Hard cap on how many points ever get pushed into the target's slab-shape
+# editor. Revit's SSE becomes unstable ("Slab Shape Edit failed") well before
+# you reach thousands of points — a dense source triangulation used to dump
+# every triangle vertex onto the target uncapped. Now points are sampled on
+# a bounded grid instead, with crease/boundary points given priority.
+MAX_TARGET_POINTS   = 400
+GRID_TARGET_COUNT   = 220     # aim for roughly this many interior grid samples
+MIN_GRID_SPACING_MM = 300.0
+MAX_GRID_SPACING_MM = 3000.0
 
 # ---------------------------------------------------------------------------
 try:
@@ -509,11 +520,8 @@ def build_triangle_grid(triangles, cell=GRID_CELL):
 
 def z_on_mesh_inside_fast(px, py, triangles, grid, cell=GRID_CELL):
     """
-    Same fast triangle lookup as the original z_on_mesh_fast, but returns None
-    when the XY point is outside the actual source mesh.
-
-    This is the only behavioral fix: outside source area = no source plane
-    extrapolation.
+    Fast triangle lookup. Returns None when the XY point is outside the
+    actual source mesh (outside source area = no source plane extrapolation).
     """
     inv = 1.0 / cell
     key = (int(math.floor(px * inv)), int(math.floor(py * inv)))
@@ -547,41 +555,6 @@ def z_on_mesh_inside_fast(px, py, triangles, grid, cell=GRID_CELL):
             return w0 * z0 + w1 * z1 + w2 * z2
 
     return None
-
-
-def z_on_mesh_fast(px, py, triangles, grid, plane_fallback, cell=GRID_CELL):
-    inv = 1.0 / cell
-    key = (int(math.floor(px * inv)), int(math.floor(py * inv)))
-
-    candidates = grid.get(key)
-
-    if candidates:
-        for idx in candidates:
-            t = triangles[idx]
-
-            x0, y0, z0 = t[0], t[1], t[2]
-            x1, y1, z1 = t[3], t[4], t[5]
-            x2, y2, z2 = t[6], t[7], t[8]
-
-            denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
-            if abs(denom) < 1e-14:
-                continue
-
-            w0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / denom
-            if w0 < -1e-4 or w0 > 1.0001:
-                continue
-
-            w1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / denom
-            if w1 < -1e-4 or w1 > 1.0001:
-                continue
-
-            w2 = 1.0 - w0 - w1
-            if w2 < -1e-4:
-                continue
-
-            return w0 * z0 + w1 * z1 + w2 * z2
-
-    return eval_plane(plane_fallback, px, py)
 
 
 # =============================================================================
@@ -650,13 +623,11 @@ def collect_shared_edges(triangles, tol=1e-4):
 
     for ek, entries in edge_map.items():
         if len(entries) == 1:
-            # naked edge - lives on the mesh boundary
             naked_edges.append(entries[0][1])
         elif len(entries) >= 2:
             n1 = tri_normal(triangles[entries[0][0]])
             n2 = tri_normal(triangles[entries[1][0]])
             dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]
-            # not co-planar -> real crease/fold/split line
             if dot < 0.9995:
                 crease_edges.append(entries[0][1])
 
@@ -664,10 +635,6 @@ def collect_shared_edges(triangles, tol=1e-4):
 
 
 def _seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4):
-    """
-    Return (x, y) intersection of segment (x1,y1)-(x2,y2) with segment
-    (x3,y3)-(x4,y4), or None if they don't cross inside both.
-    """
     dx1 = x2 - x1
     dy1 = y2 - y1
     dx2 = x4 - x3
@@ -689,33 +656,84 @@ def _seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4):
 
 
 # =============================================================================
-# COLLECT VERTEX XYs FROM SOURCE MESH — now also samples crease/naked edges
-# and inserts exact intersections with the target boundary.
+# BOUNDED SOURCE-SURFACE SAMPLING — samples the source at an adaptive grid
+# spacing instead of dumping every raw triangulation vertex onto the target.
 # =============================================================================
 
-def collect_mesh_xy(triangles, tgt_poly, extra_edges=None):
-    """
-    XY sample points from:
-      1. Every triangle vertex.
-      2. Dense samples ALONG crease/split edges and naked mesh edges
-         (this is what makes split lines project cleanly onto the target).
-      3. Intersections of every crease/naked edge with each segment of the
-         target boundary (guarantees a vertex exactly where a crease meets
-         the target outline).
-    All results are deduped and clipped to the target polygon.
-    """
-    raw = []
+def sample_source_grid(triangles, grid, tgt_poly, target_count=GRID_TARGET_COUNT):
+    if len(tgt_poly) < 3:
+        return []
 
-    # (1) triangle vertices
-    for t in triangles:
-        raw.append((t[0], t[1]))
-        raw.append((t[3], t[4]))
-        raw.append((t[6], t[7]))
+    xs = [p[0] for p in tgt_poly]
+    ys = [p[1] for p in tgt_poly]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
 
-    # (2) dense samples along important edges
+    area = (maxx - minx) * (maxy - miny)
+    if area <= 1e-6:
+        return []
+
+    spacing_ft = math.sqrt(area / float(target_count))
+    spacing_ft = max(MIN_GRID_SPACING_MM * MM_TO_FT,
+                      min(MAX_GRID_SPACING_MM * MM_TO_FT, spacing_ft))
+
+    pts = []
+    nx = int(math.ceil((maxx - minx) / spacing_ft)) + 1
+    ny = int(math.ceil((maxy - miny) / spacing_ft)) + 1
+
+    for i in range(nx + 1):
+        x = minx + i * spacing_ft
+        if x > maxx + 1e-6:
+            continue
+        for j in range(ny + 1):
+            y = miny + j * spacing_ft
+            if y > maxy + 1e-6:
+                continue
+            if not point_in_polygon(x, y, tgt_poly):
+                continue
+            z = z_on_mesh_inside_fast(x, y, triangles, grid)
+            if z is None:
+                continue
+            pts.append((x, y))
+
+    return pts
+
+
+def _thin_to_budget(pts, budget):
+    """Uniformly thin a point list down to at most `budget` entries,
+    preserving spatial spread rather than just truncating the tail."""
+    if budget <= 0:
+        return []
+    if len(pts) <= budget:
+        return pts
+    step = len(pts) / float(budget)
+    out = []
+    i = 0.0
+    while len(out) < budget and int(i) < len(pts):
+        out.append(pts[int(i)])
+        i += step
+    return out
+
+
+def collect_mesh_xy(triangles, grid, tgt_poly, extra_edges=None,
+                     edge_step_mm=EDGE_STEP_MM, max_points=MAX_TARGET_POINTS):
+    """
+    Builds a BOUNDED set of target XY sample points:
+      1. Crease/naked edge samples (coarse step) + exact intersections with
+         the target boundary — these get priority since they carry the
+         visible split/fold lines.
+      2. An adaptive interior grid sampled from the source mesh, only where
+         it falls inside both the source footprint and the target polygon.
+    The combined result is capped at `max_points` total — edge points are
+    kept first, interior grid points are thinned to fill whatever budget
+    remains. This is what keeps the target's SlabShapeEditor stable; feeding
+    it thousands of raw triangulation vertices is what causes Revit's
+    "Slab Shape Edit failed" error.
+    """
+    edge_raw = []
+
     if extra_edges:
-        # step size: ~ 100 mm along the edge in feet
-        step_ft = 100.0 * MM_TO_FT
+        step_ft = edge_step_mm * MM_TO_FT
 
         for (pa, pb) in extra_edges:
             ax, ay = pa[0], pa[1]
@@ -724,92 +742,108 @@ def collect_mesh_xy(triangles, tgt_poly, extra_edges=None):
             L = math.sqrt(dx * dx + dy * dy)
 
             if L < 1e-6:
-                raw.append((ax, ay))
+                edge_raw.append((ax, ay))
                 continue
 
-            # always include exact endpoints
-            raw.append((ax, ay))
-            raw.append((bx, by))
+            edge_raw.append((ax, ay))
+            edge_raw.append((bx, by))
 
-            # densify along the edge
             n = int(math.ceil(L / step_ft))
             if n > 1:
                 for k in range(1, n):
                     tval = float(k) / float(n)
-                    raw.append((ax + dx * tval, ay + dy * tval))
+                    edge_raw.append((ax + dx * tval, ay + dy * tval))
 
-    # (3) intersections between edges and target boundary segments
-    if extra_edges and len(tgt_poly) >= 2:
-        for (pa, pb) in extra_edges:
-            e1x, e1y = pa[0], pa[1]
-            e2x, e2y = pb[0], pb[1]
+        if len(tgt_poly) >= 2:
+            for (pa, pb) in extra_edges:
+                e1x, e1y = pa[0], pa[1]
+                e2x, e2y = pb[0], pb[1]
 
-            for i in range(len(tgt_poly)):
-                p1 = tgt_poly[i]
-                p2 = tgt_poly[(i + 1) % len(tgt_poly)]
+                for i in range(len(tgt_poly)):
+                    p1 = tgt_poly[i]
+                    p2 = tgt_poly[(i + 1) % len(tgt_poly)]
 
-                ix = _seg_intersect(e1x, e1y, e2x, e2y,
-                                    p1[0], p1[1], p2[0], p2[1])
-                if ix is not None:
-                    raw.append(ix)
+                    ix = _seg_intersect(e1x, e1y, e2x, e2y,
+                                        p1[0], p1[1], p2[0], p2[1])
+                    if ix is not None:
+                        edge_raw.append(ix)
 
-    # Fast dedupe first
-    deduped = fast_dedupe(raw, tol=DEDUP_TOL)
+    edge_deduped = fast_dedupe(edge_raw, tol=DEDUP_TOL)
 
-    # Filter by target polygon
-    if len(tgt_poly) < 3:
-        return deduped
+    if len(tgt_poly) >= 3:
+        edge_pts = [p for p in edge_deduped if point_in_polygon(p[0], p[1], tgt_poly)]
+    else:
+        edge_pts = edge_deduped
 
-    inside = []
-    for (x, y) in deduped:
-        if point_in_polygon(x, y, tgt_poly):
-            inside.append((x, y))
+    grid_pts = sample_source_grid(triangles, grid, tgt_poly)
+    grid_pts = fast_dedupe(grid_pts, tol=DEDUP_TOL)
 
-    return inside
+    if len(edge_pts) >= max_points:
+        return _thin_to_budget(edge_pts, max_points)
 
+    remaining = max_points - len(edge_pts)
+    grid_pts = _thin_to_budget(grid_pts, remaining)
 
-# =============================================================================
-# DETECT ModifySubElement REFERENCE Z
-# =============================================================================
-
-def detect_ref_z(sse, target, vertex):
-    ref_z = None
-
-    sub = SubTransaction(doc)
-    sub.Start()
-
-    try:
-        sse.ModifySubElement(vertex, 0.0)
-        doc.Regenerate()
-
-        sse2 = get_sse(target)
-        if sse2 is not None:
-            verts = list(sse2.SlabShapeVertices)
-            if verts:
-                ox, oy = vertex.Position.X, vertex.Position.Y
-                best_v = verts[0]
-                best_d = 1e18
-
-                for vv in verts:
-                    d = (vv.Position.X - ox) ** 2 + (vv.Position.Y - oy) ** 2
-                    if d < best_d:
-                        best_d = d
-                        best_v = vv
-
-                ref_z = best_v.Position.Z
-    except Exception:
-        pass
-    finally:
-        sub.RollBack()
-
-    return ref_z
+    return fast_dedupe(edge_pts + grid_pts, tol=DEDUP_TOL)
 
 
 # =============================================================================
-# PREPARE TARGET SSE
+# PER-SOURCE CACHE — extract/triangulate/fit each source only once, even if
+# it's reused across many targets. This is the single biggest speed win.
 # =============================================================================
 
-def prepare_target(target, mesh_xy):
+_source_cache = {}
+
+
+def get_source_data(source, src_face):
+    key = (get_element_id_value(source.Id), src_face)
+
+    if key in _source_cache:
+        return _source_cache[key]
+
+    src_thick = get_thickness(source)
+    raw_src = read_source_sse_full(source)
+
+    if not raw_src:
+        raise Exception("Source has no SSE vertices.")
+
+    src_face_pts = []
+    for (x, y, zt) in raw_src:
+        z = zt if src_face == "top" else zt - src_thick
+        src_face_pts.append((x, y, z))
+
+    plane = fit_plane(src_face_pts)
+
+    triangles = extract_source_triangles(source, src_face)
+
+    if not triangles:
+        raise Exception("Could not extract source surface triangulation.")
+
+    grid = build_triangle_grid(triangles, cell=GRID_CELL)
+
+    crease_edges, naked_edges = collect_shared_edges(triangles)
+    important_edges = crease_edges + naked_edges
+
+    data = {
+        "thick": src_thick,
+        "plane": plane,
+        "triangles": triangles,
+        "grid": grid,
+        "important_edges": important_edges,
+    }
+
+    _source_cache[key] = data
+    return data
+
+
+# =============================================================================
+# ResetSlabShape hardened against transient "reset failed" errors — always
+# regenerate immediately before resetting, and retry once after another
+# regenerate if the first attempt throws.
+# =============================================================================
+
+def safe_reset(target):
+    doc.Regenerate()
     sse = get_sse(target)
 
     if sse is None:
@@ -817,10 +851,22 @@ def prepare_target(target, mesh_xy):
 
     if not sse.IsEnabled:
         sse.Enable()
+        doc.Regenerate()
+        sse = get_sse(target)
 
-    sse.ResetSlabShape()
+    try:
+        sse.ResetSlabShape()
+    except Exception:
+        # Stale/leftover state from a prior run — regenerate and retry once.
+        doc.Regenerate()
+        sse = get_sse(target)
+        if sse is None:
+            raise Exception("SSE lost during reset retry.")
+        if not sse.IsEnabled:
+            sse.Enable()
+        sse.ResetSlabShape()
+
     doc.Regenerate()
-
     sse = get_sse(target)
 
     if sse is None:
@@ -829,7 +875,15 @@ def prepare_target(target, mesh_xy):
     if not sse.IsEnabled:
         sse.Enable()
 
-    flat_z = get_param_datum_z(target)
+    return sse
+
+
+# =============================================================================
+# PREPARE TARGET SSE
+# =============================================================================
+
+def prepare_target(target, mesh_xy):
+    sse = safe_reset(target)
 
     if USE_ADDPOINT_PATH:
         tgt_poly = get_boundary(target)
@@ -873,6 +927,7 @@ def prepare_target(target, mesh_xy):
                 except Exception:
                     pass
     else:
+        flat_z = get_param_datum_z(target)
         for (px, py) in mesh_xy:
             try:
                 sse.DrawPoint(XYZ(px, py, flat_z))
@@ -898,41 +953,23 @@ def prepare_target(target, mesh_xy):
 
 
 # =============================================================================
-# APPLY SLOPE
+# APPLY SLOPE — source geometry now comes from the per-source cache, and
+# ref_z is computed directly instead of via a trial-modify-and-rollback pass.
 # =============================================================================
 
 def apply_slope(target, source, src_face, tgt_face, offset_ft):
-    src_thick = get_thickness(source)
+    src_data = get_source_data(source, src_face)
+
+    src_thick = src_data["thick"]
+    triangles = src_data["triangles"]
+    grid = src_data["grid"]
+    important_edges = src_data["important_edges"]
+
     tgt_thick = get_thickness(target) if tgt_face == "base" else 0.0
-
-    raw_src = read_source_sse_full(source)
-
-    if not raw_src:
-        raise Exception("Source has no SSE vertices.")
-
-    src_face_pts = []
-
-    for (x, y, zt) in raw_src:
-        z = zt if src_face == "top" else zt - src_thick
-        src_face_pts.append((x, y, z))
-
-    plane = fit_plane(src_face_pts)
-
-    triangles = extract_source_triangles(source, src_face)
-
-    if not triangles:
-        raise Exception("Could not extract source surface triangulation.")
-
-    grid = build_triangle_grid(triangles, cell=GRID_CELL)
 
     tgt_poly = get_boundary(target)
 
-    # NEW: extract the source mesh's crease/split + naked edges and pass them
-    # to collect_mesh_xy so those lines project cleanly onto the target.
-    crease_edges, naked_edges = collect_shared_edges(triangles)
-    important_edges = crease_edges + naked_edges
-
-    mesh_xy = collect_mesh_xy(triangles, tgt_poly,
+    mesh_xy = collect_mesh_xy(triangles, grid, tgt_poly,
                               extra_edges=important_edges)
 
     def src_face_to_tgt_top(src_face_z):
@@ -945,32 +982,18 @@ def apply_slope(target, source, src_face, tgt_face, offset_ft):
 
     sse, vertices = prepare_target(target, mesh_xy)
 
-    ref_z = detect_ref_z(sse, target, vertices[0])
-
-    sse = get_sse(target)
-
-    if sse is None:
-        raise Exception("SSE lost after ref Z detection.")
-
-    if not sse.IsEnabled:
-        sse.Enable()
-
-    vertices = list(sse.SlabShapeVertices)
-
-    if ref_z is None:
-        ref_z = get_param_datum_z(target)
+    # ref_z: the SSE reference plane for a freshly-reset floor is the
+    # element's own level+offset datum — no trial-modify/rollback needed.
+    ref_z = get_param_datum_z(target)
 
     applied = 0
 
     for v in vertices:
         vx, vy = v.Position.X, v.Position.Y
 
-        # Only read real source mesh - never extrapolate onto plane outside it.
         z_src_face = z_on_mesh_inside_fast(vx, vy, triangles, grid)
 
         if z_src_face is None:
-            # Outside the source footprint: keep target point at the normal
-            # target reference elevation, i.e. same place / no slope applied.
             desired_z = ref_z
         else:
             desired_z = src_face_to_tgt_top(z_src_face)
@@ -1018,10 +1041,12 @@ def nearest_source(target, sources):
 # =============================================================================
 
 def main():
+    _source_cache.clear()
+
     topo_note = "  TopoSolids supported\n" if HAS_TOPOSOLID else ""
 
     ok = forms.alert(
-        "MATCH SLOPE  v99 (Fast Environment-style + Crease Fit)\n"
+        "MATCH SLOPE  v101 (Bounded Point Count)\n"
         "===========================================\n\n"
         "Revit {}\n\n"
         "STEP 1  Select TARGET floor(s)\n"
@@ -1029,7 +1054,7 @@ def main():
         "STEP 3  Set options and apply\n\n"
         "{}"
         "Outside source area remains in place\n"
-        "Split / crease lines are now sampled densely\n"
+        "Split / crease lines are sampled along boundaries\n"
         "===========================================".format(
             REVIT_VERSION, topo_note),
         ok=True, cancel=True,
@@ -1161,6 +1186,8 @@ def main():
     if skipped:
         msg += "\nFailed ({}):\n".format(len(skipped))
         msg += "\n".join("  • " + s for s in skipped)
+
+    forms.alert(msg, title="Match Slope Results")
 
 
 # =============================================================================
