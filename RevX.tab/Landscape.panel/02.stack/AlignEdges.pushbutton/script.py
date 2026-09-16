@@ -70,7 +70,18 @@ def get_level_elevation(el):
     try:
         lvl = doc.GetElement(el.LevelId)
         if lvl is not None:
-            return lvl.Elevation
+            # ProjectElevation is always relative to the Internal Origin --
+            # the same coordinate space every geometry query in this script
+            # uses (solid faces, curve endpoints, SlabShapeVertex.Position).
+            # Level.Elevation instead follows that level's "Elevation Base"
+            # instance parameter (Project Base Point or Survey Point) and
+            # shifts whenever that point is offset from Internal Origin,
+            # which silently corrupts the flat baseline / ModifySubElement
+            # math on any project where the Survey Point isn't at zero.
+            try:
+                return lvl.ProjectElevation
+            except AttributeError:
+                return lvl.Elevation
     except Exception:
         pass
     return 0.0

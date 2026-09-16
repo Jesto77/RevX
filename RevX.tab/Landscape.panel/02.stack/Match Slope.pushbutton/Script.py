@@ -178,7 +178,18 @@ def get_level_elevation(el):
     try:
         lvl = doc.GetElement(el.LevelId)
         if lvl is not None:
-            return lvl.Elevation
+            # ProjectElevation is always relative to the Internal Origin,
+            # matching the coordinate space that SlabShapeVertex.Position
+            # and all other geometry in this script use. Level.Elevation
+            # instead reflects the level's "Elevation Base" instance
+            # parameter (Project Base Point or Survey Point) and will be
+            # shifted whenever that point is offset from Internal Origin
+            # -- which silently corrupted every ref_z / slope calculation
+            # here whenever a project's Survey Point wasn't at zero.
+            try:
+                return lvl.ProjectElevation
+            except AttributeError:
+                return lvl.Elevation
     except Exception:
         pass
     return 0.0
