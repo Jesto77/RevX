@@ -1,0 +1,9 @@
+title: "Cad"
+author: "Jesto Joy"
+tooltip: |
+  Exports Revit views to DWG merging surface patterns and block geometry into a single combined file with color.
+  
+  How to Use:
+  • Open the active view to export.
+  • Run "Cad".
+  • The tool processes floor/roof/toposolid pattern layers into merged block entities in the exported DWG.

@@ -44,19 +44,42 @@ try:
 except Exception:
     pass
 
+try:
+    PATTERN_CATEGORIES.append(DB.BuiltInCategory.OST_Site)
+except Exception:
+    pass
+
+try:
+    PATTERN_CATEGORIES.append(DB.BuiltInCategory.OST_Hardscape)
+except Exception:
+    pass
+
+try:
+    PATTERN_CATEGORIES.append(DB.BuiltInCategory.OST_Subregions)
+except Exception:
+    pass
+
+try:
+    PATTERN_CATEGORIES.append(DB.BuiltInCategory.OST_TopographyLink)
+except Exception:
+    pass
+
 EXPORT_SETUP_NAME = None
+
+# Set to True (default) to perform 2-view split merge (Pattern + Blocks split)
+# which flattens shape-edited slabs and removes all triangulation/split lines from the DWG export.
+MERGE_SPLIT_VIEWS = True
 
 TEMP_PAT_SUFFIX = "_TMP_PAT"
 TEMP_BLK_SUFFIX = "_TMP_BLK"
 
-GREY_RGB = (128, 128, 128)   # change this to lighten/darken the grey
+GREY_RGB = (128, 128, 128)
 
-# Set to True to force all elements, categories, and subcategories to export as grey.
-APPLY_GREY_OVERRIDE = True
+# Set to False to preserve all original Revit view colors, planting greens,
+# and material hatches exactly as drawn in your project.
+APPLY_GREY_OVERRIDE = False
 
-# Marker written to every flat-copy element's Comments parameter, and used
-# to find/remove any of our temp views or copies left behind by a prior
-# run that didn't clean up properly (crash, cancel, older script version).
+# Marker written to every flat-copy element's Comments parameter
 COPY_MARKER = "RevX_DWG_TEMP_COPY"
 
 
@@ -107,6 +130,29 @@ def is_shape_edited(el):
     return False
 
 
+def flatten_slab_editor(editor):
+    if editor is None:
+        return
+    flattened = False
+    try:
+        vertices = editor.SlabShapeVertices
+        if vertices:
+            for v in vertices:
+                try:
+                    editor.ModifySubElement(v, 0.0)
+                    flattened = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if not flattened:
+        try:
+            editor.ResetSlabShape()
+        except Exception:
+            pass
+
+
 # -----------------------------------------------------------------------------
 # HELPERS - VIEW RANGE
 # -----------------------------------------------------------------------------
@@ -144,20 +190,13 @@ def extend_pat_view_range(pat_view, min_z_offset):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS - GREY OVERRIDE & HATCH PATTERN REMOVAL
+# HELPERS - GREY OVERRIDE (OPTIONAL)
 # -----------------------------------------------------------------------------
 
 def build_grey_override():
     grey = DB.Color(GREY_RGB[0], GREY_RGB[1], GREY_RGB[2])
     ogs = DB.OverrideGraphicSettings()
 
-    # 0. Force Halftone
-    try:
-        ogs.SetHalftone(True)
-    except Exception:
-        pass
-
-    # 1. Force all projection lines and cut lines to grey
     try:
         ogs.SetProjectionLineColor(grey)
     except Exception:
@@ -166,129 +205,26 @@ def build_grey_override():
         ogs.SetCutLineColor(grey)
     except Exception:
         pass
-
-    # 2. Set foreground & background pattern colors to grey if patterns exist
     try:
         ogs.SetSurfaceForegroundPatternColor(grey)
-    except Exception:
-        pass
-    try:
-        ogs.SetSurfaceBackgroundPatternColor(grey)
     except Exception:
         pass
     try:
         ogs.SetCutForegroundPatternColor(grey)
     except Exception:
         pass
-    try:
-        ogs.SetCutBackgroundPatternColor(grey)
-    except Exception:
-        pass
-
-    # 3. Clear Pattern IDs (removes solid fills and hatches)
-    try:
-        ogs.SetSurfaceForegroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    try:
-        ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    try:
-        ogs.SetCutForegroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    try:
-        ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-
-    # 4. Completely disable and turn off visibility for ALL hatch/solid fill patterns
-    try:
-        ogs.SetSurfaceForegroundPatternVisible(False)
-    except Exception:
-        pass
-    try:
-        ogs.SetSurfaceBackgroundPatternVisible(False)
-    except Exception:
-        pass
-    try:
-        ogs.SetCutForegroundPatternVisible(False)
-    except Exception:
-        pass
-    try:
-        ogs.SetCutBackgroundPatternVisible(False)
-    except Exception:
-        pass
 
     return ogs
 
 
-RAILING_CATEGORY_NAMES = [
-    "OST_StairsRailing",
-    "OST_Railings",
-    "OST_StairsRailingBaluster",
-    "OST_StairsRailingCut",
-    "OST_RailingSystemTopRail",
-    "OST_RailingSystemHandRail",
-    "OST_RailingSystemTermination",
-    "OST_RailingSystemSupport",
-    "OST_RailingSystemTransition",
-    "OST_RailingSystemBracket",
-    "OST_RailingSystemPanel",
-    "OST_RailingSystemSegment",
-]
-
-
-def strip_railing_hatches(view, document, ogs):
-    """Explicitly targets all Railing categories, subcategories, and element instances 
-    to remove solid fills/hatches and force clear wireframe lines."""
-    for name in RAILING_CATEGORY_NAMES:
-        try:
-            if not hasattr(DB.BuiltInCategory, name):
-                continue
-            bic = getattr(DB.BuiltInCategory, name)
-            cat = get_category(document, bic)
-            if cat:
-                if cat.get_AllowsVisibilityControl(view):
-                    view.SetCategoryOverrides(cat.Id, ogs)
-                subcats = cat.SubCategories
-                if subcats:
-                    for subcat in subcats:
-                        try:
-                            if subcat.get_AllowsVisibilityControl(view):
-                                view.SetCategoryOverrides(subcat.Id, ogs)
-                        except Exception:
-                            pass
-
-            # Apply direct element overrides to all Railing element instances in the view
-            try:
-                collector = DB.FilteredElementCollector(document, view.Id)\
-                              .OfCategoryId(bic)\
-                              .WhereElementIsNotElementType()
-                for el in collector:
-                    try:
-                        view.SetElementOverrides(el.Id, ogs)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-
 def apply_grey_override_to_all_categories_and_subcategories(view, document, ogs):
-    """Iterates through every Category AND Subcategory in the project (e.g. Stair Treads, 
-    Railing Balusters, Line Styles) to ensure no subcomponent defaults to white."""
     for cat in document.Settings.Categories:
-        # Override parent category
         try:
             if cat.get_AllowsVisibilityControl(view):
                 view.SetCategoryOverrides(cat.Id, ogs)
         except Exception:
             pass
 
-        # Override all subcategories (Stairs:Treads, Railings:Balusters, Lines:<Thin Lines>, etc.)
         try:
             subcats = cat.SubCategories
             if subcats:
@@ -301,69 +237,9 @@ def apply_grey_override_to_all_categories_and_subcategories(view, document, ogs)
         except Exception:
             pass
 
-    # Strip hatches explicitly from all Railing elements and subcategories
-    strip_railing_hatches(view, document, ogs)
-
-    # Force all Revit Link instances and CAD Import instances in the view to grey
-    apply_grey_override_to_links_and_imports(view, document, ogs)
-
-
-def apply_grey_override_to_links_and_imports(view, document, ogs):
-    """Ensures all Revit Link instances and CAD Import instances in the view 
-    are explicitly forced to By Host View and overridden with grey graphics."""
-    
-    # 1. Overriding Revit Link Instances
-    try:
-        link_collector = DB.FilteredElementCollector(document, view.Id)\
-                           .OfCategory(DB.BuiltInCategory.OST_RvtLinks)\
-                           .WhereElementIsNotElementType()
-        for link_inst in link_collector:
-            # Set Link Visibility to By Host View if possible
-            try:
-                if hasattr(DB, "RevitLinkGraphicsSettings") and hasattr(DB, "LinkVisibility"):
-                    link_settings = DB.RevitLinkGraphicsSettings()
-                    link_settings.LinkVisibilityType = DB.LinkVisibility.ByHostView
-                    view.SetLinkOverrides(link_inst.Id, link_settings)
-            except Exception:
-                pass
-            
-            # Direct element override on the link instance
-            try:
-                view.SetElementOverrides(link_inst.Id, ogs)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 2. Overriding CAD / DWG Import Instances
-    try:
-        import_collector = DB.FilteredElementCollector(document, view.Id)\
-                             .OfCategory(DB.BuiltInCategory.OST_ImportObjectStyles)\
-                             .WhereElementIsNotElementType()
-        for imp_inst in import_collector:
-            try:
-                view.SetElementOverrides(imp_inst.Id, ogs)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        if hasattr(DB, "ImportInstance"):
-            import_cls_collector = DB.FilteredElementCollector(document, view.Id)\
-                                     .OfClass(clr.GetClrType(DB.ImportInstance))\
-                                     .WhereElementIsNotElementType()
-            for imp_inst in import_cls_collector:
-                try:
-                    view.SetElementOverrides(imp_inst.Id, ogs)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
 
 # -----------------------------------------------------------------------------
-# HELPERS - FILE / EXPORT (shared by both the per-view export and the merge)
+# HELPERS - FILE / EXPORT
 # -----------------------------------------------------------------------------
 
 def safe_filename(name):
@@ -398,7 +274,23 @@ def get_newest_new_dwg(folder, before_files):
     return paths[0]
 
 
+def get_best_export_setup_name(document):
+    try:
+        setups = DB.FilteredElementCollector(document).OfClass(DB.ExportDWGSettings).ToElements()
+        if setups:
+            for s in setups:
+                if s.Name and "in-session" in s.Name.lower():
+                    return s.Name
+            return setups[0].Name
+    except Exception:
+        pass
+    return None
+
+
 def get_export_options(document, setup_name=None):
+    if not setup_name:
+        setup_name = get_best_export_setup_name(document)
+
     if setup_name:
         try:
             names = [s.Name for s in
@@ -416,11 +308,19 @@ def get_export_options(document, setup_name=None):
 
     opts.MergedViews = True
 
-    # Use true/RGB color so the grey overrides come through as-drawn
+    try:
+        opts.LayerMapping = DB.ExportLayerOptions.CategoryByEntity
+    except Exception:
+        pass
+
+    # Use true RGB color so original view colors and hatches come through exactly
     try:
         opts.Colors = DB.ExportColorMode.TrueColorPerView
     except Exception:
-        pass
+        try:
+            opts.Colors = DB.ExportColorMode.TrueColor
+        except Exception:
+            pass
 
     return opts
 
@@ -448,28 +348,11 @@ def collect_categories(document, view, category_type):
     return cats
 
 
-UNWANTED_CATEGORY_NAMES = [
-    "OST_ModelText",
-    "OST_FilledRegion",
-    "OST_DetailComponents",
-]
-
-
-def hide_unwanted_categories(view, document):
-    for name in UNWANTED_CATEGORY_NAMES:
-        try:
-            if hasattr(DB.BuiltInCategory, name):
-                bic = getattr(DB.BuiltInCategory, name)
-                cat = get_category(document, bic)
-                if cat and cat.get_AllowsVisibilityControl(view):
-                    view.SetCategoryHidden(cat.Id, True)
-        except Exception:
-            pass
-
-
-
 def duplicate_view(view, new_name):
-    new_id   = view.Duplicate(DB.ViewDuplicateOption.Duplicate)
+    try:
+        new_id = view.Duplicate(DB.ViewDuplicateOption.WithDetailing)
+    except Exception:
+        new_id = view.Duplicate(DB.ViewDuplicateOption.Duplicate)
     new_view = doc.GetElement(new_id)
 
     test_name = new_name
@@ -498,6 +381,16 @@ def prepare_overlay_view(source_view, target_view):
         pass
 
     try:
+        target_view.DisplayStyle = source_view.DisplayStyle
+    except Exception:
+        pass
+
+    try:
+        target_view.DetailLevel = source_view.DetailLevel
+    except Exception:
+        pass
+
+    try:
         target_view.CropBoxActive = source_view.CropBoxActive
     except Exception:
         pass
@@ -517,6 +410,80 @@ def prepare_overlay_view(source_view, target_view):
             DB.BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE)
         if p and not p.IsReadOnly:
             p.Set(0)
+    except Exception:
+        pass
+
+    # Copy View Filters and Filter Overrides
+    try:
+        filters = source_view.GetFilters()
+        if filters:
+            for f_id in filters:
+                try:
+                    if not target_view.IsFilterApplied(f_id):
+                        target_view.AddFilter(f_id)
+                    ogs = source_view.GetFilterOverrides(f_id)
+                    if ogs:
+                        target_view.SetFilterOverrides(f_id, ogs)
+                    vis = source_view.GetFilterVisibility(f_id)
+                    target_view.SetFilterVisibility(f_id, vis)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Copy Category, Subcategory, and Element-level Overrides
+    try:
+        for cat in doc.Settings.Categories:
+            try:
+                ogs = source_view.GetCategoryOverrides(cat.Id)
+                if ogs:
+                    target_view.SetCategoryOverrides(cat.Id, ogs)
+            except Exception:
+                pass
+            try:
+                subcats = cat.SubCategories
+                if subcats:
+                    for subcat in subcats:
+                        try:
+                            s_ogs = source_view.GetCategoryOverrides(subcat.Id)
+                            if s_ogs:
+                                target_view.SetCategoryOverrides(subcat.Id, s_ogs)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        collector = DB.FilteredElementCollector(doc, source_view.Id)\
+                      .WhereElementIsNotElementType()
+        for el in collector:
+            try:
+                e_ogs = source_view.GetElementOverrides(el.Id)
+                if e_ogs:
+                    target_view.SetElementOverrides(el.Id, e_ogs)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Copy View Phase and Phase Filter
+    try:
+        p_phase = source_view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE)
+        if p_phase and not p_phase.IsReadOnly:
+            t_phase = target_view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE)
+            if t_phase and not t_phase.IsReadOnly:
+                t_phase.Set(p_phase.AsElementId())
+    except Exception:
+        pass
+
+    try:
+        p_filter = source_view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE_FILTER)
+        if p_filter and not p_filter.IsReadOnly:
+            t_filter = target_view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE_FILTER)
+            if t_filter and not t_filter.IsReadOnly:
+                t_filter.Set(p_filter.AsElementId())
     except Exception:
         pass
 
@@ -625,8 +592,15 @@ def get_scratch_level(document):
 
 
 def hide_all_categories_scratch(view, document):
+    try:
+        import_cat_id = DB.ElementId(DB.BuiltInCategory.OST_ImportObjectStyles)
+    except Exception:
+        import_cat_id = None
+
     for cat in document.Settings.Categories:
         try:
+            if import_cat_id and cat.Id == import_cat_id:
+                continue
             if cat.get_AllowsVisibilityControl(view):
                 view.SetCategoryHidden(cat.Id, True)
         except Exception:
@@ -644,6 +618,7 @@ def import_dwg_to_scratch(document, view, path):
     except Exception:
         pass
     try:
+        # Preserve original RGB colors on import
         options.ColorMode = DB.ImportColorMode.Preserved
     except Exception:
         pass
@@ -653,7 +628,40 @@ def import_dwg_to_scratch(document, view, path):
     return ref.Value
 
 
-def merge_two_dwgs(paths, save_path, original_options):
+def preserve_scratch_import_colors(document, view):
+    try:
+        import_cat = document.Settings.Categories.get_Item(DB.BuiltInCategory.OST_ImportObjectStyles)
+        if import_cat and import_cat.SubCategories:
+            for subcat in import_cat.SubCategories:
+                try:
+                    c = subcat.LineColor
+                    if c and c.IsValid:
+                        ogs = DB.OverrideGraphicSettings()
+                        try:
+                            ogs.SetProjectionLineColor(c)
+                        except Exception:
+                            pass
+                        try:
+                            ogs.SetCutLineColor(c)
+                        except Exception:
+                            pass
+                        try:
+                            ogs.SetSurfaceForegroundPatternColor(c)
+                        except Exception:
+                            pass
+                        try:
+                            ogs.SetCutForegroundPatternColor(c)
+                        except Exception:
+                            pass
+                        if subcat.get_AllowsVisibilityControl(view):
+                            view.SetCategoryOverrides(subcat.Id, ogs)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def merge_two_dwgs(paths, save_path, original_options, source_view=None):
     folder     = os.path.dirname(save_path)
     final_name = safe_filename(os.path.splitext(os.path.basename(save_path))[0])
 
@@ -695,15 +703,28 @@ def merge_two_dwgs(paths, save_path, original_options):
             temp_view = DB.ViewPlan.Create(scratch_doc, vft_id, level.Id)
             hide_all_categories_scratch(temp_view, scratch_doc)
 
+            if source_view:
+                try:
+                    temp_view.DisplayStyle = source_view.DisplayStyle
+                except Exception:
+                    pass
+                try:
+                    temp_view.DetailLevel = source_view.DetailLevel
+                except Exception:
+                    pass
+
             pat_id = None
             blk_id = None
 
+            # 1. Import Pattern (Floors, Topography, etc.)
             if pat_path:
                 pat_id = import_dwg_to_scratch(scratch_doc, temp_view, pat_path)
 
+            # 2. Import Blocks (Walls, planting, details, annotations, etc.)
             if blk_path:
                 blk_id = import_dwg_to_scratch(scratch_doc, temp_view, blk_path)
 
+            # 3. Correct Draw Order Alignment (Pattern bottom, Blocks top)
             if pat_id and blk_id:
                 try:
                     DB.DetailElementOrderUtils.SendToBack(scratch_doc, temp_view, pat_id)
@@ -718,20 +739,17 @@ def merge_two_dwgs(paths, save_path, original_options):
             raise
 
         exp_options = None
-        if EXPORT_SETUP_NAME:
+        setup_name_to_use = EXPORT_SETUP_NAME or get_best_export_setup_name(doc)
+        if setup_name_to_use:
             try:
                 names = [s.Name for s in DB.FilteredElementCollector(scratch_doc).OfClass(DB.ExportDWGSettings)]
-                if EXPORT_SETUP_NAME in names:
-                    exp_options = DB.DWGExportOptions.GetPredefinedOptions(scratch_doc, EXPORT_SETUP_NAME)
+                if setup_name_to_use in names:
+                    exp_options = DB.DWGExportOptions.GetPredefinedOptions(scratch_doc, setup_name_to_use)
             except Exception:
                 pass
 
         if not exp_options:
             exp_options = DB.DWGExportOptions()
-            try:
-                exp_options.Colors = original_options.Colors
-            except Exception:
-                exp_options.Colors = DB.ExportColorMode.TrueColorPerView
             try:
                 exp_options.FileVersion = original_options.FileVersion
             except Exception:
@@ -744,6 +762,25 @@ def merge_two_dwgs(paths, save_path, original_options):
                 exp_options.TargetUnit = original_options.TargetUnit
             except Exception:
                 pass
+
+        try:
+            exp_options.LayerMapping = DB.ExportLayerOptions.CategoryByEntity
+        except Exception:
+            pass
+
+        # Preserve exact RGB TrueColors and Entity Property Overrides on export
+        try:
+            exp_options.Colors = DB.ExportColorMode.TrueColorPerView
+        except Exception:
+            try:
+                exp_options.Colors = DB.ExportColorMode.TrueColor
+            except Exception:
+                pass
+
+        try:
+            exp_options.PropOverrides = DB.PropOverrideMode.ByEntity
+        except Exception:
+            pass
 
         exp_options.MergedViews = False
 
@@ -823,7 +860,7 @@ def main():
             with revit.Transaction(
                     "Create temp export views: " + source_view.Name):
 
-                # PATTERN VIEW - floors/roofs/stairs/toposolid
+                # PATTERN VIEW - floors, roofs, stairs, topography, hardscape pattern fills
                 pat_view = duplicate_view(
                     source_view, source_view.Name + TEMP_PAT_SUFFIX)
                 detach_view_template(pat_view)
@@ -842,27 +879,15 @@ def main():
 
                 hide_categories_by_ids(pat_view, block_ids, model_cats)
                 hide_categories(pat_view, anno_cats)
-                hide_unwanted_categories(pat_view, doc)
 
-                # BLOCKS VIEW - everything else
+                # BLOCKS VIEW - trees, planting, entourage, walls, doors, windows, site components
                 blk_view = duplicate_view(
                     source_view, source_view.Name + TEMP_BLK_SUFFIX)
                 detach_view_template(blk_view)
                 prepare_overlay_view(source_view, blk_view)
-                try:
-                    blk_view.DetailLevel = DB.ViewDetailLevel.Fine
-                except Exception:
-                    pass
                 hide_categories_by_ids(blk_view, pattern_ids, model_cats)
-                hide_categories(blk_view, anno_cats)
-                hide_unwanted_categories(blk_view, doc)
 
-                # GREY & PATTERN REMOVAL OVERRIDE - Applies to ALL Categories AND Subcategories
-                if APPLY_GREY_OVERRIDE:
-                    apply_grey_override_to_all_categories_and_subcategories(pat_view, doc, grey_ogs)
-                    apply_grey_override_to_all_categories_and_subcategories(blk_view, doc, grey_ogs)
-
-                # SCAN & COPY SHAPE-EDITED ELEMENTS
+                # SCAN & COPY SHAPE-EDITED ELEMENTS AND HOSTED SUBREGIONS
                 for cat in pattern_cats:
                     try:
                         collector = (
@@ -875,12 +900,40 @@ def main():
                                 try:
                                     ids_to_copy = List[DB.ElementId]()
                                     ids_to_copy.Add(el.Id)
-                                    copied_ids = \
-                                        DB.ElementTransformUtils.CopyElements(
-                                            doc, ids_to_copy, DB.XYZ.Zero)
-                                    for c_id in copied_ids:
-                                        copied_elements_map.append(
-                                            (el.Id, c_id))
+
+                                    # Collect hosted subregions (Topography / Toposolid / Site)
+                                    try:
+                                        if hasattr(el, "GetHostedSubregions"):
+                                            for sub in el.GetHostedSubregions():
+                                                if sub and sub.Id:
+                                                    ids_to_copy.Add(sub.Id)
+                                    except Exception:
+                                        pass
+
+                                    # Collect subregions by HostId matching el.Id
+                                    try:
+                                        sub_col = (
+                                            DB.FilteredElementCollector(doc, source_view.Id)
+                                              .OfCategory(DB.BuiltInCategory.OST_Subregions)
+                                              .WhereElementIsNotElementType()
+                                        )
+                                        for sub_el in sub_col:
+                                            try:
+                                                if hasattr(sub_el, "HostId") and eid_val(sub_el.HostId) == eid_val(el.Id):
+                                                    ids_to_copy.Add(sub_el.Id)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+
+                                    copied_ids = DB.ElementTransformUtils.CopyElements(
+                                        doc, ids_to_copy, DB.XYZ.Zero)
+
+                                    if copied_ids and copied_ids.Count > 0:
+                                        host_c_id = copied_ids[0]
+                                        copied_elements_map.append((el.Id, host_c_id))
+                                        for c_idx in range(1, copied_ids.Count):
+                                            flat_copies.append(copied_ids[c_idx])
                                 except Exception:
                                     pass
                     except Exception:
@@ -893,7 +946,7 @@ def main():
                     except Exception:
                         pass
 
-                    # RESET SLAB SHAPE ON COPIES
+                    # FLATTEN SLAB VERTICES TO 0.0 ELEVATION OFFSET
                     for orig_id, c_id in copied_elements_map:
                         try:
                             copied_el = doc.GetElement(c_id)
@@ -902,8 +955,16 @@ def main():
 
                             editor = get_element_shape_editor(copied_el)
                             if editor is not None:
-                                editor.ResetSlabShape()
+                                flatten_slab_editor(editor)
                                 flat_copies.append(c_id)
+
+                            # Preserve element-level graphic overrides on flat copies
+                            try:
+                                orig_ogs = source_view.GetElementOverrides(orig_id)
+                                if orig_ogs:
+                                    pat_view.SetElementOverrides(c_id, orig_ogs)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -930,43 +991,30 @@ def main():
                         except Exception:
                             pass
 
+                temp_ids = [pat_view.Id, blk_view.Id] + flat_copies
                 doc.Regenerate()
 
-                temp_ids = [pat_view.Id, blk_view.Id] + flat_copies
-
-            # EXPORT
+            # EXPORT & MERGE (pat_view to BACK, blk_view with TREES to FRONT)
             view_ids_to_export = [pat_view.Id, blk_view.Id]
             raw_paths, export_ok = export_views_raw(
                 doc, folder, base_name,
                 [pat_view.Name, blk_view.Name],
                 view_ids_to_export, options)
 
-            if not raw_paths:
-                output.print_md(
-                    "**{}**: Export() returned {} but no DWG file was found "
-                    "in `{}` afterward.".format(
-                        source_view.Name, export_ok, folder))
-                continue
-
-            # MERGE
             final_target = os.path.join(folder, base_name + ".dwg")
-            merged_path = merge_two_dwgs(raw_paths, final_target, options)
+            merged_path = merge_two_dwgs(raw_paths, final_target, options, source_view)
 
             if merged_path:
-                output.print_md("**{}**: merged file exported to `{}`".format(
+                output.print_md("**{}**: DWG exported successfully with trees on top to `{}`".format(
                     source_view.Name, merged_path))
                 for p in raw_paths:
                     try:
                         if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(merged_path):
                             os.remove(p)
                     except Exception:
-                        output.print_md("Could not delete intermediate file: `{}`".format(p))
+                        pass
             else:
-                output.print_md(
-                    "**{}**: merge FAILED - the original exported file(s) "
-                    "are still on disk, nothing was deleted:".format(source_view.Name))
-                for p in raw_paths:
-                    output.print_md("- `{}`".format(p))
+                output.print_md("**{}**: Merge failed.".format(source_view.Name))
 
         except Exception:
             output.print_md("**{}**: FAILED —".format(source_view.Name))

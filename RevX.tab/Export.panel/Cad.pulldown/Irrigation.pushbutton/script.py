@@ -151,6 +151,13 @@ def build_grey_override():
     grey = DB.Color(GREY_RGB[0], GREY_RGB[1], GREY_RGB[2])
     ogs = DB.OverrideGraphicSettings()
 
+    # 0. Force Halftone to True so all lines and elements in host & links adopt halftone grey
+    try:
+        ogs.SetHalftone(True)
+    except Exception:
+        pass
+
+    # 1. Force all projection lines and cut lines to grey
     try:
         ogs.SetProjectionLineColor(grey)
     except Exception:
@@ -159,6 +166,8 @@ def build_grey_override():
         ogs.SetCutLineColor(grey)
     except Exception:
         pass
+
+    # 2. Set foreground pattern colors to grey so line hatch patterns export in grey
     try:
         ogs.SetSurfaceForegroundPatternColor(grey)
     except Exception:
@@ -168,11 +177,17 @@ def build_grey_override():
     except Exception:
         pass
 
-    # Turn the BACKGROUND pattern off instead of coloring it. Many floor/
-    # material patterns have a solid background fill behind the hatch
-    # (normally invisible) - coloring it grey turns it into a solid grey
-    # block that buries the actual pattern lines. Disabling it leaves
-    # clean grey line work only.
+    # 3. Keep FOREGROUND patterns (line hatch patterns like paving, brick, tile) VISIBLE in grey
+    try:
+        ogs.SetSurfaceForegroundPatternVisible(True)
+    except Exception:
+        pass
+    try:
+        ogs.SetCutForegroundPatternVisible(True)
+    except Exception:
+        pass
+
+    # 4. Turn OFF BACKGROUND patterns (this removes solid background color fills behind hatches)
     try:
         ogs.SetSurfaceBackgroundPatternVisible(False)
     except Exception:
@@ -185,10 +200,197 @@ def build_grey_override():
     return ogs
 
 
-def apply_grey_to_categories(view, categories, ogs):
-    for cat in categories:
+RAILING_CATEGORY_NAMES = [
+    "OST_StairsRailing",
+    "OST_Railings",
+    "OST_StairsRailingBaluster",
+    "OST_StairsRailingCut",
+    "OST_RailingSystemTopRail",
+    "OST_RailingSystemHandRail",
+    "OST_RailingSystemTermination",
+    "OST_RailingSystemSupport",
+    "OST_RailingSystemTransition",
+    "OST_RailingSystemBracket",
+    "OST_RailingSystemPanel",
+    "OST_RailingSystemSegment",
+]
+
+
+def strip_railing_hatches(view, document, ogs):
+    """Explicitly targets all Railing categories, subcategories, and element instances 
+    to remove solid fills/hatches and force clear wireframe lines."""
+    for name in RAILING_CATEGORY_NAMES:
         try:
-            view.SetCategoryOverrides(cat.Id, ogs)
+            if not hasattr(DB.BuiltInCategory, name):
+                continue
+            bic = getattr(DB.BuiltInCategory, name)
+            cat = get_category(document, bic)
+            if cat:
+                if cat.get_AllowsVisibilityControl(view):
+                    view.SetCategoryOverrides(cat.Id, ogs)
+                subcats = cat.SubCategories
+                if subcats:
+                    for subcat in subcats:
+                        try:
+                            if subcat.get_AllowsVisibilityControl(view):
+                                view.SetCategoryOverrides(subcat.Id, ogs)
+                        except Exception:
+                            pass
+
+            try:
+                collector = DB.FilteredElementCollector(document, view.Id)\
+                              .OfCategoryId(bic)\
+                              .WhereElementIsNotElementType()
+                for el in collector:
+                    try:
+                        view.SetElementOverrides(el.Id, ogs)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+UNWANTED_CATEGORY_NAMES = [
+    "OST_ModelText",
+]
+
+
+def hide_unwanted_categories(view, document):
+    for name in UNWANTED_CATEGORY_NAMES:
+        try:
+            if hasattr(DB.BuiltInCategory, name):
+                bic = getattr(DB.BuiltInCategory, name)
+                cat = get_category(document, bic)
+                if cat and cat.get_AllowsVisibilityControl(view):
+                    view.SetCategoryHidden(cat.Id, True)
+        except Exception:
+            pass
+
+
+def force_link_overrides(view, document, grey_ogs):
+    """FIX: linked RVT model elements were showing up in their own colors
+    instead of grey. That's because a Revit link's content defaults to
+    LinkVisibility.ByLinkView - it renders using the LINKED document's own
+    view graphics, completely independent of any category override set on
+    the HOST view. Our existing per-category grey loop was already
+    correct; it just never had anything to act on inside a link, because
+    the link wasn't following the host view's settings at all.
+
+    Switching each link's override mode to ByHostView makes its content
+    start following this view's per-category overrides (the same grey_ogs
+    loop that already handles host elements). On top of that, push a
+    direct element-level override onto the link instance itself (with
+    halftone forced off) as a second layer, so nothing about the link -
+    including any category not present in the host document's category
+    list - can fall back to rendering in its own colors."""
+    try:
+        link_instances = (DB.FilteredElementCollector(document)
+                             .OfClass(DB.RevitLinkInstance)
+                             .ToElements())
+    except Exception:
+        link_instances = []
+
+    for link in link_instances:
+        try:
+            existing = view.GetLinkOverrides(link.Id)
+        except Exception:
+            existing = None
+        try:
+            settings = existing if existing is not None else DB.RevitLinkGraphicsSettings()
+        except Exception:
+            continue
+        try:
+            settings.LinkVisibilityType = DB.LinkVisibility.ByHostView
+        except Exception:
+            pass
+        try:
+            view.SetLinkOverrides(link.Id, settings)
+        except Exception:
+            pass
+        try:
+            view.SetElementOverrides(link.Id, grey_ogs)
+        except Exception:
+            pass
+
+
+def force_cad_overrides(view, document, grey_ogs):
+    """FIX: linked/imported CAD (DWG/DXF) geometry is a different API
+    object entirely from a Revit link (ImportInstance, not
+    RevitLinkInstance), and its layers are exposed as nested
+    subcategories under 'Imported Categories' rather than top-level
+    entries in document.Settings.Categories - so neither the RVT-link fix
+    above nor the plain per-category grey loop below ever touched it.
+    Overriding each ImportInstance directly forces its ENTIRE linework to
+    solid grey in one shot, regardless of how many original CAD layers/
+    colors it contains underneath."""
+    try:
+        cad_instances = (DB.FilteredElementCollector(document)
+                            .OfClass(DB.ImportInstance)
+                            .ToElements())
+    except Exception:
+        cad_instances = []
+
+    for cad in cad_instances:
+        try:
+            view.SetElementOverrides(cad.Id, grey_ogs)
+        except Exception:
+            pass
+
+    # Belt-and-suspenders: also grey every nested category under
+    # "Imported Categories" (each linked file's own category, and each
+    # CAD layer's subcategory underneath that), in case any of them
+    # renders independently of the element-level override above.
+    try:
+        import_root = DB.Category.GetCategory(document, DB.BuiltInCategory.OST_ImportObjectStyles)
+    except Exception:
+        import_root = None
+
+    def grey_subcats_recursive(cat):
+        try:
+            subcats = cat.SubCategories
+        except Exception:
+            return
+        for sub in subcats:
+            try:
+                if sub.get_AllowsVisibilityControl(view):
+                    view.SetCategoryOverrides(sub.Id, grey_ogs)
+            except Exception:
+                pass
+            grey_subcats_recursive(sub)
+
+    if import_root is not None:
+        grey_subcats_recursive(import_root)
+
+
+def force_all_elements_grey(view, document, grey_ogs):
+    """FIX: category/link/import-level overrides can all be beaten by a
+    pre-existing PER-ELEMENT override on an individual element - and CAD
+    content that was ever imported-and-exploded into native Revit lines /
+    filled regions typically DOES carry an explicit per-element color
+    baked in at import time, taken straight from the original AutoCAD
+    layer color. A per-element override always wins over a category
+    override in Revit's precedence rules, so no amount of
+    SetCategoryOverrides can touch it.
+
+    The only thing that can beat an existing per-element override is
+    another per-element override. So instead of trying to guess which
+    mechanism is responsible for a given piece of colored geometry
+    (category default, link display setting, import/explode residue),
+    this sets a fresh element-level grey override directly on every
+    single element visible in the view - which unconditionally outranks
+    all of the above and guarantees uniform grey regardless of cause."""
+    try:
+        elements = (DB.FilteredElementCollector(document, view.Id)
+                      .WhereElementIsNotElementType()
+                      .ToElements())
+    except Exception:
+        elements = []
+
+    for el in elements:
+        try:
+            view.SetElementOverrides(el.Id, grey_ogs)
         except Exception:
             pass
 
@@ -255,6 +457,18 @@ def get_export_options(document, setup_name=None):
     # rather than being remapped to the nearest AutoCAD index color.
     try:
         opts.Colors = DB.ExportColorMode.TrueColorPerView
+    except Exception:
+        pass
+
+    # FIX: without this, Revit exports using its default PropOverrideMode
+    # (ByLayer - "no overrides"), which DISCARDS every view-specific
+    # graphic override on export and falls back to each element/layer's
+    # own native color. That's why the grey overrides looked correct
+    # inside Revit but never survived into the exported DWG. ByEntity
+    # keeps category-based layer assignment but bakes our overrides in
+    # per-entity, so the grey actually makes it into the file.
+    try:
+        opts.PropOverrides = DB.PropOverrideMode.ByEntity
     except Exception:
         pass
 
@@ -593,6 +807,10 @@ def merge_two_dwgs(paths, save_path, original_options):
                 exp_options.TargetUnit = original_options.TargetUnit
             except Exception:
                 pass
+            try:
+                exp_options.PropOverrides = DB.PropOverrideMode.ByEntity
+            except Exception:
+                pass
 
         exp_options.MergedViews = False  # Keep single view flat file representation
 
@@ -697,9 +915,9 @@ def main():
 
                 hide_categories_by_ids(pat_view, block_ids, model_cats)
                 hide_categories(pat_view, anno_cats)
+                hide_unwanted_categories(pat_view, doc)
 
-                # BLOCKS VIEW - everything else, kept separate so it never
-                # visually cuts the pattern fill on export
+                # BLOCKS VIEW - everything else
                 blk_view = duplicate_view(
                     source_view, source_view.Name + TEMP_BLK_SUFFIX)
                 detach_view_template(blk_view)
@@ -709,10 +927,16 @@ def main():
                 except Exception:
                     pass
                 hide_categories_by_ids(blk_view, pattern_ids, model_cats)
+                hide_categories(blk_view, anno_cats)
+                hide_unwanted_categories(blk_view, doc)
 
-                # GREY OVERRIDE - Loops through all available categories in the 
-                # document to guarantee absolutely every visible element is greyed out.
+                # GREY & PATTERN REMOVAL OVERRIDE - Applies to ALL Categories AND Subcategories
                 if APPLY_GREY_OVERRIDE:
+                    force_link_overrides(pat_view, doc, grey_ogs)
+                    force_link_overrides(blk_view, doc, grey_ogs)
+                    force_cad_overrides(pat_view, doc, grey_ogs)
+                    force_cad_overrides(blk_view, doc, grey_ogs)
+
                     for cat in doc.Settings.Categories:
                         try:
                             if cat.get_AllowsVisibilityControl(pat_view):
@@ -724,6 +948,29 @@ def main():
                                 blk_view.SetCategoryOverrides(cat.Id, grey_ogs)
                         except Exception:
                             pass
+                        # Subcategories
+                        try:
+                            subcats = cat.SubCategories
+                            if subcats:
+                                for subcat in subcats:
+                                    try:
+                                        if subcat.get_AllowsVisibilityControl(pat_view):
+                                            pat_view.SetCategoryOverrides(subcat.Id, grey_ogs)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if subcat.get_AllowsVisibilityControl(blk_view):
+                                            blk_view.SetCategoryOverrides(subcat.Id, grey_ogs)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                    strip_railing_hatches(pat_view, doc, grey_ogs)
+                    strip_railing_hatches(blk_view, doc, grey_ogs)
+
+                    force_all_elements_grey(pat_view, doc, grey_ogs)
+                    force_all_elements_grey(blk_view, doc, grey_ogs)
 
                 # SCAN & COPY SHAPE-EDITED ELEMENTS
                 for cat in pattern_cats:
