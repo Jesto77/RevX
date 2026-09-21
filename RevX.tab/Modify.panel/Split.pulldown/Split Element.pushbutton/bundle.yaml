@@ -1,0 +1,9 @@
+title: "Split Element"
+author: "Jesto Joy"
+tooltip: |
+  Splits one single element with multiple boundaries into individual elements (Floor , Toposolids , Roofs , Ceilings).
+  
+  How to Use:
+  • Click on the button and then pick the element.
+  • Choose whether the source element needs to be deleted or kept
+  • The Selected elements will be splitted and placed at the same place.

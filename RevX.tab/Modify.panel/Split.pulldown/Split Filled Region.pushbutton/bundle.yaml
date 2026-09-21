@@ -1,0 +1,9 @@
+title: "Split Filed Region"
+author: "Jesto Joy"
+tooltip: |
+  Splits one single Filled Region with multiple boundaries to split into individual elements.
+  
+  How to Use:
+  • Click on the button and then pick the Filled Region.
+  • Choose whether the source element needs to be deleted or kept
+  • The Selected Filled Region will be splitted and placed at the same place.
