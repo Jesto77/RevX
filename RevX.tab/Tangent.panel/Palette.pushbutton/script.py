@@ -231,6 +231,7 @@ class DivideWindow(forms.WPFWindow):
 
         self.result_ok = False
         self.link_images = False
+        self.standard_mode = False
         self.max_capacity = 0
         self.adjust_rows = False
         self.adjust_cols = False
@@ -427,6 +428,26 @@ class DivideWindow(forms.WPFWindow):
 
     def link_images_click(self, sender, args):
         if self._store_results(True):
+            self.Close()
+
+    def standard_click(self, sender, args):
+        """Preset: rows custom 20,100,20 x5 | columns equal, 5 | then Link Images."""
+        try:
+            # Values first, then the mode switches (mode change redraws the preview)
+            self.RowSizesBox.Text = "20, 100, 20"
+            self.RowRepeatBox.Text = "5"
+            self.ColsBox.Text = "5"
+            try:
+                self.RowAdjustCheck.IsChecked = True
+            except Exception:
+                pass
+            self.RowCustomRadio.IsChecked = True
+            self.ColEqualRadio.IsChecked = True
+        except Exception as ex:
+            forms.alert("Could not apply the Standard preset:\n{}".format(ex), warn_icon=True)
+            return
+        if self._store_results(True):
+            self.standard_mode = True
             self.Close()
 
     def cancel_click(self, sender, args):
@@ -801,18 +822,92 @@ def get_default_text_type_id():
     return t_id
 
 
-def place_text(cell, text_string, is_header):
+def _center_text_vertically(tn, target_cy, anchor_y):
+    """Move a TextNote vertically so the middle of its box sits at target_cy.
+
+    Revit anchors a TextNote by its TOP edge, so a note created at the cell's
+    centre hangs below it. We measure the real text height after creation and
+    shift by the difference - this works for any row height, text size,
+    view scale and multi-line text. X is never touched.
+    """
+    try:
+        doc.Regenerate()
+    except Exception:
+        pass
+    cur_cy = None
+    try:
+        bb = tn.get_BoundingBox(view)
+        if bb:
+            cur_cy = (bb.Min.Y + bb.Max.Y) / 2.0
+    except Exception:
+        pass
+    if cur_cy is None:
+        # Fallback: note is top-anchored at anchor_y, height is paper-space
+        try:
+            cur_cy = anchor_y - (tn.Height * view.Scale) / 2.0
+        except Exception:
+            return
+    dy = target_cy - cur_cy
+    if abs(dy) > 1e-9:
+        try:
+            DB.ElementTransformUtils.MoveElement(doc, tn.Id, XYZ(0, dy, 0))
+        except Exception:
+            pass
+
+
+# Standard-preset text styles (size in mm on paper)
+STD_HEADER_TYPE = "Palette Header 5mm Bold"
+STD_LABEL_TYPE = "Palette Label 4mm"
+
+
+def get_or_create_text_type(name, size_mm, bold):
+    """Find (or duplicate from the default text type) a TextNoteType with the
+    given size / bold setting and return its ElementId."""
+    tnt = None
+    for t in FilteredElementCollector(doc).OfClass(DB.TextNoteType):
+        try:
+            if t.Name == name:
+                tnt = t
+                break
+        except Exception:
+            pass
+    if tnt is None:
+        base_id = get_default_text_type_id()
+        base = doc.GetElement(base_id)
+        if base is None:
+            raise Exception("No Text Type found in the project to duplicate.")
+        tnt = base.Duplicate(name)
+
+    p = tnt.get_Parameter(DB.BuiltInParameter.TEXT_SIZE)
+    if p and not p.IsReadOnly:
+        p.Set(mm_to_internal(size_mm))
+    p = tnt.get_Parameter(DB.BuiltInParameter.TEXT_STYLE_BOLD)
+    if p and not p.IsReadOnly:
+        p.Set(1 if bold else 0)
+    for bip in (DB.BuiltInParameter.TEXT_STYLE_ITALIC,
+                DB.BuiltInParameter.TEXT_STYLE_UNDERLINE):
+        p = tnt.get_Parameter(bip)
+        if p and not p.IsReadOnly:
+            p.Set(0)
+    return tnt.Id
+
+
+def place_text(cell, text_string, is_header, type_id=None):
     opt = TextNoteOptions()
-    tid = get_default_text_type_id()
+    tid = type_id if type_id is not None else get_default_text_type_id()
     if tid != ElementId.InvalidElementId:
         opt.TypeId = tid
     if is_header:
         opt.HorizontalAlignment = DB.HorizontalTextAlignment.Left
-        pt = XYZ(cell['left'] + cell['w'] * 0.05, cell['bottom'] + cell['h'] * 0.20, cell['z'])
+        x = cell['left'] + cell['w'] * 0.05
     else:
         opt.HorizontalAlignment = DB.HorizontalTextAlignment.Center
-        pt = XYZ(cell['cx'], cell['cy'], cell['z'])
-    TextNote.Create(doc, view.Id, pt, text_string, opt)
+        x = cell['cx']
+    # Create at the cell's vertical centre, then correct for the note's height
+    pt = XYZ(x, cell['cy'], cell['z'])
+    tn = TextNote.Create(doc, view.Id, pt, text_string, opt)
+    _center_text_vertically(tn, cell['cy'], cell['cy'])
+    return tn
 
 
 def _recenter_image(img_inst, cx, cy):
@@ -884,7 +979,7 @@ def place_image(cell, filepath):
     return img_inst
 
 
-def populate_grid(cells, image_data):
+def populate_grid(cells, image_data, header_type_id=None, label_type_id=None):
     num_cols = len(cells[0])
     num_blocks = len(cells) // 3
     idx = 0
@@ -900,10 +995,10 @@ def populate_grid(cells, image_data):
             try:
                 if item['category'] != last_cat:
                     header_txt = item.get('header') or clean_header_name(item['category'])
-                    place_text(cells[r_head][c], header_txt, True)
+                    place_text(cells[r_head][c], header_txt, True, header_type_id)
                     last_cat = item['category']
                 place_image(cells[r_img][c], item['path'])
-                place_text(cells[r_lbl][c], item['label'], False)
+                place_text(cells[r_lbl][c], item['label'], False, label_type_id)
                 placed += 1
             except Exception as ex:
                 failures.append("{} -> {}".format(item['path'], ex))
@@ -913,6 +1008,47 @@ def populate_grid(cells, image_data):
         forms.alert("Some images failed ({}):\n\n{}".format(len(failures), "\n".join(failures[:5])),
                     title="Placement Issues", warn_icon=True)
     return placed
+
+
+# =============================================================================
+# STANDARD MODE: header continuity
+# =============================================================================
+def header_continuity_gaps(image_data, num_cols):
+    """Standard mode: where two neighbouring items in the same block belong to
+    the same category, the vertical line between them must be left out of the
+    HEADER row so the category header runs continuously over its images.
+
+    Returns {x_edge_index: set(row_index)} - row_index is the header row of
+    the block (block * 3). Different category / empty cell / first item of a
+    new block => line stays (separated).
+    """
+    gaps = {}
+    for idx in range(1, len(image_data)):
+        c = idx % num_cols
+        if c == 0:
+            continue  # first column of a new block - nothing to its left
+        if image_data[idx]['category'] == image_data[idx - 1]['category']:
+            block = idx // num_cols
+            gaps.setdefault(c, set()).add(block * 3)
+    return gaps
+
+
+def vertical_segments(y_edges, skip_rows):
+    """Split one interior vertical line into (y_low, y_high) pieces, leaving
+    out the rows in skip_rows. y_edges runs top -> bottom (descending)."""
+    n_rows = len(y_edges) - 1
+    segs = []
+    start = None
+    for r in range(n_rows):
+        if r in skip_rows:
+            if start is not None:
+                segs.append((y_edges[r], y_edges[start]))
+                start = None
+        elif start is None:
+            start = r
+    if start is not None:
+        segs.append((y_edges[n_rows], y_edges[start]))
+    return segs
 
 
 # =============================================================================
@@ -955,8 +1091,14 @@ def main():
         Line.CreateBound(XYZ(grid_max_x, grid_max_y, z), XYZ(grid_min_x, grid_max_y, z)),
         Line.CreateBound(XYZ(grid_min_x, grid_max_y, z), XYZ(grid_min_x, grid_min_y, z)),
     ]
-    for x in x_edges[1:-1]:
-        lines.append(Line.CreateBound(XYZ(x, grid_min_y, z), XYZ(x, grid_max_y, z)))
+    # Standard mode: keep the category header continuous over its images
+    gaps = {}
+    if win.standard_mode and image_data:
+        gaps = header_continuity_gaps(image_data, len(x_edges) - 1)
+    for i in range(1, len(x_edges) - 1):
+        x = x_edges[i]
+        for y_lo, y_hi in vertical_segments(y_edges, gaps.get(i, set())):
+            lines.append(Line.CreateBound(XYZ(x, y_lo, z), XYZ(x, y_hi, z)))
     for y in y_edges[1:-1]:
         lines.append(Line.CreateBound(XYZ(grid_min_x, y, z), XYZ(grid_max_x, y, z)))
 
@@ -972,7 +1114,11 @@ def main():
 
         if win.link_images and image_data:
             cells = get_grid_cells_from_edges(x_edges, y_edges, z)
-            populate_grid(cells, image_data)
+            header_tid = label_tid = None
+            if win.standard_mode:
+                header_tid = get_or_create_text_type(STD_HEADER_TYPE, 5.0, True)
+                label_tid = get_or_create_text_type(STD_LABEL_TYPE, 4.0, False)
+            populate_grid(cells, image_data, header_tid, label_tid)
 
         t.Commit()
         # No success popup — finishes silently

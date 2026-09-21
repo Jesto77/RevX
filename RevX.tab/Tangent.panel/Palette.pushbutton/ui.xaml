@@ -86,7 +86,9 @@
         <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="CancelBtn" Content="Cancel" Width="80" Height="30" Margin="0,0,10,0" Click="cancel_click"/>
             <Button x:Name="CreateBtn" Content="Create Lines Only" Width="120" Height="30" Margin="0,0,10,0" Click="create_click"/>
-            <Button x:Name="LinkImgBtn" Content="Link Images" Width="100" Height="30" FontWeight="Bold" Click="link_images_click"/>
+            <Button x:Name="LinkImgBtn" Content="Link Images" Width="100" Height="30" Margin="0,0,10,0" FontWeight="Bold" Click="link_images_click"/>
+            <Button x:Name="StandardBtn" Content="Standard" Width="80" Height="30" FontWeight="Bold" Click="standard_click"
+                    ToolTip="Preset: rows 20,100,20 x5 | 5 equal columns | then Link Images. Headers 5 mm bold, labels 4 mm."/>
         </StackPanel>
     </Grid>
 </Window>
