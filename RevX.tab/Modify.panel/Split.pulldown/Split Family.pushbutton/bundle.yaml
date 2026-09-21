@@ -1,0 +1,9 @@
+title: "Split Family"
+author: "Jesto Joy"
+tooltip: |
+  Splits one single Family with multiple Instances inside the family to individual separate families.
+  
+  How to Use:
+  • Click on the button and then pick the Family.
+  • Choose whether the source Family needs to be deleted or kept.
+  • The Selected Family will be splitted and placed at the same place.
