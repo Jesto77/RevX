@@ -14,6 +14,11 @@ Smoothing uses a quintic smooth-step blended with a Gaussian falloff
 for a natural real-world hill profile with no flat top, no centre spike,
 and a gentle zero-gradient landing at the boundary edge.
 
+Points are laid out in ROWS THAT FOLLOW THE BOUNDARY (inward offsets of the
+boundary loop, staggered half a step) instead of a square X/Y grid, so the
+surface comes out as a smooth wave of points. If the offset rows cannot be
+built for a given boundary, the original square grid is used as a fallback.
+
 Compatible: Revit 2018-2025+  |  IronPython 2.7 (PyRevit)
 """
 
@@ -161,13 +166,24 @@ def flatten_curve_segments(crv, target_z, tol=1e-6):
     For Line and Arc we create a clean flattened copy.
     For any other type (spline, ellipse, etc.) we tessellate and return
     a series of straight line segments.
+
+    NOTE: a full circle Arc/Ellipse (e.g. a circular paver edge or hole)
+    has no start/end - calling GetEndPoint on it raises "the input curve
+    is not bound". Those must go through the tessellate branch instead of
+    the Line/Arc fast-path below.
     """
-    if isinstance(crv, Line):
+    is_bound = True
+    try:
+        is_bound = bool(crv.IsBound)
+    except Exception:
+        is_bound = True  # older API surfaces without IsBound - assume bound
+
+    if is_bound and isinstance(crv, Line):
         sp = crv.GetEndPoint(0)
         ep = crv.GetEndPoint(1)
         return [Line.CreateBound(XYZ(sp.X, sp.Y, target_z),
                                  XYZ(ep.X, ep.Y, target_z))]
-    elif isinstance(crv, Arc):
+    elif is_bound and isinstance(crv, Arc):
         sp = crv.GetEndPoint(0)
         ep = crv.GetEndPoint(1)
         mp = crv.Evaluate(0.5, True)  # midpoint on curve
@@ -175,7 +191,8 @@ def flatten_curve_segments(crv, target_z, tol=1e-6):
                            XYZ(ep.X, ep.Y, target_z),
                            XYZ(mp.X, mp.Y, target_z))]
     else:
-        # For HermiteSpline, Ellipse, etc., tessellate and return line segments
+        # For HermiteSpline, Ellipse, unbound/full-circle Arc, etc.,
+        # tessellate and return line segments
         try:
             pts = list(crv.Tessellate())
             segments = []
@@ -292,10 +309,11 @@ def quintic_smooth(t):
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
-def gaussian_peak(t, sigma=0.42):
+def gaussian_peak(t, sigma=0.55):
     """
     Gaussian bell centred at t=1 (the interior peak).
-    sigma controls how quickly it falls from the peak.
+    sigma controls how quickly it falls from the peak - a larger sigma gives
+    a gentler, rounder crest with no sharp point at the very top.
     Normalised so gaussian_peak(1) = 1.
     """
     return math.exp(-((t - 1.0) ** 2) / (2.0 * sigma * sigma))
@@ -315,9 +333,16 @@ def mound_height(d, max_interior, target_height):
 
     Blend weight: near boundary -> mostly quintic (respects slope),
                   near peak     -> mostly gaussian (natural rounding).
+    The weight is t*t (not plain t): with a plain-t blend the gaussian's
+    value at t=0 is small but not zero, and weighting it by t alone does
+    not cancel its slope there either, so the surface kinks upward right
+    at the boundary instead of easing in tangent to grade. Squaring the
+    weight makes both the value AND the slope of the gaussian's
+    contribution vanish at t=0, giving a proper S-curve that is tangent to
+    grade at the edge as well as flat at the peak.
 
     Result: zero at edge, smooth slope up, rounded organic peak,
-            no flat top, no crater, no spike.
+            no flat top, no crater, no spike, no kink where it meets grade.
     """
     if max_interior <= 0:
         return 0.0
@@ -330,9 +355,10 @@ def mound_height(d, max_interior, target_height):
     # Gaussian component (dominates at high t = near peak)
     g = gaussian_peak(t)
 
-    # Blend: use t itself as the blend weight so the outer slope is
-    # governed by quintic and the top is shaped by the gaussian
-    blended = (1.0 - t) * q + t * g
+    # Blend: weight by t*t so the profile is tangent (zero slope) at BOTH
+    # the boundary and the peak, not just the peak
+    w = t * t
+    blended = (1.0 - w) * q + w * g
 
     # Normalise so blended(1) = 1  (gaussian_peak(1) = 1, quintic(1) = 1 -> blend = 1)
     return target_height * blended
@@ -340,6 +366,70 @@ def mound_height(d, max_interior, target_height):
 # ----------------------------------------------------------
 # BUILD MOUND POINT GRID
 # ----------------------------------------------------------
+
+LONGITUDINAL_TAPER = True   # False restores a level ridge (old behaviour)
+
+
+def _principal_axis(boundary_pts):
+    """Centroid + long axis of the boundary, via a closed-form 2x2 PCA. For an
+    elongated shape this is "along the length"; for a roughly round shape the
+    axis is not meaningful, which is handled by the caller (span ~ 0)."""
+    n = len(boundary_pts)
+    cx = sum(p.X for p in boundary_pts) / n
+    cy = sum(p.Y for p in boundary_pts) / n
+    sxx = syy = sxy = 0.0
+    for p in boundary_pts:
+        dx, dy = p.X - cx, p.Y - cy
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+    theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+    return cx, cy, math.cos(theta), math.sin(theta)
+
+
+ELONGATION_THRESHOLD = 1.6   # boundary length/width ratio above which the
+                             # longitudinal taper kicks in. Below this a shape
+                             # is treated as "round enough" and left untapered
+                             # - a circle or square has no meaningful long
+                             # axis, and PCA would pick an arbitrary one for
+                             # it, which would otherwise squash the mound
+                             # toward one side instead of keeping it centred.
+
+
+def build_longitudinal_taper(boundary_pts):
+    """A single gentle hill along the boundary's long axis instead of a
+    level-topped ridge: 16*u^2*(1-u)^2, a smooth bump that is 0 (and has zero
+    slope) at both ends of the shape and 1 at the midpoint. Only applied when
+    the footprint is meaningfully longer than it is wide (see
+    ELONGATION_THRESHOLD); a round or square footprint is left alone.
+    Returns a function (x, y) -> factor in [0, 1]."""
+    if not LONGITUDINAL_TAPER:
+        return lambda x, y: 1.0
+    cx, cy, ax, ay = _principal_axis(boundary_pts)
+    s_vals = [(p.X - cx) * ax + (p.Y - cy) * ay for p in boundary_pts]
+    s_min, s_max = min(s_vals), max(s_vals)
+    span = s_max - s_min
+    if span < 1e-6:
+        return lambda x, y: 1.0
+
+    # perpendicular axis - the shape's "width" - to check it is actually
+    # elongated before tapering along the axis PCA picked
+    px, py = -ay, ax
+    p_vals = [(p.X - cx) * px + (p.Y - cy) * py for p in boundary_pts]
+    perp_span = max(p_vals) - min(p_vals)
+    if perp_span < 1e-6 or span / perp_span < ELONGATION_THRESHOLD:
+        return lambda x, y: 1.0
+
+    def factor(x, y):
+        s = (x - cx) * ax + (y - cy) * ay
+        u = (s - s_min) / span
+        if u < 0.0:
+            u = 0.0
+        elif u > 1.0:
+            u = 1.0
+        return 16.0 * u * u * (1.0 - u) * (1.0 - u)
+    return factor
+
 
 def create_mound_points(boundary_pts, base_z):
     """
@@ -381,6 +471,7 @@ def create_mound_points(boundary_pts, base_z):
         target_height = max_interior / SLOPE_RATIO
 
     # ── Pass 2: generate XYZ grid ────────────────────────────────────────────
+    taper = build_longitudinal_taper(boundary_pts)
     topo_pts = []
     x = min_x
     while x <= max_x + 1e-6:
@@ -388,12 +479,154 @@ def create_mound_points(boundary_pts, base_z):
         while y <= max_y + 1e-6:
             if point_inside_boundary(x, y, boundary_pts):
                 d = nearest_boundary_distance(x, y, boundary_pts)
-                h = mound_height(d, max_interior, target_height)
+                h = mound_height(d, max_interior, target_height * taper(x, y))
                 topo_pts.append(XYZ(x, y, base_z + h))
             y += GRID_SPACING
         x += GRID_SPACING
 
     return topo_pts
+
+# ----------------------------------------------------------
+# BOUNDARY-FOLLOWING ROWS OF POINTS  ("wave of points")
+# Rows are inward offsets of the boundary loop. Every point on a row gets the
+# height for its exact distance from the boundary, so slope and smoothness come
+# from the profile, not from where a square grid happened to land.
+# ----------------------------------------------------------
+
+RING_DENSITY_FT = 1.0                    # feet - point spacing for the smooth
+                                           # boundary-following rows (independent
+                                           # of GRID_SPACING, which only affects the
+                                           # square-grid fallback). Lower = smoother
+                                           # surface but more points / slower.
+ROW_SPACING   = RING_DENSITY_FT * 0.866   # distance between rows (0.866 = even triangles)
+POINT_SPACING = RING_DENSITY_FT           # distance between points along a row
+
+
+MAX_ARC_ANGLE_STEP = 0.10   # radians (~5.7 deg) - caps the angle between points
+                             # on a curved segment (a rounded end, a fillet, a
+                             # circular edge). Without this, a fixed foot-spacing
+                             # samples a tight-radius curve with only a handful of
+                             # points, which is what shows up as flat facets /
+                             # a "hexagon" look on a rounded tip.
+
+
+def sample_loop_by_length(loop, step, start=0.0):
+    """Points along the whole closed loop, spaced every `step` on straight
+    segments. On a curved segment (has .Radius, i.e. an Arc) the spacing is
+    tightened so the angle between points never exceeds MAX_ARC_ANGLE_STEP -
+    a small-radius curve gets extra points instead of just a handful, so it
+    reads as round instead of faceted."""
+    pts = []
+    next_s = start
+    c0 = 0.0
+    for crv in loop:
+        try:
+            length = crv.Length
+        except Exception:
+            continue
+        if length <= 1e-9:
+            continue
+
+        seg_step = step
+        try:
+            radius = crv.Radius
+        except Exception:
+            radius = None
+        if radius and radius > 1e-6:
+            seg_step = min(step, radius * MAX_ARC_ANGLE_STEP)
+            if seg_step < 1e-4:
+                seg_step = 1e-4
+
+        while next_s < c0 + length - 1e-9:
+            t = (next_s - c0) / length
+            pts.append(crv.Evaluate(t, True))
+            next_s += seg_step
+        c0 += length
+    return pts
+
+
+def poly_area(pts):
+    a = 0.0
+    n = len(pts)
+    for i in range(n):
+        j = (i + 1) % n
+        a += pts[i].X * pts[j].Y - pts[j].X * pts[i].Y
+    return a * 0.5
+
+
+def offset_loop(loop, dist):
+    try:
+        return CurveLoop.CreateViaOffset(loop, dist, XYZ.BasisZ)
+    except Exception:
+        return None
+
+
+def build_rings(loop, row_step, point_step, max_rings=2000):
+    """Inward offsets of the boundary loop -> [(distance_from_boundary, [points])]."""
+    base_area = abs(poly_area(sample_loop_by_length(loop, point_step)))
+    if base_area <= 1e-9:
+        return []
+
+    # which sign of offset goes INWARD? (the inner loop has the smaller area)
+    sign = None
+    best_area = None
+    for sg in (1.0, -1.0):
+        test = offset_loop(loop, sg * row_step)
+        if test is None:
+            continue
+        a = abs(poly_area(sample_loop_by_length(test, point_step)))
+        if a < base_area - 1e-6 and (best_area is None or a < best_area):
+            sign, best_area = sg, a
+    if sign is None:
+        return []
+
+    rings = []
+    cur = loop
+    prev_area = base_area
+    for k in range(1, max_rings + 1):
+        nxt = offset_loop(cur, sign * row_step)
+        if nxt is None:
+            break
+        area = abs(poly_area(sample_loop_by_length(nxt, point_step)))
+        if area >= prev_area - 1e-6:      # collapsed or flipped
+            break
+        # every second row is shifted half a step -> even, wave-like triangles
+        shift = point_step * 0.5 if (k % 2) else 0.0
+        pts = sample_loop_by_length(nxt, point_step, shift)
+        if len(pts) < 3:
+            break
+        rings.append((k * row_step, pts))
+        cur = nxt
+        prev_area = area
+    return rings
+
+
+def create_mound_points_rings(loop, base_z, include_boundary):
+    """Returns (points, row_count) or (None, 0) if rows could not be built."""
+    rings = build_rings(loop, ROW_SPACING, POINT_SPACING)
+    if len(rings) < 2:      # small footprint - try a finer spacing once
+        rings = build_rings(loop, ROW_SPACING * 0.5, POINT_SPACING * 0.5)
+    if len(rings) < 2:
+        return None, 0
+
+    max_interior = rings[-1][0]           # last row = the crest
+    if MAX_HEIGHT_FT is not None:
+        target_height = MAX_HEIGHT_FT
+    else:
+        target_height = max_interior / SLOPE_RATIO
+
+    all_ring_pts = [p for _, ring_pts in rings for p in ring_pts]
+    taper = build_longitudinal_taper(all_ring_pts)
+
+    pts = []
+    if include_boundary:   # old TopographySurface has no separate boundary
+        for p in sample_loop_by_length(loop, POINT_SPACING):
+            pts.append(XYZ(p.X, p.Y, base_z))
+    for d, ring_pts in rings:
+        for p in ring_pts:
+            h = mound_height(d, max_interior, target_height * taper(p.X, p.Y))
+            pts.append(XYZ(p.X, p.Y, base_z + h))
+    return pts, len(rings)
 
 # ----------------------------------------------------------
 # SELECT BOUNDARY MODEL LINES
@@ -441,7 +674,28 @@ base_z = min(p.Z for p in boundary_pts)
 # GENERATE MOUND GRID (now uses pre‑computed base_z)
 # ----------------------------------------------------------
 
-graded_pts = create_mound_points(boundary_pts, base_z)
+use_toposolid = (version >= 2024 and HAS_TOPOSOLID)
+
+ring_loop = None
+try:
+    ring_loop = build_boundary_loop(boundary_curves, base_z)
+except Exception:
+    ring_loop = None
+
+graded_pts = None
+ring_count = 0
+if ring_loop is not None:
+    try:
+        graded_pts, ring_count = create_mound_points_rings(
+            ring_loop, base_z, not use_toposolid)
+    except Exception:
+        graded_pts = None
+        ring_count = 0
+
+if not graded_pts:
+    # fallback: the original square grid
+    graded_pts = create_mound_points(boundary_pts, base_z)
+    ring_count = 0
 
 if len(graded_pts) < 3:
     forms.alert(
@@ -457,7 +711,7 @@ if len(graded_pts) < 3:
 
 loop = None
 if version >= 2024 and HAS_TOPOSOLID:
-    loop = build_boundary_loop(boundary_curves, base_z)
+    loop = ring_loop if ring_loop is not None else build_boundary_loop(boundary_curves, base_z)
     if loop is None:
         forms.alert(
             "Cannot create a valid boundary loop for Toposolid.\n"
@@ -528,10 +782,13 @@ try:
         "Mound created successfully!\n\n"
         "Mode         : {}\n"
         "{}\n"
+        "Layout       : {}\n"
         "Grid points  : {}\n"
         "Boundary pts : {}".format(
             mode,
             mode_detail,
+            ("boundary-following rows ({} rows)".format(ring_count)
+             if ring_count else "square grid (fallback)"),
             len(graded_pts),
             len(boundary_pts)
         )
