@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-# OFF-AXIS SKETCH LINE FIXER v5 - Revit 2026
-# - Snaps BOTH endpoints of flagged lines
-# - Rounds coordinates to eliminate floating-point drift
-# - Pulls adjacent curves to shared exact coordinates
-# - Skips spline rebuilds
-# - Two-pass strategy (batch then per-curve)
+# OFF-AXIS SKETCH LINE FIXER v7 - Revit 2025 / 2026
+# - Tests every flagged line against the sketch-plane frame AND the
+#   world horizontal/vertical frame, each with 0/45/90/135 targets
+# - Solves all snaps together (corners shared by several lines are OK)
+# - Finds off-axis lines by geometry too (not only by warning ids)
+# - Resolves sketches via owner element as well as via the sketch lines
+# - Splines / non line-arc curves keep their endpoints
+# - Two-pass strategy (batch then per-curve); prints why a write fails
 
 from pyrevit import revit
 from Autodesk.Revit.DB import *
@@ -229,222 +231,227 @@ def rebuild_curve(c, new_p0, new_p1):
     return None
 
 
+
 # ==========================================================
-# PLAN MOVES
-# Snaps both endpoints of each flagged line
-# to a rounded common coordinate.
-# Pulls adjacent curves to share the exact same value.
+# DETECTION / FRAMES
+# Revit does not only flag lines that are off the sketch
+# plane's own axes: it also flags lines that are slightly off
+# WORLD horizontal/vertical (when the plane axes are rotated)
+# and slightly off 45 degrees. So every line is tested against
+# several reference frames, each with 0/45/90/135 targets.
 # ==========================================================
 
-def plan_endpoint_moves(curves, plane_data, warning_elem_ids):
+def frame_offsets(plane_data):
+    """Angles (rad, in sketch UV space) of reference frames."""
     ux = plane_data['ux']
     uy = plane_data['uy']
+    nz = plane_data['nz']
+    offs = [0.0]
+    ref = None
+    if abs(nz.Z) > 0.999:          # horizontal sketch: world X
+        ref = XYZ(1, 0, 0)
+    elif abs(nz.Z) < 0.001:        # vertical sketch: world up
+        ref = XYZ(0, 0, 1)
+    if ref is not None:
+        offs.append(math.atan2(ref.DotProduct(uy), ref.DotProduct(ux)))
+    return offs
 
-    def _key(p):
-        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
 
-    # Identify endpoints that touch splines (never move these)
-    spline_endpoints = set()
-    for c in curves:
-        if c['kind'] == 'spline':
-            spline_endpoints.add(_key(c['p0']))
-            spline_endpoints.add(_key(c['p1']))
+def nearest_axis_angle(du, dv, offsets):
+    """Best (target_angle_rad, residual_deg) over all frames."""
+    a = math.atan2(dv, du)
+    step = math.pi / 4.0
+    best = None
+    for o in offsets:
+        k = round((a - o) / step)
+        t = o + k * step
+        res = abs(math.degrees(a - t))
+        if best is None or res < best[1]:
+            best = (t, res)
+    return best
 
-    moves = {}   # _key(old_pt) -> new_pt
 
-    def _register(old_pt, new_pt):
-        k = _key(old_pt)
-        if k in spline_endpoints:
-            return
-        moves[k] = new_pt
-        # Pull nearby endpoints to identical coordinate
-        for c in curves:
-            for p in (c['p0'], c['p1']):
-                if p.DistanceTo(old_pt) < NEARBY_ENDPOINT_TOL:
-                    kp = _key(p)
-                    if kp in spline_endpoints:
-                        continue
-                    if kp not in moves:
-                        moves[kp] = new_pt
+def line_uv(c, plane_data):
+    rel = c['p1'] - c['p0']
+    return rel.DotProduct(plane_data['ux']), rel.DotProduct(plane_data['uy'])
 
-    AXIS_TOL = 0.0001
-    ux_is_x = abs(abs(ux.X) - 1.0) < AXIS_TOL
-    ux_is_y = abs(abs(ux.Y) - 1.0) < AXIS_TOL
-    ux_is_z = abs(abs(ux.Z) - 1.0) < AXIS_TOL
-    uy_is_x = abs(abs(uy.X) - 1.0) < AXIS_TOL
-    uy_is_y = abs(abs(uy.Y) - 1.0) < AXIS_TOL
-    uy_is_z = abs(abs(uy.Z) - 1.0) < AXIS_TOL
 
-    plane_axis_aligned = (
-        (ux_is_x or ux_is_y or ux_is_z) and
-        (uy_is_x or uy_is_y or uy_is_z)
-    )
+def is_off_axis_line(c, plane_data):
+    """Geometric detection: within 0.2 deg of an axis/45 but not exact."""
+    if c['kind'] != 'line':
+        return False
+    du, dv = line_uv(c, plane_data)
+    if math.sqrt(du * du + dv * dv) < VERY_SMALL:
+        return False
+    _t, res = nearest_axis_angle(du, dv, frame_offsets(plane_data))
+    return 1e-10 < res < 0.2
 
-    for c in curves:
-        if c['kind'] != 'line':
+
+class _DSU(object):
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, a):
+        while self.p[a] != a:
+            self.p[a] = self.p[self.p[a]]
+            a = self.p[a]
+        return a
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+MOVE_EPS = 1e-12
+_reported = set()
+
+
+def plan_moves(curves, plane_data, flagged_ids):
+    """Returns {(curve_index, end_index): new XYZ} for endpoints to move.
+
+    Endpoints closer than NEARBY_ENDPOINT_TOL form a corner cluster.
+    Each flagged line becomes a linear constraint
+        n . (cluster_a - cluster_b) = 0
+    (n = normal of the target direction in the sketch plane), solved
+    by alternating projection so corners shared by several flagged
+    lines get every correction. Spline-type endpoints stay pinned."""
+    origin  = plane_data['origin']
+    ux      = plane_data['ux']
+    uy      = plane_data['uy']
+    offsets = frame_offsets(plane_data)
+
+    pts = []
+    for ci, c in enumerate(curves):
+        pinned_curve = c['kind'] not in ('line', 'arc')
+        for ei, p in enumerate((c['p0'], c['p1'])):
+            rel = p - origin
+            pts.append({
+                'ci': ci, 'ei': ei, 'p': p,
+                'u': rel.DotProduct(ux), 'v': rel.DotProduct(uy),
+                'pinned': pinned_curve,
+            })
+    n = len(pts)
+
+    cl = _DSU(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if pts[i]['ci'] == pts[j]['ci']:
+                continue
+            if pts[i]['p'].DistanceTo(pts[j]['p']) < NEARBY_ENDPOINT_TOL:
+                cl.union(i, j)
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(cl.find(i), []).append(i)
+
+    cinfo = {}
+    pos = {}
+    for root, members in clusters.items():
+        us = [pts[m]['u'] for m in members]
+        vs = [pts[m]['v'] for m in members]
+        pin = None
+        for m in members:
+            if pts[m]['pinned']:
+                pin = (pts[m]['u'], pts[m]['v'])
+                break
+        cinfo[root] = {
+            'spread': max(max(us) - min(us), max(vs) - min(vs)),
+            'pin': pin, 'members': members,
+        }
+        if pin:
+            pos[root] = [pin[0], pin[1]]
+        else:
+            pos[root] = [sum(us) / len(us), sum(vs) / len(vs)]
+
+    cons = []
+    constrained = set()
+    for ci, c in enumerate(curves):
+        if c['kind'] != 'line' or c['id'] not in flagged_ids:
             continue
-        if c['id'] not in warning_elem_ids:
+        du, dv = line_uv(c, plane_data)
+        if math.sqrt(du * du + dv * dv) < VERY_SMALL:
             continue
-
-        p0, p1 = c['p0'], c['p1']
-        rel = p1 - p0
-        du = rel.DotProduct(ux)
-        dv = rel.DotProduct(uy)
-
-        direction, should_snap = classify_line(du, dv)
-        if not should_snap:
+        t, res = nearest_axis_angle(du, dv, offsets)
+        if res > SNAP_ANGLE_THRESHOLD_DEG:
+            key = (c['id'], round(res, 3))
+            if key not in _reported:
+                _reported.add(key)
+                print("    curve {} : {:.3f} deg from nearest axis/45 "
+                      "(plane angle {:.3f} deg) - not snapped".format(
+                          c['id'], res, math.degrees(math.atan2(dv, du))))
             continue
-
-        p0_spline = _key(p0) in spline_endpoints
-        p1_spline = _key(p1) in spline_endpoints
-        if p0_spline and p1_spline:
-            print("    curve {} : both ends on spline - skip"
+        r0 = cl.find(2 * ci)
+        r1 = cl.find(2 * ci + 1)
+        if r0 == r1:
+            continue
+        if cinfo[r0]['pin'] and cinfo[r1]['pin']:
+            print("    curve {} : both ends pinned by spline - skip"
                   .format(c['id']))
             continue
+        cons.append((r0, r1, -math.sin(t), math.cos(t)))
+        constrained.add(r0)
+        constrained.add(r1)
 
-        new_p0 = None
-        new_p1 = None
-
-        if plane_axis_aligned:
-            # Compute rounded common coordinate
-            if direction == 'horizontal':
-                if uy_is_y:
-                    common = round((p0.Y + p1.Y) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(p0.X, common, p0.Z)
-                    new_p1 = XYZ(p1.X, common, p1.Z)
-                elif uy_is_z:
-                    common = round((p0.Z + p1.Z) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(p0.X, p0.Y, common)
-                    new_p1 = XYZ(p1.X, p1.Y, common)
-                elif uy_is_x:
-                    common = round((p0.X + p1.X) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(common, p0.Y, p0.Z)
-                    new_p1 = XYZ(common, p1.Y, p1.Z)
-            else:  # vertical
-                if ux_is_x:
-                    common = round((p0.X + p1.X) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(common, p0.Y, p0.Z)
-                    new_p1 = XYZ(common, p1.Y, p1.Z)
-                elif ux_is_y:
-                    common = round((p0.Y + p1.Y) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(p0.X, common, p0.Z)
-                    new_p1 = XYZ(p1.X, common, p1.Z)
-                elif ux_is_z:
-                    common = round((p0.Z + p1.Z) / 2.0, ROUND_DP)
-                    new_p0 = XYZ(p0.X, p0.Y, common)
-                    new_p1 = XYZ(p1.X, p1.Y, common)
-        else:
-            # Tilted plane - UV-based snap
-            origin = plane_data['origin']
-
-            def to_uv(p):
-                rel_p = p - origin
-                return rel_p.DotProduct(ux), rel_p.DotProduct(uy)
-
-            def from_uv(u, v):
-                return origin.Add(
-                    ux.Multiply(u)).Add(uy.Multiply(v))
-
-            u0, v0 = to_uv(p0)
-            u1, v1 = to_uv(p1)
-
-            if direction == 'horizontal':
-                common_v = round((v0 + v1) / 2.0, ROUND_DP)
-                new_p0 = from_uv(u0, common_v)
-                new_p1 = from_uv(u1, common_v)
+    for _it in range(400):
+        worst = 0.0
+        for r0, r1, nu, nv in cons:
+            a = pos[r0]
+            b = pos[r1]
+            viol = nu * (a[0] - b[0]) + nv * (a[1] - b[1])
+            worst = max(worst, abs(viol))
+            if cinfo[r0]['pin']:
+                wa, wb = 0.0, 1.0
+            elif cinfo[r1]['pin']:
+                wa, wb = 1.0, 0.0
             else:
-                common_u = round((u0 + u1) / 2.0, ROUND_DP)
-                new_p0 = from_uv(common_u, v0)
-                new_p1 = from_uv(common_u, v1)
+                wa, wb = 0.5, 0.5
+            a[0] -= nu * viol * wa
+            a[1] -= nv * viol * wa
+            b[0] += nu * viol * wb
+            b[1] += nv * viol * wb
+        if worst < 1e-14:
+            break
 
-        if new_p0 is None or new_p1 is None:
+    new_pts = {}
+    for root, info in cinfo.items():
+        multi = len(info['members']) > 1 and info['spread'] > VERY_SMALL
+        if not (root in constrained or multi or info['pin']):
             continue
-
-        if new_p0.DistanceTo(new_p1) < app.ShortCurveTolerance:
-            continue
-
-        # Register both endpoint moves
-        if not p0_spline:
-            _register(p0, new_p0)
-        if not p1_spline:
-            _register(p1, new_p1)
-
-    return moves
-
-
-def add_gap_closure_moves(curves, moves):
-    """
-    Close any pre-existing tiny gaps between different curves'
-    endpoints (regardless of flag status).
-    """
-    def _key(p):
-        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
-
-    spline_endpoints = set()
-    for c in curves:
-        if c['kind'] == 'spline':
-            spline_endpoints.add(_key(c['p0']))
-            spline_endpoints.add(_key(c['p1']))
-
-    endpoint_list = []
-    for c in curves:
-        endpoint_list.append((c['id'], 0, c['p0']))
-        endpoint_list.append((c['id'], 1, c['p1']))
-
-    for i in range(len(endpoint_list)):
-        cid1, ei1, p1 = endpoint_list[i]
-        for j in range(i + 1, len(endpoint_list)):
-            cid2, ei2, p2 = endpoint_list[j]
-            if cid1 == cid2:
+        tu, tv = pos[root]
+        for m in info['members']:
+            pt = pts[m]
+            if pt['pinned']:
                 continue
-            d = p1.DistanceTo(p2)
-            if VERY_SMALL < d < NEARBY_ENDPOINT_TOL:
-                k1 = _key(p1)
-                k2 = _key(p2)
-                k1_spline = k1 in spline_endpoints
-                k2_spline = k2 in spline_endpoints
-                if k1_spline and k2_spline:
-                    continue
-                if k1 in moves and k2 not in moves and not k2_spline:
-                    moves[k2] = moves[k1]
-                elif k2 in moves and k1 not in moves and not k1_spline:
-                    moves[k1] = moves[k2]
-                elif k1 not in moves and k2 not in moves:
-                    if k1_spline:
-                        moves[k2] = p1
-                    elif k2_spline:
-                        moves[k1] = p2
-                    else:
-                        # Merge to rounded midpoint
-                        mid = XYZ(
-                            round((p1.X + p2.X) / 2.0, ROUND_DP),
-                            round((p1.Y + p2.Y) / 2.0, ROUND_DP),
-                            round((p1.Z + p2.Z) / 2.0, ROUND_DP)
-                        )
-                        moves[k1] = mid
-                        moves[k2] = mid
+            du = tu - pt['u']
+            dv = tv - pt['v']
+            if abs(du) < MOVE_EPS and abs(dv) < MOVE_EPS:
+                continue
+            new_pts[(pt['ci'], pt['ei'])] = (
+                pt['p'].Add(ux.Multiply(du)).Add(uy.Multiply(dv)))
+
+    return new_pts
 
 
-def apply_moves(curves, moves):
-    def _key(p):
-        return (round(p.X, 4), round(p.Y, 4), round(p.Z, 4))
-
+def apply_moves(curves, new_pts):
     pairs = []
-    for c in curves:
-        k0 = _key(c['p0'])
-        k1 = _key(c['p1'])
-        new_p0 = moves.get(k0, c['p0'])
-        new_p1 = moves.get(k1, c['p1'])
-        moved = (new_p0 is not c['p0'] or new_p1 is not c['p1'])
-        if not moved:
+    for ci, c in enumerate(curves):
+        n0 = new_pts.get((ci, 0))
+        n1 = new_pts.get((ci, 1))
+        if n0 is None and n1 is None:
             continue
-        new_curve = rebuild_curve(c, new_p0, new_p1)
+        if n0 is None:
+            n0 = c['p0']
+        if n1 is None:
+            n1 = c['p1']
+        new_curve = rebuild_curve(c, n0, n1)
         if new_curve is None:
             print("    SKIP curve {} ({}) : cannot rebuild"
                   .format(c['id'], c['kind']))
             continue
         pairs.append((c['elem'], new_curve, c['id'], c['kind']))
     return pairs
+
 
 
 def validate_loop_closure(curves, pairs):
@@ -584,13 +591,18 @@ def try_write(sid_int, owner, pairs, dim_ids, joined, strategy):
 
         status = t.Commit()
         if status != TransactionStatus.Committed:
+            print("    [{}] inner transaction status: {}".format(
+                strategy, status))
             return False
 
         scope_proc = BulldozerProc()
         try:
             ses.Commit(scope_proc)
             scope_committed = True
-        except Exception:
+        except Exception as ex:
+            print("    [{}] sketch commit failed: {}".format(strategy, ex))
+            for line in scope_proc.log[:4]:
+                print("        failure: {}".format(line))
             return False
 
         try:
@@ -600,7 +612,8 @@ def try_write(sid_int, owner, pairs, dim_ids, joined, strategy):
             pass
         return True
 
-    except Exception:
+    except Exception as ex:
+        print("    [{}] write error: {}".format(strategy, ex))
         return False
 
     finally:
@@ -623,30 +636,38 @@ def try_write(sid_int, owner, pairs, dim_ids, joined, strategy):
                 pass
 
 
+
 # ==========================================================
 # MAIN
 # ==========================================================
 
-warnings_list = []
-for w in doc.GetWarnings():
+def is_target_warning(w):
     try:
         txt = w.GetDescriptionText().lower()
-        if "line in sketch" in txt and "slightly off axis" in txt:
-            warnings_list.append(w)
     except Exception:
-        pass
+        return False
+    return "line in sketch" in txt and "slightly off axis" in txt
+
+
+warnings_list = [w for w in doc.GetWarnings() if is_target_warning(w)]
 
 print("")
 print("=" * 60)
-print("OFF-AXIS LINE FIXER v5 - Revit 2026")
+print("OFF-AXIS LINE FIXER v7 - Revit {}".format(app.VersionNumber))
 print("=" * 60)
 print("TARGET WARNINGS FOUND : {}".format(len(warnings_list)))
 print("")
 
+# Sketch lookup tables
 curve_id_to_sketch_id = {}
-all_sketches = (FilteredElementCollector(doc)
-                .OfClass(Sketch).ToElements())
-for sk in all_sketches:
+owner_id_to_sketch_ids = {}
+for sk in FilteredElementCollector(doc).OfClass(Sketch).ToElements():
+    try:
+        sk_iv = get_id_value(sk.Id)
+        owner_iv = get_id_value(sk.OwnerId)
+        owner_id_to_sketch_ids.setdefault(owner_iv, set()).add(sk_iv)
+    except Exception:
+        sk_iv = None
     try:
         for ceid in sk.GetAllElements():
             curve_id_to_sketch_id[get_id_value(ceid)] = get_id_value(sk.Id)
@@ -655,6 +676,7 @@ for sk in all_sketches:
 
 warning_elem_ids = set()
 sketch_ids       = set()
+unresolved       = []
 
 for w in warnings_list:
     try:
@@ -664,21 +686,39 @@ for w in warnings_list:
     for eid in ids:
         iv = get_id_value(eid)
         elem = doc.GetElement(eid)
-        if elem is not None and isinstance(elem, ModelCurve):
+        if elem is None:
+            unresolved.append((iv, "None"))
+            continue
+
+        if isinstance(elem, ModelCurve):
             warning_elem_ids.add(iv)
             if iv in curve_id_to_sketch_id:
                 sketch_ids.add(curve_id_to_sketch_id[iv])
-        elif elem is not None and isinstance(elem, Sketch):
+                continue
+        elif isinstance(elem, Sketch):
             sketch_ids.add(iv)
+            continue
+
+        # Parent element (Floor, Wall, Roof, ...) -> its sketches
+        found = False
+        if iv in owner_id_to_sketch_ids:
+            sketch_ids.update(owner_id_to_sketch_ids[iv])
+            found = True
         else:
+            sid = get_sketch_id(elem)
             try:
-                sid = get_sketch_id(elem)
-                if sid and sid != ElementId.InvalidElementId:
+                if sid is not None and sid != ElementId.InvalidElementId:
                     sketch_ids.add(get_id_value(sid))
+                    found = True
             except Exception:
                 pass
+        if not found:
+            unresolved.append((iv, elem.__class__.__name__))
 
-print("SKETCH IDS : {}".format(sorted(sketch_ids)))
+print("FLAGGED MODEL LINES   : {}".format(len(warning_elem_ids)))
+print("SKETCH IDS            : {}".format(sorted(sketch_ids)))
+if unresolved:
+    print("UNRESOLVED ELEMENTS   : {}".format(unresolved[:10]))
 print("")
 
 # ==========================================================
@@ -702,14 +742,39 @@ for sid_int in sorted(sketch_ids):
         owner_elem   = doc.GetElement(sketch.OwnerId)
         owner_class  = owner_elem.__class__.__name__
     except Exception:
+        print("  no owner element")
         continue
 
     curves, plane_data = read_sketch_curves(sketch)
     if not curves:
+        print("  could not read sketch curves / plane")
         continue
 
     print("  Owner : {} ({})".format(
         get_id_value(owner_elem.Id), owner_class))
+
+    # Lines to fix = ids Revit reported + anything geometrically off axis
+    sketch_curve_ids = set(c['id'] for c in curves)
+    flagged_ids = set(warning_elem_ids & sketch_curve_ids)
+    for c in curves:
+        if is_off_axis_line(c, plane_data):
+            flagged_ids.add(c['id'])
+    print("  Flagged lines : {}".format(len(flagged_ids)))
+    _pl = plane_data
+    print("  Plane  ux=({:.6f},{:.6f},{:.6f}) uy=({:.6f},{:.6f},{:.6f}) "
+          "n=({:.4f},{:.4f},{:.4f})".format(
+              _pl['ux'].X, _pl['ux'].Y, _pl['ux'].Z,
+              _pl['uy'].X, _pl['uy'].Y, _pl['uy'].Z,
+              _pl['nz'].X, _pl['nz'].Y, _pl['nz'].Z))
+    _kinds = {}
+    for c in curves:
+        if c['id'] in flagged_ids:
+            _kinds[c['kind']] = _kinds.get(c['kind'], 0) + 1
+    print("  Flagged kinds : {}".format(_kinds))
+    if not flagged_ids:
+        print("  nothing to snap in this sketch")
+        write_fails += 1
+        continue
 
     dim_ids = []
     joined_elems = []
@@ -723,12 +788,11 @@ for sid_int in sorted(sketch_ids):
         strategies = ['normal', 'unjoin']
 
     # PASS 1: batch
-    moves = plan_endpoint_moves(curves, plane_data, warning_elem_ids)
-    add_gap_closure_moves(curves, moves)
-    pairs = apply_moves(curves, moves)
+    new_pts = plan_moves(curves, plane_data, flagged_ids)
+    pairs = apply_moves(curves, new_pts)
 
     if pairs:
-        ok, _ = validate_loop_closure(curves, pairs)
+        ok, opens = validate_loop_closure(curves, pairs)
         if ok:
             print("  Pass 1 (batch): {} curves".format(len(pairs)))
             success = False
@@ -743,29 +807,30 @@ for sid_int in sorted(sketch_ids):
 
             if success:
                 continue
+        else:
+            print("  Pass 1 skipped : loop would not close ({} open ends)"
+                  .format(len(opens)))
+    else:
+        print("  Pass 1 : no movable curves planned")
 
     # PASS 2: per-curve
     print("  Pass 2 (per-curve retry)")
 
     per_curve_fixed = 0
-    for target_cid in list(warning_elem_ids):
-        # Refresh sketch state
+    for target_cid in sorted(flagged_ids):
+        sketch = doc.GetElement(make_eid(sid_int))
+        if not sketch:
+            break
         curves, plane_data = read_sketch_curves(sketch)
         if not curves:
             break
 
-        found = False
-        for c in curves:
-            if c['id'] == target_cid and c['kind'] == 'line':
-                found = True
-                break
-        if not found:
+        if not any(c['id'] == target_cid and c['kind'] == 'line'
+                   for c in curves):
             continue
 
-        single_warning = set([target_cid])
-        moves = plan_endpoint_moves(curves, plane_data, single_warning)
-        pairs = apply_moves(curves, moves)
-
+        new_pts = plan_moves(curves, plane_data, set([target_cid]))
+        pairs = apply_moves(curves, new_pts)
         if not pairs:
             continue
 
@@ -797,14 +862,8 @@ for sid_int in sorted(sketch_ids):
 # FINAL COUNT
 # ==========================================================
 
-remaining_off_axis = 0
-for w in doc.GetWarnings():
-    try:
-        txt = w.GetDescriptionText().lower()
-        if "line in sketch" in txt and "slightly off axis" in txt:
-            remaining_off_axis += 1
-    except Exception:
-        pass
+remaining_off_axis = len([w for w in doc.GetWarnings()
+                          if is_target_warning(w)])
 
 print("")
 print("=" * 60)
@@ -818,9 +877,8 @@ if remaining_off_axis > 0:
     print("")
     print("TIP: Run the script again - each pass can catch")
     print("     warnings that only appear after previous fixes.")
-    print("     If warnings persist after 2-3 runs, they may")
-    print("     be on lines whose endpoints are pinned by")
-    print("     splines or other constraints.")
+    print("     If warnings persist, copy this output - the lines")
+    print("     above show which stage dropped them.")
 
 print("")
 print("DONE")
