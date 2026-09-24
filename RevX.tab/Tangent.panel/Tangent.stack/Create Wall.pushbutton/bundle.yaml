@@ -1,0 +1,11 @@
+title: "Create Wall"
+author: "Jesto Joy"
+tooltip: |
+  Creates walls of a chosen wall type around the edges of a selected floor. Each wall's top and bottom match the floor's top and bottom faces, and the wall sits outside the floor edge with its exterior face pointing away from the floor.
+
+  How to Use:
+  • Select one or more floors (or click the button and pick them when prompted).
+  • Click "Create Wall".
+  • Choose a wall type from the list.
+  • If the floor has openings, choose whether to also create walls around them (placed inside the opening).
+  • Walls are created on every side face of the floor, including curved edges and sloped or shape-edited floors.
