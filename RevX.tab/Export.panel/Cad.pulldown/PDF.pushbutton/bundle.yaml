@@ -1,0 +1,9 @@
+title: "PDF"
+author: "Jesto Joy"
+tooltip: |
+  Exports the views into a single PDF.
+  
+  How to Use:
+  • Open any layout view.
+  • Run "PDF".
+  • The tool exports host and linked elements into a single PDF export.
