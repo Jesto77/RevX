@@ -34,7 +34,7 @@ SIDE_NZ    = 0.2      # |normal.Z| below this = side face
 
 class FloorFilter(ISelectionFilter):
     def AllowElement(self, e):
-        return isinstance(e, Floor)
+        return isinstance(e, Floor) or e.GetType().Name == 'Toposolid'
 
     def AllowReference(self, r, p):
         return False
@@ -44,7 +44,7 @@ def get_floors():
     floors = []
     for eid in uidoc.Selection.GetElementIds():
         el = doc.GetElement(eid)
-        if isinstance(el, Floor):
+        if isinstance(el, Floor) or el.GetType().Name == 'Toposolid':
             floors.append(el)
     if floors:
         return floors
@@ -273,7 +273,21 @@ def plan_floor(floor):
                     'n3': f.FaceNormal})
             elif isinstance(f, CylindricalFace):
                 o = f.Origin
-                key = ('cyl', rk(o.X), rk(o.Y), rk(f.Radius))
+                try:
+                    rad_obj = f.Radius[0]
+                except Exception:
+                    rad_obj = f.get_Radius(0) if hasattr(f, 'get_Radius') else f.Radius
+                
+                # If rad_obj is an XYZ (vector), use its length
+                try:
+                    rad_val = rad_obj.GetLength()
+                except Exception:
+                    try:
+                        rad_val = float(rad_obj)
+                    except Exception:
+                        rad_val = 0.0
+                        
+                key = ('cyl', rk(o.X), rk(o.Y), rk(rad_val))
                 g = groups.setdefault(key, {
                     'faces': [], 'planar': False, 'nh': None,
                     'n3': None})
@@ -334,8 +348,30 @@ def plan_floor(floor):
                               'nh': g['nh'], 'n3': g['n3'],
                               'opening': is_opening})
             else:
-                notes.append("skipped a curved/tilted edge whose top or "
-                             "bottom is not level (not supported)")
+                notes.append("curved/tilted edge gets standard wall (attach top manually)")
+                bc_orig = None
+                for c in loop:
+                    if not isinstance(c, Line):
+                        bc_orig = c
+                        break
+                if not bc_orig:
+                    bc_orig = loop[0]
+                
+                nh = outward_normal(g, bc_orig)
+                
+                # Project the curve to Z=zmin
+                bc = bc_orig
+                if isinstance(bc, Arc):
+                    p0, p1, pm = bc.GetEndPoint(0), bc.GetEndPoint(1), bc.Evaluate(0.5, True)
+                    try:
+                        bc = Arc.Create(XYZ(p0.X, p0.Y, zmin), XYZ(p1.X, p1.Y, zmin), XYZ(pm.X, pm.Y, zmin))
+                    except Exception:
+                        bc = bc.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, zmin - p0.Z)))
+                else:
+                    bc = bc.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, zmin - bc.GetEndPoint(0).Z)))
+                
+                if nh:
+                    tasks.append({'kind': 'straight', 'curve': bc, 'zmin': zmin, 'zmax': zmax, 'nh': nh, 'opening': is_opening})
     return tasks, notes
 
 
@@ -376,24 +412,13 @@ def place_outside(wall, ref_curve, nh):
     """Make the wall body lie outside the floor edge with its exterior
     face pointing outward. Measured on the real wall geometry."""
     mid = ref_curve.Evaluate(0.5, True)
-    is_arc = isinstance(ref_curve, Arc)
+    is_line = isinstance(ref_curve, Line)
+    
     for _i in range(5):
         doc.Regenerate()
         pts = wall_points(wall)
         if not pts:
             return False
-
-        if is_arc:
-            c = ref_curve.Center
-            R = ref_curve.Radius
-            convex = XYZ(mid.X - c.X, mid.Y - c.Y, 0).DotProduct(nh) > 0
-            rs = [math.hypot(p.X - c.X, p.Y - c.Y) for p in pts]
-            bad = (min(rs) < R - PLACE_TOL) if convex \
-                else (max(rs) > R + PLACE_TOL)
-            if bad:
-                wall.Flip()
-                continue
-            return True
 
         ori_ok = True
         try:
@@ -403,6 +428,11 @@ def place_outside(wall, ref_curve, nh):
         if not ori_ok:
             wall.Flip()
             continue
+
+        if not is_line:
+            # Curved walls are perfectly placed by CreateOffset; 
+            # do not linearly translate them as it causes non-uniform gaps!
+            return True
 
         mn = min((p.X - mid.X) * nh.X + (p.Y - mid.Y) * nh.Y
                  for p in pts)
@@ -420,26 +450,88 @@ def set_location_line(wall):
         p.Set(int(WallLocationLine.FinishFaceInterior))
 
 
-def create_straight(task, floor, wtype):
-    lvl = floor_level(floor, task['zmin'])
+def create_straight(task, floor, wtype, chosen_level):
+    lvl = chosen_level
     c = task['curve']
     dz = lvl.Elevation - c.GetEndPoint(0).Z
     flat_curve = c.CreateTransformed(
         Transform.CreateTranslation(XYZ(0, 0, dz)))
-    wall = Wall.Create(doc, flat_curve, wtype.Id, lvl.Id,
-                       task['zmax'] - task['zmin'],
-                       task['zmin'] - lvl.Elevation, False, False)
-    set_location_line(wall)
+        
+    width = wtype.Width
+    offset_dist = width / 2.0
+    
+    offset_curve = None
+    try:
+        temp_off = flat_curve.CreateOffset(offset_dist, XYZ.BasisZ)
+        if temp_off:
+            mid_orig = flat_curve.Evaluate(0.5, True)
+            mid_off = temp_off.Evaluate(0.5, True)
+            # Ensure the offset is in the outward direction (nh)
+            if (mid_off - mid_orig).DotProduct(task['nh']) < 0:
+                offset_curve = flat_curve.CreateOffset(-offset_dist, XYZ.BasisZ)
+            else:
+                offset_curve = temp_off
+    except Exception:
+        pass
+        
+    if offset_curve:
+        wall = Wall.Create(doc, offset_curve, wtype.Id, lvl.Id,
+                           task['zmax'] - task['zmin'],
+                           task['zmin'] - lvl.Elevation, False, False)
+        set_location_line(wall)
+    else:
+        wall = Wall.Create(doc, flat_curve, wtype.Id, lvl.Id,
+                           task['zmax'] - task['zmin'],
+                           task['zmin'] - lvl.Elevation, False, False)
+        set_location_line(wall)
+        if hasattr(wall.Location, 'Curve'):
+            try:
+                wall.Location.Curve = flat_curve
+            except Exception:
+                pass
+                
     ok = place_outside(wall, c, task['nh'])
     return wall, ok
 
 
-def create_profile(task, floor, wtype):
-    lvl = floor_level(floor, task['zmin'])
+def create_profile(task, floor, wtype, chosen_level):
+    lvl = chosen_level
     prof = List[Curve]()
     for c in task['loop']:
         prof.Add(c)
+    
     wall = Wall.Create(doc, prof, wtype.Id, lvl.Id, False, task['n3'])
+    
+    # Check for vertical inversion (Revit sometimes creates profile walls upside down)
+    doc.Regenerate()
+    pts = wall_points(wall)
+    if pts:
+        expected_cz = sum(c.Evaluate(0.5, True).Z for c in task['loop']) / len(task['loop'])
+        z_min_wall = min(p.Z for p in pts)
+        dz = task['zmin'] - z_min_wall
+        wall_cz = (sum(p.Z for p in pts) / len(pts)) + dz
+        
+        if abs(wall_cz - expected_cz) > 1.0:
+            # Wall is inverted! Delete and recreate with reversed curve loop
+            doc.Delete(wall.Id)
+            prof = List[Curve]()
+            for c in reversed(task['loop']):
+                prof.Add(c.CreateReversed())
+            wall = Wall.Create(doc, prof, wtype.Id, lvl.Id, False, task['n3'])
+            doc.Regenerate()
+            pts = wall_points(wall)
+            z_min_wall = min(p.Z for p in pts)
+            dz = task['zmin'] - z_min_wall
+            
+        if abs(dz) > Z_TOL:
+            # Apply the required vertical shift via Base Offset parameter
+            p_base = wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET)
+            if p_base and not p_base.IsReadOnly:
+                p_base.Set(dz)
+            else:
+                ElementTransformUtils.MoveElement(doc, wall.Id, XYZ(0, 0, dz))
+            doc.Regenerate()
+            
     set_location_line(wall)
     ok = place_outside(wall, task['loop'][0], task['nh'])
     return wall, ok
@@ -457,6 +549,16 @@ class WarnSwallower(IFailuresPreprocessor):
 # MAIN
 # ==========================================================
 
+def pick_level():
+    levels = FilteredElementCollector(doc).OfClass(Level).ToElements()
+    if not levels:
+        return None
+    names = {"{} (Elevation: {})".format(l.Name, round(l.Elevation, 2)): l for l in sorted(levels, key=lambda l: l.Elevation)}
+    sel = forms.SelectFromList.show(
+        names.keys(), title="Select Base Level for Walls",
+        multiselect=False, button_name="Select Level")
+    return names.get(sel) if sel else None
+
 def main():
     floors = get_floors()
     if not floors:
@@ -464,6 +566,10 @@ def main():
 
     wtype = pick_wall_type()
     if wtype is None:
+        return
+
+    chosen_level = pick_level()
+    if chosen_level is None:
         return
 
     plans = []
@@ -501,9 +607,9 @@ def main():
                     continue
                 try:
                     if task['kind'] == 'straight':
-                        wall, ok = create_straight(task, fl, wtype)
+                        wall, ok = create_straight(task, fl, wtype, chosen_level)
                     else:
-                        wall, ok = create_profile(task, fl, wtype)
+                        wall, ok = create_profile(task, fl, wtype, chosen_level)
                     made += 1
                     if not ok:
                         misplaced += 1
