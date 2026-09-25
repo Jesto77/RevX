@@ -1,0 +1,9 @@
+title: "Linked Pdf"
+author: "Jesto Joy"
+tooltip: |
+  Exports the linked rvt files in views with proper hatch patterns into a single Pdf.
+  
+  How to Use:
+  • Open any layout view.
+  • Run "Linked Pdf".
+  • The tool exports host and linked elements without any distorted hatch patterns into a single Pdf export.
