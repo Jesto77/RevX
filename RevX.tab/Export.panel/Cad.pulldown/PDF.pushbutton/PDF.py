@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Export PDF (with Flattened Patterns)
+Export PDF (with Flattened Patterns + Titleblock Support)
 For each selected plan view: creates a temporary view, flattens shape-edited
 slabs to eliminate distorted patterns and triangulation lines, then exports
-directly to PDF matching the view name. Preset A1 / Landscape / Color.
+directly to PDF matching the view name. Optionally places view on a temporary
+sheet with selected titleblock and fits view automatically.
 Author: Jesto Joy (Modified for PDF)
 """
 
@@ -43,7 +44,7 @@ for optional_cat in [
         pass
 
 TEMP_PDF_SUFFIX = "_TMP_PDF_EXP"
-
+TEMP_SHEET_PREFIX = "TMP_PDF_SHEET_"
 
 # -----------------------------------------------------------------------------
 # COMPATIBILITY & HELPERS
@@ -176,7 +177,6 @@ def detach_view_template(view):
 
 
 def prepare_overlay_view(source_view, target_view):
-    """Duplicates overrides, crop settings, scale, filters, and phases from source view."""
     try:
         target_view.Scale = source_view.Scale
         target_view.DisplayStyle = source_view.DisplayStyle
@@ -187,7 +187,6 @@ def prepare_overlay_view(source_view, target_view):
     except Exception:
         pass
 
-    # Copy view filters
     try:
         filters = source_view.GetFilters()
         if filters:
@@ -205,7 +204,6 @@ def prepare_overlay_view(source_view, target_view):
     except Exception:
         pass
 
-    # Copy Category-level Overrides
     try:
         for cat in doc.Settings.Categories:
             try:
@@ -217,7 +215,6 @@ def prepare_overlay_view(source_view, target_view):
     except Exception:
         pass
 
-    # Copy Element-level Overrides
     try:
         collector = DB.FilteredElementCollector(doc, source_view.Id)\
                       .WhereElementIsNotElementType()
@@ -231,7 +228,6 @@ def prepare_overlay_view(source_view, target_view):
     except Exception:
         pass
 
-    # Phase Settings
     for param_id in [DB.BuiltInParameter.VIEW_PHASE, DB.BuiltInParameter.VIEW_PHASE_FILTER]:
         try:
             p_source = source_view.get_Parameter(param_id)
@@ -287,7 +283,6 @@ def validate_pattern_categories(document, bic_list):
 
 
 def get_safe_paper_format(selected_paper):
-    """Dynamically looks up matching Revit API ExportPaperFormat enums to prevent TypeErrors."""
     candidates_map = {
         "A0": ["ISO_A0", "A0"],
         "A1": ["ISO_A1", "A1"],
@@ -298,16 +293,132 @@ def get_safe_paper_format(selected_paper):
         "Legal": ["Legal", "NorthAmericanLegal"],
         "Ledger/Tabloid": ["ANSI_B", "Tabloid", "Ledger"]
     }
-    
     names = candidates_map.get(selected_paper, ["ISO_A1"])
     for name in names:
         if hasattr(DB.ExportPaperFormat, name):
             return getattr(DB.ExportPaperFormat, name)
-            
-    # Universal fallbacks
     if hasattr(DB.ExportPaperFormat, "Default"):
         return DB.ExportPaperFormat.Default
     return list(DB.ExportPaperFormat.GetValues(DB.ExportPaperFormat))[0]
+
+
+# -----------------------------------------------------------------------------
+# HELPERS - TITLEBLOCK
+# -----------------------------------------------------------------------------
+
+def collect_titleblocks(document):
+    """Returns list of tuples (display_name, FamilySymbol) for all TB types."""
+    tbs = []
+    collector = DB.FilteredElementCollector(document)\
+                  .OfCategory(DB.BuiltInCategory.OST_TitleBlocks)\
+                  .WhereElementIsElementType()
+    for tb in collector:
+        try:
+            fam_name = tb.Family.Name
+            type_name = tb.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
+            display = "{} : {}".format(fam_name, type_name)
+            tbs.append((display, tb))
+        except Exception:
+            pass
+    tbs.sort(key=lambda x: x[0].lower())
+    return tbs
+
+
+def get_titleblock_size(tb_symbol):
+    """Returns (width, height) in feet from titleblock family symbol parameters."""
+    try:
+        width_p = tb_symbol.get_Parameter(DB.BuiltInParameter.SHEET_WIDTH)
+        height_p = tb_symbol.get_Parameter(DB.BuiltInParameter.SHEET_HEIGHT)
+        if width_p and height_p:
+            return (width_p.AsDouble(), height_p.AsDouble())
+    except Exception:
+        pass
+    return (2.75, 1.94)  # ~A1 default fallback
+
+
+def create_temp_sheet_with_view(document, source_view_id, tb_symbol, sheet_name):
+    """Creates a temporary sheet, places the view fit-to-sheet, returns sheet."""
+    if not tb_symbol.IsActive:
+        tb_symbol.Activate()
+        document.Regenerate()
+
+    sheet = DB.ViewSheet.Create(document, tb_symbol.Id)
+
+    try:
+        sheet.Name = sheet_name
+    except Exception:
+        pass
+    
+    import time
+    unique_suffix = str(int(time.time() * 1000))[-6:]
+    try:
+        sheet.SheetNumber = "TMP-" + unique_suffix
+    except Exception:
+        pass
+
+    tb_width, tb_height = get_titleblock_size(tb_symbol)
+    center = DB.XYZ(tb_width / 2.0, tb_height / 2.0, 0)
+
+    view_to_place = document.GetElement(source_view_id)
+    viewport = None
+    try:
+        viewport = DB.Viewport.Create(document, sheet.Id, source_view_id, center)
+    except Exception:
+        pass
+
+    if viewport and view_to_place:
+        try:
+            fit_view_to_sheet(document, view_to_place, viewport, tb_width, tb_height)
+        except Exception:
+            pass
+
+    return sheet, viewport
+
+
+def fit_view_to_sheet(document, view, viewport, sheet_width_ft, sheet_height_ft):
+    """Adjusts view scale so it fits nicely on sheet with margins."""
+    try:
+        crop = view.CropBox
+        if crop is None:
+            return
+
+        model_w = abs(crop.Max.X - crop.Min.X)
+        model_h = abs(crop.Max.Y - crop.Min.Y)
+        if model_w <= 0 or model_h <= 0:
+            return
+
+        usable_w = sheet_width_ft * 0.80
+        usable_h = sheet_height_ft * 0.80
+
+        scale_w = model_w / usable_w
+        scale_h = model_h / usable_h
+        best_scale = max(scale_w, scale_h)
+
+        standard_scales = [1, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000]
+        chosen = standard_scales[-1]
+        for s in standard_scales:
+            if s >= best_scale:
+                chosen = s
+                break
+
+        try:
+            view.Scale = int(chosen)
+        except Exception:
+            pass
+
+        document.Regenerate()
+
+        try:
+            sheet = document.GetElement(viewport.SheetId)
+            new_center = DB.XYZ(sheet_width_ft / 2.0, sheet_height_ft / 2.0, 0)
+            box_center = viewport.GetBoxCenter()
+            move_vec = new_center - box_center
+            DB.ElementTransformUtils.MoveElement(document, viewport.Id, move_vec)
+        except Exception:
+            pass
+
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -315,31 +426,44 @@ def get_safe_paper_format(selected_paper):
 # -----------------------------------------------------------------------------
 
 class PDFSettingsForm(forms.WPFWindow):
-    """Single-dialog PDF settings form: paper size, orientation, color mode."""
-
-    def __init__(self, xaml_source):
+    def __init__(self, xaml_source, titleblock_options):
         forms.WPFWindow.__init__(self, xaml_source)
-        # Preload combo values
+        self._titleblock_options = titleblock_options
+
         self.paper_combo.ItemsSource = [
             "A0", "A1", "A2", "A3", "A4",
             "Letter", "Legal", "Ledger/Tabloid"
         ]
         self.orient_combo.ItemsSource = ["Landscape", "Portrait"]
         self.color_combo.ItemsSource = ["Color", "GrayScale", "BlackLine"]
+        self.fit_combo.ItemsSource = ["Fit to Page", "Zoom 100%", "Zoom 75%", "Zoom 50%"]
+
+        tb_display_names = ["<None - Export view directly>"] + [t[0] for t in titleblock_options]
+        self.tb_combo.ItemsSource = tb_display_names
 
         # Preset defaults
         self.paper_combo.SelectedItem = "A1"
         self.orient_combo.SelectedItem = "Landscape"
         self.color_combo.SelectedItem = "Color"
+        self.fit_combo.SelectedItem = "Fit to Page"
+        self.tb_combo.SelectedIndex = 0
 
         self.result = None
 
     # pylint: disable=unused-argument
     def ok_click(self, sender, args):
+        tb_idx = self.tb_combo.SelectedIndex
+        selected_tb = None
+        if tb_idx > 0:
+            selected_tb = self._titleblock_options[tb_idx - 1][1]
+
         self.result = {
             "paper": self.paper_combo.SelectedItem,
             "orient": self.orient_combo.SelectedItem,
             "color": self.color_combo.SelectedItem,
+            "fit": self.fit_combo.SelectedItem,
+            "titleblock": selected_tb,
+            "tb_display": self.tb_combo.SelectedItem,
         }
         self.Close()
 
@@ -352,12 +476,16 @@ PDF_SETTINGS_XAML = """
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="PDF Export Settings"
-        Height="260" Width="340"
+        Height="430" Width="400"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         SizeToContent="Manual">
     <Grid Margin="15">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -377,24 +505,27 @@ PDF_SETTINGS_XAML = """
         <TextBlock Grid.Row="4" Text="Color Mode:" FontWeight="Bold" Margin="0,0,0,3"/>
         <ComboBox Grid.Row="5" x:Name="color_combo" Margin="0,0,0,10" Height="26"/>
 
-        <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Content="Export" Width="80" Height="28" Margin="0,0,8,0"
-                    Click="ok_click" IsDefault="True"/>
-            <Button Content="Cancel" Width="80" Height="28"
-                    Click="cancel_click" IsCancel="True"/>
+        <TextBlock Grid.Row="6" Text="Fit / Zoom:" FontWeight="Bold" Margin="0,0,0,3"/>
+        <ComboBox Grid.Row="7" x:Name="fit_combo" Margin="0,0,0,10" Height="26"/>
+
+        <TextBlock Grid.Row="8" Text="Titleblock (auto-fit view inside):" FontWeight="Bold" Margin="0,0,0,3"/>
+        <ComboBox Grid.Row="9" x:Name="tb_combo" Margin="0,0,0,10" Height="26"/>
+
+        <StackPanel Grid.Row="11" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="Export" Width="80" Height="28" Margin="0,0,8,0" Click="ok_click" IsDefault="True"/>
+            <Button Content="Cancel" Width="80" Height="28" Click="cancel_click" IsCancel="True"/>
         </StackPanel>
     </Grid>
 </Window>
 """
 
 
-def show_pdf_settings_dialog():
-    """Show single dialog for PDF settings. Returns dict or None."""
+def show_pdf_settings_dialog(titleblock_options):
     import tempfile
     tmp_path = os.path.join(tempfile.gettempdir(), "pdf_settings_form.xaml")
     with open(tmp_path, "w") as f:
         f.write(PDF_SETTINGS_XAML)
-    form = PDFSettingsForm(tmp_path)
+    form = PDFSettingsForm(tmp_path, titleblock_options)
     form.ShowDialog()
     try:
         os.remove(tmp_path)
@@ -413,7 +544,6 @@ def main():
         output.print_md("**Stopped:** Standard pattern categories could not be resolved.")
         return
 
-    # Select Views
     selected_views = forms.select_views(
         title="Select plan views to export as PDF",
         filterfunc=lambda v: isinstance(v, DB.ViewPlan) and not v.IsTemplate
@@ -422,14 +552,14 @@ def main():
         output.print_md("**Stopped:** No views selected.")
         return
 
-    # Target Folder
     folder = forms.pick_folder(title="Choose export folder")
     if not folder:
         output.print_md("**Stopped:** No export folder selected.")
         return
 
-    # Single PDF Settings Dialog (preset A1 / Landscape / Color)
-    settings = show_pdf_settings_dialog()
+    titleblock_options = collect_titleblocks(doc)
+
+    settings = show_pdf_settings_dialog(titleblock_options)
     if not settings:
         output.print_md("**Stopped:** PDF settings cancelled.")
         return
@@ -437,10 +567,13 @@ def main():
     selected_paper = settings["paper"]
     selected_orient = settings["orient"]
     selected_color = settings["color"]
+    selected_fit = settings["fit"]
+    selected_tb = settings["titleblock"]
+    tb_display = settings["tb_display"]
 
     output.print_md(
-        "**PDF Settings chosen:** Size: {} | Orientation: {} | Palette: {}".format(
-            selected_paper, selected_orient, selected_color))
+        "**PDF Settings:** {} | {} | {} | {} | TB: {}".format(
+            selected_paper, selected_orient, selected_color, selected_fit, tb_display))
 
     for source_view in selected_views:
         base_name = safe_filename(source_view.Name)
@@ -448,9 +581,11 @@ def main():
         copied_elements_map = []
         temp_ids = []
         temp_view = None
+        temp_sheet = None
+        temp_viewport = None
 
         try:
-            # Step 1: Duplicate view and flatten shape-edited slabs
+            # Step 1: Prep flat view
             with revit.Transaction("Prep View Slabs: " + source_view.Name):
                 temp_view = duplicate_view(source_view, source_view.Name + TEMP_PDF_SUFFIX)
                 detach_view_template(temp_view)
@@ -521,28 +656,53 @@ def main():
                         except Exception:
                             pass
 
-                temp_ids = [temp_view.Id] + [c_id for _, c_id in copied_elements_map if c_id in flat_copies]
+                temp_ids = [c_id for _, c_id in copied_elements_map if c_id in flat_copies]
                 doc.Regenerate()
 
-            # Step 2: Export Clean View directly to PDF
+            # Step 2: If TB selected, create temp sheet
+            export_target_view_id = temp_view.Id
+            if selected_tb is not None:
+                with revit.Transaction("Create Temp Sheet: " + source_view.Name):
+                    try:
+                        temp_sheet, temp_viewport = create_temp_sheet_with_view(
+                            doc, temp_view.Id, selected_tb,
+                            TEMP_SHEET_PREFIX + base_name)
+                        if temp_sheet is not None:
+                            export_target_view_id = temp_sheet.Id
+                    except Exception:
+                        output.print_md("Warning: Failed to create temp sheet — exporting view directly.")
+                        output.print_code(traceback.format_exc())
+
+            # Step 3: PDF Export config
             pdf_opts = DB.PDFExportOptions()
             pdf_opts.Combine = False
             pdf_opts.FileName = base_name
 
-            # Setup options within try-catch blocks to guarantee execution across versions
             try:
                 pdf_opts.RasterQuality = DB.RasterQualityType.Presentation
             except Exception:
                 pass
+
+            # Fit / Zoom mode
             try:
-                pdf_opts.ZoomType = DB.ZoomType.Zoom
-                pdf_opts.ZoomPercentage = 100
+                fit_map = {
+                    "Fit to Page": (DB.ZoomType.FitToPage, 100),
+                    "Zoom 100%": (DB.ZoomType.Zoom, 100),
+                    "Zoom 75%": (DB.ZoomType.Zoom, 75),
+                    "Zoom 50%": (DB.ZoomType.Zoom, 50),
+                }
+                zt, zp = fit_map.get(selected_fit, (DB.ZoomType.FitToPage, 100))
+                pdf_opts.ZoomType = zt
+                if zt == DB.ZoomType.Zoom:
+                    pdf_opts.ZoomPercentage = zp
             except Exception:
                 pass
+
             try:
                 pdf_opts.PaperPlacement = DB.PaperPlacementType.Center
             except Exception:
                 pass
+
             try:
                 pdf_opts.HideCropBoundaries = True
                 pdf_opts.HideReferencePlane = True
@@ -551,13 +711,11 @@ def main():
             except Exception:
                 pass
 
-            # Safe Paper format configuration (prevents AttributeError)
             try:
                 pdf_opts.PaperFormat = get_safe_paper_format(selected_paper)
             except Exception:
                 pass
 
-            # Orientation
             try:
                 if selected_orient == "Portrait":
                     pdf_opts.PaperOrientation = DB.PageOrientationType.Portrait
@@ -566,7 +724,6 @@ def main():
             except Exception:
                 pass
 
-            # Color Configuration
             try:
                 color_map = {
                     "Color": DB.ColorDepthType.Color,
@@ -577,33 +734,32 @@ def main():
             except Exception:
                 pass
 
-            # Native Revit PDF Export Call
             export_view_ids = List[DB.ElementId]()
-            export_view_ids.Add(temp_view.Id)
-
+            export_view_ids.Add(export_target_view_id)
             doc.Export(folder, export_view_ids, pdf_opts)
 
             final_target_pdf = os.path.join(folder, base_name + ".pdf")
             if os.path.exists(final_target_pdf):
-                output.print_md("**{}**: PDF exported successfully: `{}`".format(
-                    source_view.Name, final_target_pdf))
+                output.print_md("**{}**: PDF exported: `{}`".format(source_view.Name, final_target_pdf))
             else:
-                output.print_md("**{}**: Export finished. Check folder: `{}`".format(
-                    source_view.Name, folder))
+                output.print_md("**{}**: Export finished. Check folder: `{}`".format(source_view.Name, folder))
 
         except Exception:
             output.print_md("**{}**: PDF Export FAILED —".format(source_view.Name))
             output.print_code(traceback.format_exc())
 
         finally:
-            # Step 3: Clean up temporary flat components and cloned views
-            all_to_delete = list(temp_ids) + [
-                c_id for _, c_id in copied_elements_map
-                if c_id not in flat_copies
-            ]
-            if all_to_delete:
+            # Cleanup temp sheet + viewport
+            cleanup_ids = []
+            if temp_sheet is not None:
+                cleanup_ids.append(temp_sheet.Id)
+            if temp_view is not None:
+                cleanup_ids.append(temp_view.Id)
+            cleanup_ids.extend(temp_ids)
+
+            if cleanup_ids:
                 with revit.Transaction("Clean up Temp PDF Objects: " + source_view.Name):
-                    for eid in all_to_delete:
+                    for eid in cleanup_ids:
                         try:
                             doc.Delete(eid)
                         except Exception:
