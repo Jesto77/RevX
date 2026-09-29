@@ -1,0 +1,12 @@
+title: "Fill Pattern"
+author: "Jesto Joy"
+tooltip: |
+  Add preset / create custom Model fill patterns (staggered & uniform) in the project
+  How to Use:
+  • Click "Fill Pattern".
+  • In the "Add" tab, tick the patterns you need. Staggered is on the left, Uniform on the right (sizes are Width x Height in mm: 200 to 600 wide, up to 1200 high).
+  • Or open the "Create" tab, enter a custom Width and Height, and choose Staggered, Uniform or Both.
+  • Keep "Overwrite existing patterns" ticked to update patterns that already exist in the project.
+  • Click "Add Selected" or "Create Pattern".
+  • Apply the new patterns as Model patterns in your Floor, Wall or Material types.
+ 

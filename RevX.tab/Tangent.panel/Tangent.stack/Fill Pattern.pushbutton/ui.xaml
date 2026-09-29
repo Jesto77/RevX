@@ -1,0 +1,112 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Model Fill Patterns" Width="640" Height="620"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanResize"
+        Background="#F5F6F8" FontFamily="Segoe UI" FontSize="13">
+    <Window.Resources>
+        <DataTemplate x:Key="item_tpl">
+            <Grid Margin="4,3">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <CheckBox Grid.Column="0" Content="{Binding Label}"
+                          IsChecked="{Binding Checked, Mode=TwoWay}"/>
+                <TextBlock Grid.Column="1" Text="{Binding Status}" Foreground="#B26A00" FontSize="11"/>
+            </Grid>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TabControl Grid.Row="0">
+            <!-- ============================ ADD ============================ -->
+            <TabItem Header="  Add  ">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <!-- headers -->
+                    <DockPanel Grid.Row="0" Grid.Column="0" Margin="0,0,0,6">
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Content="All" Width="40" Click="stag_all"/>
+                            <Button Content="None" Width="44" Margin="4,0,0,0" Click="stag_none"/>
+                        </StackPanel>
+                        <TextBlock Text="Staggered" FontWeight="SemiBold" FontSize="15"/>
+                    </DockPanel>
+                    <DockPanel Grid.Row="0" Grid.Column="2" Margin="0,0,0,6">
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Content="All" Width="40" Click="uni_all"/>
+                            <Button Content="None" Width="44" Margin="4,0,0,0" Click="uni_none"/>
+                        </StackPanel>
+                        <TextBlock Text="Uniform" FontWeight="SemiBold" FontSize="15"/>
+                    </DockPanel>
+
+                    <!-- lists -->
+                    <Border Grid.Row="1" Grid.Column="0" Background="White" BorderBrush="#D0D3D9" BorderThickness="1">
+                        <ListBox x:Name="staggered_list" BorderThickness="0"
+                                 ItemTemplate="{StaticResource item_tpl}"
+                                 HorizontalContentAlignment="Stretch"/>
+                    </Border>
+                    <Border Grid.Row="1" Grid.Column="2" Background="White" BorderBrush="#D0D3D9" BorderThickness="1">
+                        <ListBox x:Name="uniform_list" BorderThickness="0"
+                                 ItemTemplate="{StaticResource item_tpl}"
+                                 HorizontalContentAlignment="Stretch"/>
+                    </Border>
+
+                    <DockPanel Grid.Row="2" Grid.ColumnSpan="3" Margin="0,10,0,0">
+                        <Button DockPanel.Dock="Right" Content="Add Selected" Width="130" Height="32"
+                                Background="#2E7D32" Foreground="White" FontWeight="SemiBold"
+                                Click="add_click"/>
+                        <TextBlock x:Name="count_text" VerticalAlignment="Center" Foreground="#666"
+                                   Text="Sizes are Width x Height in mm."/>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <!-- =========================== CREATE ========================== -->
+            <TabItem Header="  Create  ">
+                <StackPanel Margin="16">
+                    <TextBlock Text="Custom pattern" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,10"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <TextBlock Text="Width (mm)" Width="90" VerticalAlignment="Center"/>
+                        <TextBox x:Name="custom_w" Width="90" Text="200" TextChanged="custom_changed"/>
+                        <TextBlock Text="Height (mm)" Width="90" Margin="20,0,0,0" VerticalAlignment="Center"/>
+                        <TextBox x:Name="custom_h" Width="90" Text="200" TextChanged="custom_changed"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <TextBlock Text="Type" Width="90" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="custom_type" Width="140" SelectedIndex="0"
+                                  SelectionChanged="custom_type_changed">
+                            <ComboBoxItem Content="Staggered"/>
+                            <ComboBoxItem Content="Uniform"/>
+                            <ComboBoxItem Content="Both"/>
+                        </ComboBox>
+                    </StackPanel>
+                    <TextBlock x:Name="custom_preview" Foreground="#555" Margin="0,4,0,16" TextWrapping="Wrap"/>
+                    <Button Content="Create Pattern" Width="140" Height="32" HorizontalAlignment="Left"
+                            Background="#1565C0" Foreground="White" FontWeight="SemiBold"
+                            Click="create_click"/>
+                </StackPanel>
+            </TabItem>
+        </TabControl>
+
+        <DockPanel Grid.Row="1" Margin="0,12,0,0">
+            <Button DockPanel.Dock="Right" Content="Close" Width="80" Height="28" Click="close_click"/>
+            <CheckBox x:Name="overwrite_chk" Content="Overwrite existing patterns with the same name"
+                      IsChecked="True" VerticalAlignment="Center"/>
+        </DockPanel>
+    </Grid>
+</Window>
