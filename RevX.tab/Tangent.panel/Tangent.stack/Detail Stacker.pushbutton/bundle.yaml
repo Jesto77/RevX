@@ -1,0 +1,20 @@
+title: "Detail Stacker"
+author: "Jesto Joy"
+tooltip: |
+Stacks Filled Regions and Detail Components along a multi-point path, with editable layer heights and reusable presets.
+
+How to Use:
+• Open a supported Detail, Drafting, Section, Elevation, Floor Plan, Ceiling Plan, or Engineering Plan view.
+• Click "Detail Stacker".
+• Select Filled Regions and/or Detail Components from the Available Items list.
+• Set the default height for Filled Regions and click "Add Selected".
+• Arrange the stack in Top-to-Bottom order using UP, DN, Copy, Del, or Clear.
+• Edit H(mm) values in the Stack Order list when required.
+• Optionally save the stack as a preset for reuse, or load an existing preset.
+• Click "PLACE STACK".
+• Pick two or more points along the TOP path of the detail stack.
+• Continue picking points to create a multi-point/bent path.
+• Press ESC when finished.
+• The layers are placed downward from the picked path with no gaps.
+• Filled Region layer ends are created with vertical start and end cuts.
+• Detail Components are automatically placed and aligned along the path.
