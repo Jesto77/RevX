@@ -11,7 +11,7 @@ Features:
 - FILLED REGIONS ALWAYS HAVE VERTICAL START AND END CUTS
 """
 
-__title__ = "Detail\nStacker"
+__title__ = "Detail\nStack"
 __author__ = "Jesto Joy"
 
 import clr
