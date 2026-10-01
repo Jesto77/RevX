@@ -1,0 +1,14 @@
+title: "Planter Fill"
+author: "Jesto Joy"
+tooltip: |
+  Fills a planter cavity with the 026 Filled Region and places the 005, 006 and 008 detail items waterproofing in it.
+
+  How to Use:
+  • Open the Detail / Drafting / Section view that contains the planter detail.
+  • Click "Planter Fill".
+  • Click once INSIDE the soil area (the cavity) of the planter - not on a line.
+  • Everything is created in one step, so a single Undo removes it all.
+
+  Requirements:
+  • A Filled Region type with "026" in its name.
+  • Line-based detail items with "005", "006" and "008" in their family or type name.
