@@ -150,10 +150,25 @@ def _seg_cross(p, q, r, s):
     return (d1 * d2 < -1e-12) and (d3 * d4 < -1e-12)
 
 
+def _seg_overlap(p, q, r, s_):
+    """Collinear segments that share a stretch (two leaders lying on top of each other)."""
+    if abs(_orient(p, q, r)) > 1e-9 or abs(_orient(p, q, s_)) > 1e-9:
+        return False
+    if abs(q[0] - p[0]) >= abs(q[1] - p[1]):
+        a0, a1 = sorted((p[0], q[0]))
+        b0, b1 = sorted((r[0], s_[0]))
+    else:
+        a0, a1 = sorted((p[1], q[1]))
+        b0, b1 = sorted((r[1], s_[1]))
+    return min(a1, b1) - max(a0, b0) > 1e-6
+
+
 def polys_cross(pa, pb):
     for a in range(len(pa) - 1):
         for b in range(len(pb) - 1):
             if _seg_cross(pa[a], pa[a + 1], pb[b], pb[b + 1]):
+                return True
+            if _seg_overlap(pa[a], pa[a + 1], pb[b], pb[b + 1]):
                 return True
     return False
 
@@ -165,6 +180,67 @@ def count_crossings(polys):
             if polys_cross(polys[i], polys[j]):
                 n += 1
     return n
+
+
+def _layout_given(items, slot_of, xc, picked_ax, x_offset):
+    """Tag y positions come from slot_of (index -> y). Computes attach points (staircase to the
+    left, one step per tag) and the leader polylines. Returns the number of crossings."""
+    n = len(items)
+    for i, it in enumerate(items):
+        it["ty"] = slot_of[i]
+
+    items_by_y = sorted(items, key=lambda it: -it["ty"])
+    current_ax = picked_ax
+    pen_y = 0.3 * x_offset  # about 0.24 * h
+    pen_x = 1.0 * x_offset  # about 0.8 * h
+
+    for rank, it in enumerate(items_by_y):
+        ty = it["ty"]
+        y_min, y_max = it["y_min"], it["y_max"]
+
+        safe_y_min = y_min + pen_y
+        safe_y_max = y_max - pen_y
+        if safe_y_max < safe_y_min:
+            safe_y_min = safe_y_max = (y_min + y_max) / 2.0
+
+        if safe_y_min <= ty <= safe_y_max:
+            is_straight = True
+            ay = ty
+        elif ty > safe_y_max:
+            is_straight = False
+            ay = safe_y_max
+        else:
+            is_straight = False
+            ay = safe_y_min
+
+        x0, x1 = get_x_range_at_y(it["segs"], ay)
+
+        safe_x_min = x0 + pen_x
+        safe_x_max = x1 - pen_x
+        if safe_x_max < safe_x_min:
+            safe_x_min = safe_x_max = (x0 + x1) / 2.0
+
+        target_ax = current_ax - x_offset
+        if target_ax > safe_x_max:
+            target_ax = safe_x_max
+        elif target_ax < safe_x_min:
+            target_ax = safe_x_min
+
+        it["ax"] = target_ax
+        it["ay"] = ay
+        current_ax = target_ax
+
+        if is_straight:
+            it["poly"] = [(xc, ty), (target_ax, ty)]
+        else:
+            it["poly"] = [(xc, ty), (target_ax, ty), (target_ax, ay)]
+
+    return count_crossings([it["poly"] for it in items])
+
+
+def _poly_length(poly):
+    return sum(math.hypot(poly[k + 1][0] - poly[k][0], poly[k + 1][1] - poly[k][1])
+               for k in range(len(poly) - 1))
 
 
 def assign_slots(items, slots, xc, picked_ax, x_offset):
@@ -179,64 +255,43 @@ def assign_slots(items, slots, xc, picked_ax, x_offset):
             it["y_min"] = it["ay"]
             it["y_max"] = it["ay"]
             it["ny"] = it["ay"]
-            
-    # Strictly preserve top-to-bottom layout by matching sorted elements directly to sorted slots.
-    # This prevents leader lines from crossing or having overly long diagonals.
+
+    # Start: top-to-bottom order of the elements matched to the slots top-to-bottom.
     order = sorted(range(n), key=lambda i: -items[i]["ny"])
-    slot_of = {}
+    best = {}
     for rank, i in enumerate(order):
-        slot_of[i] = slots[rank]
+        best[i] = slots[rank]
 
-    for i, it in enumerate(items):
-        it["ty"] = slot_of[i]
-        
-    items_by_y = sorted(items, key=lambda it: -it["ty"])
-    current_ax = picked_ax
-    pen_y = 0.3 * x_offset  # about 0.24 * h
-    pen_x = 1.0 * x_offset  # about 0.8 * h
-    
-    for rank, it in enumerate(items_by_y):
-        ty = it["ty"]
-        y_min, y_max = it["y_min"], it["y_max"]
-        
-        safe_y_min = y_min + pen_y
-        safe_y_max = y_max - pen_y
-        if safe_y_max < safe_y_min:
-            safe_y_min = safe_y_max = (y_min + y_max) / 2.0
-            
-        if safe_y_min <= ty <= safe_y_max:
-            is_straight = True
-            ay = ty
-        elif ty > safe_y_max:
-            is_straight = False
-            ay = safe_y_max
-        else:
-            is_straight = False
-            ay = safe_y_min
+    crossings = _layout_given(items, best, xc, picked_ax, x_offset)
+    if crossings == 0:
+        return 0
 
-        x0, x1 = get_x_range_at_y(it["segs"], ay)
-        
-        safe_x_min = x0 + pen_x
-        safe_x_max = x1 - pen_x
-        if safe_x_max < safe_x_min:
-            safe_x_min = safe_x_max = (x0 + x1) / 2.0
-            
-        target_ax = current_ax - x_offset
-        if target_ax > safe_x_max:
-            target_ax = safe_x_max
-        elif target_ax < safe_x_min:
-            target_ax = safe_x_min
-            
-        it["ax"] = target_ax
-        it["ay"] = ay
-        current_ax = target_ax
-        
-        if is_straight:
-            it["poly"] = [(xc, ty), (target_ax, ty)]
-        else:
-            it["poly"] = [(xc, ty), (target_ax, ty), (target_ax, ay)]
+    # Leaders clash: swap tag positions, changing as little as possible. A crossing / overlap
+    # counts far more than anything else; among equal results the one that moves the fewest
+    # tags (smallest total shift in the top-to-bottom order) wins.
+    slot_rank = dict((slots[k], k) for k in range(n))
+    start_rank = dict((i, slot_rank[best[i]]) for i in range(n))
 
-    return 0
+    def cost(assign):
+        shift = sum(abs(slot_rank[assign[i]] - start_rank[i]) for i in range(n))
+        return (count_crossings([it["poly"] for it in items]) * 1.0e6 + shift)
+
+    best_cost = cost(best)
+    for _ in range(30):
+        improved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                trial = dict(best)
+                trial[i], trial[j] = trial[j], trial[i]
+                _layout_given(items, trial, xc, picked_ax, x_offset)
+                c = cost(trial)
+                if c < best_cost - 1e-9:
+                    best_cost = c
+                    best = trial
+                    improved = True
+        if not improved:
+            break
+    return _layout_given(items, best, xc, picked_ax, x_offset)
 
 
 # =============================================================================
