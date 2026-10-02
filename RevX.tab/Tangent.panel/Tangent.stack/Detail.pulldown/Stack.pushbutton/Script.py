@@ -5,13 +5,13 @@ Features:
 - Pick 2+ points forming a polyline (ESC to finish)
 - Layers stack downward from the path (Top → Bottom order)
 - No gaps between layers
-- Local segment alignment (prevents DC stepping/misplacement)
-- Save/Load presets, left-to-right auto-correct
-- Compatible with all Revit versions
+- WATERPROOFING: type-to-filter dropdown (001-009 DCs), click to assign
+- Local segment alignment
+- Save/Load presets with overwrite or save-as-new
 - FILLED REGIONS ALWAYS HAVE VERTICAL START AND END CUTS
 """
 
-__title__ = "Stack"
+__title__ = "Detail\nStacker"
 __author__ = "Jesto Joy"
 
 import clr
@@ -31,11 +31,12 @@ from Autodesk.Revit.DB.Structure import StructuralType
 from System.Collections.Generic import List
 from System.Windows.Forms import (
     Form, Label, TextBox, Button, ComboBox, CheckedListBox, DataGridView,
-    DataGridViewTextBoxColumn, Panel, GroupBox, MessageBox,
+    DataGridViewTextBoxColumn, DataGridViewComboBoxColumn, Panel, GroupBox, MessageBox,
     MessageBoxButtons, MessageBoxIcon, DialogResult,
     FormStartPosition, AnchorStyles, FormBorderStyle,
     DataGridViewAutoSizeColumnMode, DataGridViewAutoSizeColumnsMode,
-    DataGridViewSelectionMode, FlatStyle, CheckBox, NumericUpDown
+    DataGridViewSelectionMode, FlatStyle, CheckBox, NumericUpDown,
+    ComboBoxStyle, AutoCompleteMode, AutoCompleteSource, Keys
 )
 from System.Drawing import Size, Point, Color, Font, FontStyle
 import System
@@ -120,6 +121,16 @@ def get_detail_component_types():
     return result
 
 
+def get_waterproofing_dc_names(detail_components):
+    """Only DCs whose name contains 001..009."""
+    valid_tags = ["001", "002", "003", "004", "005", "006", "007", "008", "009"]
+    names = []
+    for name in sorted(detail_components.keys()):
+        if any(tag in name for tag in valid_tags):
+            names.append(name)
+    return names
+
+
 # ============================================================
 # PRESETS
 # ============================================================
@@ -127,7 +138,10 @@ def get_detail_component_types():
 def save_preset(name, stack_items):
     data = [{'name': safe_str(i['name']),
              'type': safe_str(i['type']),
-             'height_mm': float(i['height_mm'])} for i in stack_items]
+             'height_mm': float(i['height_mm']),
+             'sub_dc_name': safe_str(i.get('sub_dc_name', '')),
+             'sub_offset_mm': float(i.get('sub_offset_mm', 0.0))
+             } for i in stack_items]
     safe_name = "".join(c for c in name if c not in r'<>:"/\|?*')
     filepath = System.IO.Path.Combine(PRESET_FOLDER, safe_name + '.json')
     try:
@@ -147,7 +161,10 @@ def load_preset(filepath):
         data = json.loads(safe_str(net_str))
         return [{'name': safe_str(e.get('name', '')),
                  'type': safe_str(e.get('type', '')),
-                 'height_mm': float(e.get('height_mm', 100))} for e in data]
+                 'height_mm': float(e.get('height_mm', 100)),
+                 'sub_dc_name': safe_str(e.get('sub_dc_name', '')),
+                 'sub_offset_mm': float(e.get('sub_offset_mm', 0.0))
+                 } for e in data]
     except Exception as ex:
         MessageBox.Show("Failed to load preset:\n{}".format(str(ex)),
                         "Load Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
@@ -185,18 +202,21 @@ class StackerForm(Form):
     def __init__(self):
         self.filled_regions = get_filled_region_types()
         self.detail_components = get_detail_component_types()
+        self.wp_dc_names = get_waterproofing_dc_names(self.detail_components)
         self.stack_items = []
         self.result = None
         self._current_items = []
+        self._wp_filtering = False          # guard against re-entrant filter
+        self._wp_edit_combo = None          # current editing combo ref
         self._setup_form()
         self._create_controls()
 
     def _setup_form(self):
         self.Text = "Detail Stacker - Layer Builder"
-        self.Size = Size(950, 820)
+        self.Size = Size(1280, 820)
         self.StartPosition = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.Sizable
-        self.MinimumSize = Size(850, 750)
+        self.MinimumSize = Size(1100, 750)
         self.BackColor = Color.FromArgb(245, 245, 250)
         self.Font = Font("Segoe UI", 9)
 
@@ -222,7 +242,7 @@ class StackerForm(Form):
         preset_group = GroupBox()
         preset_group.Text = "Presets"
         preset_group.Location = Point(15, 65)
-        preset_group.Size = Size(905, 55)
+        preset_group.Size = Size(1235, 55)
         preset_group.Font = Font("Segoe UI", 9, FontStyle.Bold)
         preset_group.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         self.Controls.Add(preset_group)
@@ -238,7 +258,7 @@ class StackerForm(Form):
         self.preset_combo.Location = Point(58, 20)
         self.preset_combo.Size = Size(250, 25)
         self.preset_combo.Font = Font("Segoe UI", 9)
-        self.preset_combo.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList
+        self.preset_combo.DropDownStyle = ComboBoxStyle.DropDownList
         preset_group.Controls.Add(self.preset_combo)
 
         self.btn_load_preset = Button()
@@ -272,13 +292,13 @@ class StackerForm(Form):
 
         self.preset_name_box = TextBox()
         self.preset_name_box.Location = Point(518, 20)
-        self.preset_name_box.Size = Size(250, 25)
+        self.preset_name_box.Size = Size(280, 25)
         self.preset_name_box.Font = Font("Segoe UI", 9)
         preset_group.Controls.Add(self.preset_name_box)
 
         self.btn_save_preset = Button()
         self.btn_save_preset.Text = "Save"
-        self.btn_save_preset.Location = Point(775, 19)
+        self.btn_save_preset.Location = Point(805, 19)
         self.btn_save_preset.Size = Size(60, 26)
         self.btn_save_preset.Font = Font("Segoe UI", 8, FontStyle.Bold)
         self.btn_save_preset.BackColor = Color.FromArgb(80, 160, 100)
@@ -289,7 +309,7 @@ class StackerForm(Form):
 
         self.btn_open_folder = Button()
         self.btn_open_folder.Text = "Folder"
-        self.btn_open_folder.Location = Point(840, 19)
+        self.btn_open_folder.Location = Point(870, 19)
         self.btn_open_folder.Size = Size(55, 26)
         self.btn_open_folder.Font = Font("Segoe UI", 7)
         self.btn_open_folder.BackColor = Color.FromArgb(160, 160, 180)
@@ -302,7 +322,7 @@ class StackerForm(Form):
         left_group = GroupBox()
         left_group.Text = "Available Items"
         left_group.Location = Point(15, 130)
-        left_group.Size = Size(420, 400)
+        left_group.Size = Size(400, 400)
         left_group.Font = Font("Segoe UI", 9, FontStyle.Bold)
         left_group.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom
         self.Controls.Add(left_group)
@@ -316,7 +336,7 @@ class StackerForm(Form):
 
         self.search_box = TextBox()
         self.search_box.Location = Point(65, 23)
-        self.search_box.Size = Size(340, 25)
+        self.search_box.Size = Size(320, 25)
         self.search_box.Font = Font("Segoe UI", 9)
         self.search_box.TextChanged += self._on_search_changed
         left_group.Controls.Add(self.search_box)
@@ -341,7 +361,7 @@ class StackerForm(Form):
 
         self.items_list = CheckedListBox()
         self.items_list.Location = Point(10, 80)
-        self.items_list.Size = Size(395, 230)
+        self.items_list.Size = Size(375, 230)
         self.items_list.Font = Font("Segoe UI", 9)
         self.items_list.CheckOnClick = True
         self.items_list.Anchor = (AnchorStyles.Top | AnchorStyles.Left |
@@ -370,7 +390,7 @@ class StackerForm(Form):
         self.btn_add = Button()
         self.btn_add.Text = "Add Selected  >>>"
         self.btn_add.Location = Point(10, 358)
-        self.btn_add.Size = Size(395, 32)
+        self.btn_add.Size = Size(375, 32)
         self.btn_add.Font = Font("Segoe UI", 10, FontStyle.Bold)
         self.btn_add.BackColor = Color.FromArgb(70, 130, 180)
         self.btn_add.ForeColor = Color.White
@@ -381,9 +401,10 @@ class StackerForm(Form):
 
         # ---- RIGHT ----
         right_group = GroupBox()
-        right_group.Text = "Stack Order (Top to Bottom)  -  Edit H(mm) to override Auto"
-        right_group.Location = Point(450, 130)
-        right_group.Size = Size(480, 400)
+        right_group.Text = ("Stack Order (Top to Bottom)  —  "
+                            "WATERPROOFING: type to filter list, then click a name")
+        right_group.Location = Point(430, 130)
+        right_group.Size = Size(820, 400)
         right_group.Font = Font("Segoe UI", 9, FontStyle.Bold)
         right_group.Anchor = (AnchorStyles.Top | AnchorStyles.Left |
                               AnchorStyles.Right | AnchorStyles.Bottom)
@@ -391,14 +412,14 @@ class StackerForm(Form):
 
         self.stack_grid = DataGridView()
         self.stack_grid.Location = Point(10, 25)
-        self.stack_grid.Size = Size(390, 330)
+        self.stack_grid.Size = Size(730, 330)
         self.stack_grid.Font = Font("Segoe UI", 9)
         self.stack_grid.AllowUserToAddRows = False
         self.stack_grid.AllowUserToDeleteRows = False
         self.stack_grid.ReadOnly = False
         self.stack_grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
         self.stack_grid.MultiSelect = False
-        self.stack_grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        self.stack_grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None
         self.stack_grid.RowHeadersVisible = False
         self.stack_grid.BackgroundColor = Color.White
         self.stack_grid.Anchor = (AnchorStyles.Top | AnchorStyles.Left |
@@ -414,31 +435,61 @@ class StackerForm(Form):
 
         col_name = DataGridViewTextBoxColumn()
         col_name.HeaderText = "Item Name"
+        col_name.Width = 150
         col_name.ReadOnly = True
+        col_name.MinimumWidth = 100
         col_name.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         self.stack_grid.Columns.Add(col_name)
 
         col_type = DataGridViewTextBoxColumn()
         col_type.HeaderText = "Type"
-        col_type.Width = 50
+        col_type.Width = 42
         col_type.ReadOnly = True
-        col_type.MinimumWidth = 45
+        col_type.MinimumWidth = 40
         col_type.AutoSizeMode = DataGridViewAutoSizeColumnMode.None
         self.stack_grid.Columns.Add(col_type)
 
         col_height = DataGridViewTextBoxColumn()
         col_height.HeaderText = "H(mm)"
-        col_height.Width = 65
+        col_height.Width = 55
         col_height.ReadOnly = False
-        col_height.MinimumWidth = 55
+        col_height.MinimumWidth = 50
         col_height.AutoSizeMode = DataGridViewAutoSizeColumnMode.None
         self.stack_grid.Columns.Add(col_height)
 
+        # WATERPROOFING — wide + type-to-filter dropdown
+        col_sub_dc = DataGridViewComboBoxColumn()
+        col_sub_dc.HeaderText = "WATERPROOFING  (type to filter, click to assign)"
+        col_sub_dc.Name = "col_wp"
+        col_sub_dc.Width = 340
+        col_sub_dc.MinimumWidth = 240
+        col_sub_dc.AutoSizeMode = DataGridViewAutoSizeColumnMode.None
+        col_sub_dc.FlatStyle = FlatStyle.Flat
+        col_sub_dc.DisplayStyle = System.Windows.Forms.DataGridViewComboBoxDisplayStyle.ComboBox
+        col_sub_dc.DisplayStyleForCurrentCellOnly = True
+        # Items start with full WP list (filter happens on the editing control)
+        col_sub_dc.Items.Add("")
+        for dc_name in self.wp_dc_names:
+            col_sub_dc.Items.Add(dc_name)
+        self.stack_grid.Columns.Add(col_sub_dc)
+
+        col_sub_off = DataGridViewTextBoxColumn()
+        col_sub_off.HeaderText = "Offset(mm)"
+        col_sub_off.Width = 75
+        col_sub_off.ReadOnly = False
+        col_sub_off.MinimumWidth = 65
+        col_sub_off.AutoSizeMode = DataGridViewAutoSizeColumnMode.None
+        self.stack_grid.Columns.Add(col_sub_off)
+
         self.stack_grid.CellEndEdit += self._on_cell_edit
+        self.stack_grid.CurrentCellDirtyStateChanged += self._on_combo_dirty
+        self.stack_grid.EditingControlShowing += self._on_editing_control_showing
+        self.stack_grid.CellBeginEdit += self._on_cell_begin_edit
+        self.stack_grid.DataError += self._on_grid_error
         right_group.Controls.Add(self.stack_grid)
 
         btn_panel = Panel()
-        btn_panel.Location = Point(405, 25)
+        btn_panel.Location = Point(745, 25)
         btn_panel.Size = Size(65, 330)
         btn_panel.Anchor = AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom
         right_group.Controls.Add(btn_panel)
@@ -496,7 +547,7 @@ class StackerForm(Form):
         self.total_label = Label()
         self.total_label.Text = "Total Height: 0 mm"
         self.total_label.Location = Point(10, 365)
-        self.total_label.Size = Size(390, 25)
+        self.total_label.Size = Size(500, 25)
         self.total_label.Font = Font("Segoe UI", 10, FontStyle.Bold)
         self.total_label.ForeColor = Color.FromArgb(50, 50, 120)
         self.total_label.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
@@ -505,24 +556,27 @@ class StackerForm(Form):
         # ---- BOTTOM ----
         bottom_panel = Panel()
         bottom_panel.Location = Point(15, 540)
-        bottom_panel.Size = Size(910, 55)
+        bottom_panel.Size = Size(1235, 55)
         bottom_panel.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
         self.Controls.Add(bottom_panel)
 
         info_label = Label()
         info_label.Text = (
-            "Placement: Pick multiple points for the TOP path (2, 3, 4…).\n"
-            "Press ESC when done. Layers stack downward with NO GAPS along the whole path."
+            "WATERPROOFING: Click cell → type part of name (e.g. 003 or membrane) → "
+            "dropdown filters live → click a result to assign. Clear text = no WP.\n"
+            "Offset(mm) = distance down from the TOP of that layer. "
+            "Load preset → edit → Save = overwrite, or change Name = save as new.\n"
+            "Placement: pick 2+ points for TOP path, ESC when done. Layers stack down with no gaps."
         )
         info_label.Location = Point(0, 0)
-        info_label.Size = Size(580, 50)
+        info_label.Size = Size(780, 55)
         info_label.Font = Font("Segoe UI", 7.5)
         info_label.ForeColor = Color.Gray
         bottom_panel.Controls.Add(info_label)
 
         self.btn_place = Button()
         self.btn_place.Text = "PLACE STACK"
-        self.btn_place.Location = Point(680, 2)
+        self.btn_place.Location = Point(1005, 2)
         self.btn_place.Size = Size(220, 48)
         self.btn_place.Font = Font("Segoe UI", 13, FontStyle.Bold)
         self.btn_place.BackColor = Color.FromArgb(50, 150, 80)
@@ -534,7 +588,7 @@ class StackerForm(Form):
 
         self.btn_cancel = Button()
         self.btn_cancel.Text = "Cancel"
-        self.btn_cancel.Location = Point(590, 10)
+        self.btn_cancel.Location = Point(915, 10)
         self.btn_cancel.Size = Size(80, 32)
         self.btn_cancel.Font = Font("Segoe UI", 9)
         self.btn_cancel.FlatStyle = FlatStyle.Flat
@@ -543,6 +597,238 @@ class StackerForm(Form):
 
         self._populate_items_list()
         self._refresh_preset_list()
+
+    # ============================================================
+    # WATERPROOFING TYPE-TO-FILTER COMBO
+    # ============================================================
+
+    def _on_grid_error(self, sender, args):
+        args.ThrowException = False
+
+    def _on_combo_dirty(self, sender, args):
+        # Commit when user picks from the filtered list
+        if self.stack_grid.IsCurrentCellDirty:
+            if (self.stack_grid.CurrentCell is not None and
+                    self.stack_grid.CurrentCell.ColumnIndex == 4):
+                self.stack_grid.CommitEdit(
+                    System.Windows.Forms.DataGridViewDataErrorContexts.Commit)
+
+    def _on_cell_begin_edit(self, sender, args):
+        # Before editing WP cell, restore full item list on the column
+        if args.ColumnIndex == 4:
+            self._reset_wp_column_items()
+
+    def _reset_wp_column_items(self):
+        """Put the full 001-009 list back on the grid column."""
+        col = self.stack_grid.Columns[4]
+        # Build desired set
+        desired = [""] + list(self.wp_dc_names)
+        # Also keep any currently assigned values not in filter (from old presets)
+        for item in self.stack_items:
+            n = item.get('sub_dc_name', "") or ""
+            if n and n not in desired:
+                desired.append(n)
+        col.Items.Clear()
+        for n in desired:
+            col.Items.Add(n)
+
+    def _on_editing_control_showing(self, sender, args):
+        """Hook the editing ComboBox so typing filters its dropdown list."""
+        # Unhook previous combo if any
+        self._unhook_wp_combo()
+
+        if self.stack_grid.CurrentCell is None:
+            return
+        if self.stack_grid.CurrentCell.ColumnIndex != 4:
+            return
+
+        combo = args.Control
+        if not isinstance(combo, ComboBox):
+            return
+
+        self._wp_edit_combo = combo
+        combo.DropDownStyle = ComboBoxStyle.DropDown
+        combo.AutoCompleteMode = AutoCompleteMode.None   # we filter manually
+        combo.AutoCompleteSource = AutoCompleteSource.None
+        combo.MaxDropDownItems = 20
+        try:
+            combo.DropDownWidth = max(combo.Width, 480)
+        except:
+            pass
+
+        # Load full list into editing control
+        self._fill_wp_combo_items(combo, "")
+
+        # Hook events (remove first so they don't stack on reuse)
+        try:
+            combo.TextUpdate -= self._on_wp_combo_text_update
+        except:
+            pass
+        try:
+            combo.KeyUp -= self._on_wp_combo_keyup
+        except:
+            pass
+        try:
+            combo.SelectedIndexChanged -= self._on_wp_combo_selected
+        except:
+            pass
+
+        combo.TextUpdate += self._on_wp_combo_text_update
+        combo.KeyUp += self._on_wp_combo_keyup
+        combo.SelectedIndexChanged += self._on_wp_combo_selected
+
+    def _unhook_wp_combo(self):
+        combo = self._wp_edit_combo
+        if combo is None:
+            return
+        try:
+            combo.TextUpdate -= self._on_wp_combo_text_update
+        except:
+            pass
+        try:
+            combo.KeyUp -= self._on_wp_combo_keyup
+        except:
+            pass
+        try:
+            combo.SelectedIndexChanged -= self._on_wp_combo_selected
+        except:
+            pass
+        self._wp_edit_combo = None
+
+    def _fill_wp_combo_items(self, combo, filter_text):
+        """Rebuild combo.Items to names matching filter_text (case-insensitive contains)."""
+        if self._wp_filtering:
+            return
+        self._wp_filtering = True
+        try:
+            typed = safe_str(filter_text)
+            # Remember caret
+            sel_start = 0
+            try:
+                sel_start = combo.SelectionStart
+            except:
+                sel_start = len(typed)
+
+            ft = typed.lower().strip()
+
+            matches = []
+            if not ft:
+                matches = list(self.wp_dc_names)
+            else:
+                for n in self.wp_dc_names:
+                    if ft in n.lower():
+                        matches.append(n)
+
+            combo.BeginUpdate()
+            try:
+                combo.Items.Clear()
+                combo.Items.Add("")          # blank = clear waterproofing
+                for n in matches:
+                    combo.Items.Add(n)
+            finally:
+                combo.EndUpdate()
+
+            # Restore what the user typed (Clear wipes Text on some .NET versions)
+            combo.Text = typed
+            try:
+                combo.SelectionStart = min(sel_start, len(typed))
+                combo.SelectionLength = 0
+            except:
+                pass
+
+            # Show filtered list under the cell
+            if not combo.DroppedDown:
+                try:
+                    combo.DroppedDown = True
+                except:
+                    pass
+            # Keep cursor in the text box (DroppedDown can steal focus feel)
+            try:
+                combo.SelectionStart = min(sel_start, len(typed))
+                combo.SelectionLength = 0
+            except:
+                pass
+        finally:
+            self._wp_filtering = False
+
+    def _on_wp_combo_text_update(self, sender, args):
+        """Fires as user types each character — filter the list."""
+        combo = sender
+        if self._wp_filtering:
+            return
+        # Ignore when change came from picking an item
+        if combo.SelectedIndex >= 0:
+            sel_txt = safe_str(combo.Items[combo.SelectedIndex]) if combo.SelectedIndex < combo.Items.Count else ""
+            if sel_txt and sel_txt == safe_str(combo.Text):
+                return
+        self._fill_wp_combo_items(combo, combo.Text)
+
+    def _on_wp_combo_keyup(self, sender, args):
+        """Backup filter on KeyUp (handles backspace/delete reliably)."""
+        combo = sender
+        if self._wp_filtering:
+            return
+        # Don't filter on navigation keys inside open list
+        if args.KeyCode in (Keys.Up, Keys.Down, Keys.Enter, Keys.Escape,
+                            Keys.PageUp, Keys.PageDown, Keys.Left, Keys.Right):
+            return
+        self._fill_wp_combo_items(combo, combo.Text)
+
+    def _on_wp_combo_selected(self, sender, args):
+        """User clicked a filtered item — push value into grid cell & data."""
+        if self._wp_filtering:
+            return
+        combo = sender
+        if combo.SelectedIndex < 0:
+            return
+        val = safe_str(combo.Items[combo.SelectedIndex]) if combo.SelectedIndex < combo.Items.Count else ""
+        # Also take combo.Text if selected index is weird
+        if not val:
+            val = safe_str(combo.Text).strip()
+
+        row = self.stack_grid.CurrentCell.RowIndex if self.stack_grid.CurrentCell else -1
+        if row < 0 or row >= len(self.stack_items):
+            return
+
+        resolved_name, resolved_id = self._resolve_wp_name(val)
+        self.stack_items[row]['sub_dc_name'] = resolved_name
+        self.stack_items[row]['sub_dc_id'] = resolved_id
+
+        # Write into cell
+        try:
+            self.stack_grid.CurrentCell.Value = resolved_name
+        except:
+            pass
+
+        # Make sure column items contain it (avoids DataError)
+        col = self.stack_grid.Columns[4]
+        if resolved_name and resolved_name not in col.Items:
+            col.Items.Add(resolved_name)
+
+    def _resolve_wp_name(self, typed):
+        """Match typed/selected text to a DC id."""
+        typed = safe_str(typed).strip()
+        if not typed:
+            return "", None
+        if typed in self.detail_components:
+            return typed, self.detail_components[typed]
+        low = typed.lower()
+        for n in self.wp_dc_names:
+            if n.lower() == low:
+                return n, self.detail_components.get(n)
+        hits = [n for n in self.wp_dc_names if low in n.lower()]
+        if len(hits) == 1:
+            return hits[0], self.detail_components.get(hits[0])
+        if len(hits) > 1:
+            starts = [n for n in hits if n.lower().startswith(low)]
+            if len(starts) == 1:
+                return starts[0], self.detail_components.get(starts[0])
+            # ambiguous — keep exact typed only if it is a real name
+            return "", None
+        for n, eid in self.detail_components.items():
+            if low == n.lower():
+                return n, eid
+        return "", None
 
     # ---- PRESET HANDLERS ----
     def _refresh_preset_list(self):
@@ -569,16 +855,26 @@ class StackerForm(Form):
             MessageBox.Show("Stack is empty.", "Empty",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
+
         if name in get_saved_presets():
-            res = MessageBox.Show("Overwrite preset '{}'?".format(name),
-                                  "Confirm", MessageBoxButtons.YesNo,
+            msg = (
+                "Preset '{}' already exists.\n\n"
+                "Yes  = Overwrite existing preset\n"
+                "No   = Cancel (change the Name box to save as a NEW preset)"
+            ).format(name)
+            res = MessageBox.Show(msg, "Overwrite or Save as New?",
+                                  MessageBoxButtons.YesNo,
                                   MessageBoxIcon.Question)
             if res != DialogResult.Yes:
                 return
+
         if save_preset(name, self.stack_items):
             MessageBox.Show("Preset '{}' saved!".format(name), "Saved",
                             MessageBoxButtons.OK, MessageBoxIcon.Information)
             self._refresh_preset_list()
+            idx = self.preset_combo.Items.IndexOf(name)
+            if idx >= 0:
+                self.preset_combo.SelectedIndex = idx
 
     def _on_load_preset(self, sender, args):
         if self.preset_combo.SelectedIndex < 0:
@@ -586,16 +882,22 @@ class StackerForm(Form):
                             MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
         name = safe_str(self.preset_combo.SelectedItem.ToString())
+        self.preset_name_box.Text = name
+
         filepath = System.IO.Path.Combine(PRESET_FOLDER, name + '.json')
         data = load_preset(filepath)
         if data is None:
             return
+
         self.stack_items = []
         not_found, found = [], 0
         for entry in data:
             en = safe_str(entry.get('name', ''))
             et = safe_str(entry.get('type', ''))
             eh = float(entry.get('height_mm', 100))
+            sub_dc_name = safe_str(entry.get('sub_dc_name', ''))
+            sub_off_mm = float(entry.get('sub_offset_mm', 0.0))
+
             eid = None
             src = self.filled_regions if et == 'FR' else self.detail_components
             eid = src.get(en)
@@ -604,14 +906,34 @@ class StackerForm(Form):
                     if safe_str(k).lower() == en.lower():
                         eid = v
                         break
+
+            sub_dc_id = None
+            if sub_dc_name:
+                resolved, sub_dc_id = self._resolve_wp_name(sub_dc_name)
+                if sub_dc_id:
+                    sub_dc_name = resolved
+                else:
+                    # keep name visible even if not in 001-009 set
+                    if sub_dc_name in self.detail_components:
+                        sub_dc_id = self.detail_components[sub_dc_name]
+                    else:
+                        sub_dc_name = ""
+
             if eid is not None:
                 self.stack_items.append({
                     'name': en, 'type': et,
-                    'element_id': eid, 'height_mm': eh})
+                    'element_id': eid, 'height_mm': eh,
+                    'sub_dc_name': sub_dc_name,
+                    'sub_dc_id': sub_dc_id,
+                    'sub_offset_mm': sub_off_mm
+                })
                 found += 1
             else:
                 not_found.append("  - [{}] {}".format(et, en))
+
+        self._reset_wp_column_items()
         self._refresh_stack_grid()
+
         if not_found and found == 0:
             MessageBox.Show("No items found in this project.\n" +
                             "\n".join(not_found[:15]),
@@ -620,9 +942,6 @@ class StackerForm(Form):
             MessageBox.Show("Loaded {}/{}.\nMissing:\n{}".format(
                 found, len(data), "\n".join(not_found)),
                 "Partial", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-        else:
-            MessageBox.Show("Loaded {} items.".format(found), "Loaded",
-                            MessageBoxButtons.OK, MessageBoxIcon.Information)
 
     def _on_delete_preset(self, sender, args):
         if self.preset_combo.SelectedIndex < 0:
@@ -672,7 +991,9 @@ class StackerForm(Form):
             h = float(self.height_input.Value) if item['type'] == 'FR' else 0.0
             self.stack_items.append({
                 'name': item['name'], 'type': item['type'],
-                'element_id': item['element_id'], 'height_mm': h})
+                'element_id': item['element_id'], 'height_mm': h,
+                'sub_dc_name': "", 'sub_dc_id': None, 'sub_offset_mm': 0.0
+            })
         for i in range(self.items_list.Items.Count):
             self.items_list.SetItemChecked(i, False)
         self._refresh_stack_grid()
@@ -680,11 +1001,14 @@ class StackerForm(Form):
     def _refresh_stack_grid(self):
         self.stack_grid.Rows.Clear()
         total = 0.0
+        combo_col = self.stack_grid.Columns[4]
+
         for i, item in enumerate(self.stack_items):
             r = self.stack_grid.Rows[self.stack_grid.Rows.Add()]
             r.Cells[0].Value = str(i + 1)
             r.Cells[1].Value = item['name']
             r.Cells[2].Value = item['type']
+
             if item['type'] == 'FR':
                 r.Cells[3].Value = str(item['height_mm'])
                 total += item['height_mm']
@@ -695,10 +1019,20 @@ class StackerForm(Form):
                 else:
                     r.Cells[3].Value = "Auto"
                 r.Cells[3].ReadOnly = False
+
+            sub_name = item.get('sub_dc_name', "") or ""
+            if sub_name and sub_name not in combo_col.Items:
+                combo_col.Items.Add(sub_name)
+            r.Cells[4].Value = sub_name
+            r.Cells[5].Value = str(item.get('sub_offset_mm', 0.0))
+
         self.total_label.Text = "Total Height (known): {:.1f} mm".format(total)
 
     def _on_cell_edit(self, s, args):
-        if args.ColumnIndex == 3 and args.RowIndex < len(self.stack_items):
+        if args.RowIndex >= len(self.stack_items):
+            return
+
+        if args.ColumnIndex == 3:  # Height
             try:
                 raw = safe_str(self.stack_grid.Rows[args.RowIndex].Cells[3].Value)
                 raw = raw.strip().lower()
@@ -710,6 +1044,28 @@ class StackerForm(Form):
                         self.stack_items[args.RowIndex]['height_mm'] = val
             except:
                 pass
+            self._refresh_stack_grid()
+
+        elif args.ColumnIndex == 4:  # WATERPROOFING
+            raw = safe_str(self.stack_grid.Rows[args.RowIndex].Cells[4].Value)
+            resolved_name, resolved_id = self._resolve_wp_name(raw)
+            # If user typed a filter string but didn't click, try resolve;
+            # if ambiguous/empty keep blank (they should click a list item)
+            self.stack_items[args.RowIndex]['sub_dc_name'] = resolved_name
+            self.stack_items[args.RowIndex]['sub_dc_id'] = resolved_id
+            self.stack_grid.Rows[args.RowIndex].Cells[4].Value = resolved_name
+            if resolved_name:
+                col = self.stack_grid.Columns[4]
+                if resolved_name not in col.Items:
+                    col.Items.Add(resolved_name)
+            self._unhook_wp_combo()
+
+        elif args.ColumnIndex == 5:  # Offset
+            try:
+                raw = safe_str(self.stack_grid.Rows[args.RowIndex].Cells[5].Value)
+                self.stack_items[args.RowIndex]['sub_offset_mm'] = float(raw)
+            except:
+                self.stack_items[args.RowIndex]['sub_offset_mm'] = 0.0
             self._refresh_stack_grid()
 
     def _on_move_up(self, s, a):
@@ -754,6 +1110,11 @@ class StackerForm(Form):
             self._refresh_stack_grid()
 
     def _on_place_clicked(self, s, a):
+        # Commit any open editor first
+        try:
+            self.stack_grid.EndEdit()
+        except:
+            pass
         if not self.stack_items:
             MessageBox.Show("Add at least one item.", "Empty",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning)
@@ -809,7 +1170,6 @@ def _vdot(a, b):
 
 
 def _clean_pts(pts, tol=TOL):
-    """Remove consecutive near-duplicates."""
     if not pts:
         return []
     out = [pts[0]]
@@ -837,13 +1197,11 @@ def segment_dir(p0, p1):
 
 
 def segment_perp_down(p0, p1):
-    """Clockwise 90° from segment dir = downward for an L→R path."""
     d = segment_dir(p0, p1)
     return XYZ(d.Y, -d.X, 0.0)
 
 
 def project_to_view_plane(pt, view):
-    """Project a picked point onto the view's work plane."""
     try:
         origin = view.Origin
         normal = view.ViewDirection
@@ -861,17 +1219,14 @@ def project_to_view_plane(pt, view):
 # ============================================================
 
 def offset_polyline_miter(pts, distance, miter_limit=4.0):
-    """Standard perpendicular offset (used only for Detail Components)."""
     pts = _clean_pts(pts)
     n = len(pts)
     if n < 2:
         return list(pts)
 
     norms = []
-    dirs = []
     for i in range(n - 1):
         d = segment_dir(pts[i], pts[i + 1])
-        dirs.append(d)
         norms.append(XYZ(d.Y, -d.X, 0.0))
 
     out = []
@@ -902,7 +1257,6 @@ def offset_polyline_miter(pts, distance, miter_limit=4.0):
 
 
 def offset_polyline_miter_vertical_cuts(pts, distance, view, miter_limit=4.0):
-    """Offsets polyline while ensuring start and end boundaries project strictly vertically."""
     pts = _clean_pts(pts)
     n = len(pts)
     if n < 2:
@@ -921,79 +1275,76 @@ def offset_polyline_miter_vertical_cuts(pts, distance, view, miter_limit=4.0):
 
     pts2d = [to_2d(p) for p in pts]
 
-    dirs = []
     norms = []
     for i in range(n - 1):
         p0 = pts2d[i]
         p1 = pts2d[i + 1]
         dx = p1[0] - p0[0]
         dy = p1[1] - p0[1]
-        L = math.sqrt(dx*dx + dy*dy)
+        L = math.sqrt(dx * dx + dy * dy)
         if L < 1e-12:
             d = (1.0, 0.0)
         else:
-            d = (dx/L, dy/L)
-        dirs.append(d)
-        norms.append((d[1], -d[0])) # Clockwise local normal
+            d = (dx / L, dy / L)
+        norms.append((d[1], -d[0]))
 
     out2d = []
     for i in range(n):
         if i == 0:
-            # Start Point: Compute offset projected along vertical axis
             p0 = pts2d[0]
             p1 = pts2d[1]
             dx = p1[0] - p0[0]
             dy = p1[1] - p0[1]
-            L = math.sqrt(dx*dx + dy*dy)
+            L = math.sqrt(dx * dx + dy * dy)
             if L > 1e-12 and abs(dx) > 1e-4:
                 out2d.append((p0[0], p0[1] - distance * L / dx))
             else:
                 n0 = norms[0]
                 out2d.append((p0[0] + n0[0] * distance, p0[1] + n0[1] * distance))
         elif i == n - 1:
-            # End Point: Compute offset projected along vertical axis
             p_penult = pts2d[n - 2]
             p_last = pts2d[n - 1]
             dx = p_last[0] - p_penult[0]
             dy = p_last[1] - p_penult[1]
-            L = math.sqrt(dx*dx + dy*dy)
+            L = math.sqrt(dx * dx + dy * dy)
             if L > 1e-12 and abs(dx) > 1e-4:
                 out2d.append((p_last[0], p_last[1] - distance * L / dx))
             else:
                 n_last = norms[n - 2]
-                out2d.append((p_last[0] + n_last[0] * distance, p_last[1] + n_last[1] * distance))
+                out2d.append((p_last[0] + n_last[0] * distance,
+                              p_last[1] + n_last[1] * distance))
         else:
-            # Intermediate Points: Normal clean miter join
             n0 = norms[i - 1]
             n1 = norms[i]
             avg_x = n0[0] + n1[0]
             avg_y = n0[1] + n1[1]
-            avg_len = math.sqrt(avg_x*avg_x + avg_y*avg_y)
+            avg_len = math.sqrt(avg_x * avg_x + avg_y * avg_y)
             if avg_len < 1e-8:
-                out2d.append((pts2d[i][0] + n0[0] * distance, pts2d[i][1] + n0[1] * distance))
+                out2d.append((pts2d[i][0] + n0[0] * distance,
+                              pts2d[i][1] + n0[1] * distance))
                 continue
             miter = (avg_x / avg_len, avg_y / avg_len)
             denom = miter[0] * n0[0] + miter[1] * n0[1]
             if abs(denom) < 1e-6:
-                out2d.append((pts2d[i][0] + n0[0] * distance, pts2d[i][1] + n0[1] * distance))
+                out2d.append((pts2d[i][0] + n0[0] * distance,
+                              pts2d[i][1] + n0[1] * distance))
                 continue
             miter_dist = distance / denom
             max_miter = abs(distance) * miter_limit
             if abs(miter_dist) > max_miter:
                 miter_dist = math.copysign(max_miter, miter_dist)
-            out2d.append((pts2d[i][0] + miter[0] * miter_dist, pts2d[i][1] + miter[1] * miter_dist))
+            out2d.append((pts2d[i][0] + miter[0] * miter_dist,
+                          pts2d[i][1] + miter[1] * miter_dist))
 
     return [to_3d(p[0], p[1]) for p in out2d]
 
 
 def make_closed_loop_from_ring(ring_pts):
-    """Build a CurveLoop from a ring of points."""
     clean = _clean_pts(ring_pts, tol=1e-7)
     if len(clean) > 2 and _vlen(_vsub(clean[-1], clean[0])) <= 1e-7:
         clean = clean[:-1]
     if len(clean) < 3:
         raise ValueError("Degenerate polygon")
-
     loop = CurveLoop()
     count = len(clean)
     for i in range(count):
@@ -1010,7 +1361,6 @@ def make_strip_loop(top_pts, bottom_pts):
     bot = _clean_pts(bottom_pts)
     if len(top) < 2 or len(bot) < 2:
         raise ValueError("Strip needs at least 2 points")
-
     ring = []
     ring.extend(top)
     ring.extend(reversed(bot))
@@ -1018,29 +1368,19 @@ def make_strip_loop(top_pts, bottom_pts):
 
 
 def create_fr_strip(fr_type_id, view, path_pts, top_offset, height_feet):
-    """
-    Create one FR layer:
-    - top boundary = path offset by top_offset
-    - bottom boundary = path offset by top_offset + height
-    Both use vertical-cut ends so start/end edges are always vertical.
-    """
     path_pts = _clean_pts(path_pts)
     if len(path_pts) < 2 or height_feet <= 1e-12:
         return []
-
     try:
         top_pts = offset_polyline_miter_vertical_cuts(path_pts, top_offset, view)
         bottom_pts = offset_polyline_miter_vertical_cuts(
             path_pts, top_offset + height_feet, view)
     except Exception:
         return []
-
     top_pts = _clean_pts(top_pts)
     bottom_pts = _clean_pts(bottom_pts)
     if len(top_pts) < 2 or len(bottom_pts) < 2:
         return []
-
-    # Prefer one continuous strip
     try:
         loop = make_strip_loop(top_pts, bottom_pts)
         boundaries = List[CurveLoop]()
@@ -1049,8 +1389,6 @@ def create_fr_strip(fr_type_id, view, path_pts, top_offset, height_feet):
         return [fr]
     except Exception:
         pass
-
-    # Fallback: per-segment quads (still vertical ends, no gaps)
     regions = []
     n = min(len(top_pts), len(bottom_pts))
     for i in range(n - 1):
@@ -1072,7 +1410,7 @@ def create_fr_strip(fr_type_id, view, path_pts, top_offset, height_feet):
 
 
 # ============================================================
-# GEOMETRY EXTENT (DC alignment - Local Segment Origin)
+# GEOMETRY EXTENT
 # ============================================================
 
 def _collect_points(geom_elem, points):
@@ -1115,7 +1453,6 @@ def _collect_points(geom_elem, points):
 
 
 def get_extent_along(element, view, origin, direction):
-    """Measures min/max extent of geometry relative to local segment origin."""
     points = []
     try:
         opts = Options()
@@ -1161,7 +1498,6 @@ def get_or_create_sketch_plane(view):
 
 
 def place_dc_per_segment(dc_type_id, view, path_pts, top_offset):
-    """Places Detail Component on EVERY segment of the offset path."""
     symbol = doc.GetElement(dc_type_id)
     if not symbol.IsActive:
         symbol.Activate()
@@ -1185,7 +1521,6 @@ def place_dc_per_segment(dc_type_id, view, path_pts, top_offset):
 
         local_down = segment_perp_down(a, b)
         inst = None
-
         try:
             if "Curve" in placement or "Line" in placement:
                 line = Line.CreateBound(a, b)
@@ -1216,27 +1551,22 @@ def place_dc_per_segment(dc_type_id, view, path_pts, top_offset):
         if inst:
             doc.Regenerate()
             min_p, max_p = get_extent_along(inst, view, a, local_down)
-
             if abs(min_p) > 1e-4:
                 shift_vec = _vscale(local_down, -min_p)
                 ElementTransformUtils.MoveElement(doc, inst.Id, shift_vec)
                 doc.Regenerate()
                 min_p, max_p = get_extent_along(inst, view, a, local_down)
-
             seg_h = max_p - min_p
             if seg_h > max_h:
                 max_h = seg_h
-
             instances.append(inst)
 
     if not instances:
         return [], mm_to_feet(10)
-
     return instances, max_h
 
 
 def place_dc_on_path(dc_type_id, view, path_pts, top_offset, angle_ref_dir):
-    """Places single DC along whole path chord."""
     symbol = doc.GetElement(dc_type_id)
     if not symbol.IsActive:
         symbol.Activate()
@@ -1259,7 +1589,6 @@ def place_dc_on_path(dc_type_id, view, path_pts, top_offset, angle_ref_dir):
 
     instance = None
     placed_on_curve = False
-
     if "Curve" in placement or "Line" in placement:
         try:
             if _vlen(_vsub(p1, p0)) > 1e-6:
@@ -1302,7 +1631,6 @@ def place_dc_on_path(dc_type_id, view, path_pts, top_offset, angle_ref_dir):
                 pass
 
     doc.Regenerate()
-
     meas_down = segment_perp_down(p0, p1)
     min_p, max_p = get_extent_along(instance, view, p0, meas_down)
     if abs(min_p) > 1e-4:
@@ -1336,9 +1664,10 @@ def place_stack_on_path(stack_items, path_pts, view):
     t.Start()
     try:
         for item in stack_items:
+            layer_start_offset = current_offset
+
             if item['type'] == 'FR':
                 h = mm_to_feet(item['height_mm'])
-                # Stack correctly: this layer sits between current_offset and current_offset+h
                 frs = create_fr_strip(
                     item['element_id'], view, path_pts, current_offset, h)
                 placed.extend(frs)
@@ -1346,13 +1675,6 @@ def place_stack_on_path(stack_items, path_pts, view):
 
             elif item['type'] == 'DC':
                 user_h = item.get('height_mm', 0) or 0
-                symbol = doc.GetElement(item['element_id'])
-                ptype = ""
-                try:
-                    ptype = symbol.Family.FamilyPlacementType.ToString()
-                except:
-                    pass
-
                 if len(path_pts) > 2:
                     insts, comp_h = place_dc_per_segment(
                         item['element_id'], view, path_pts, current_offset)
@@ -1363,11 +1685,25 @@ def place_stack_on_path(stack_items, path_pts, view):
                         current_offset, ref_dir)
                     if inst:
                         placed.append(inst)
-
                 if user_h > 0:
                     current_offset += mm_to_feet(user_h)
                 else:
                     current_offset += comp_h
+
+            # WATERPROOFING DC — offset from top of this layer
+            sub_dc_id = item.get('sub_dc_id')
+            if sub_dc_id:
+                sub_off_mm = item.get('sub_offset_mm', 0.0) or 0.0
+                sub_off_ft = layer_start_offset + mm_to_feet(sub_off_mm)
+                if len(path_pts) > 2:
+                    sub_insts, _ = place_dc_per_segment(
+                        sub_dc_id, view, path_pts, sub_off_ft)
+                    placed.extend(sub_insts)
+                else:
+                    sub_inst, _ = place_dc_on_path(
+                        sub_dc_id, view, path_pts, sub_off_ft, ref_dir)
+                    if sub_inst:
+                        placed.append(sub_inst)
 
         t.Commit()
         TaskDialog.Show(
@@ -1392,7 +1728,6 @@ def place_stack_on_path(stack_items, path_pts, view):
 def pick_path_points(view):
     sel = uidoc.Selection
     points = []
-
     TaskDialog.Show(
         "Pick Path Points",
         "Click points along the TOP path of the stack.\n\n"
@@ -1400,7 +1735,6 @@ def pick_path_points(view):
         "  • Path can bend at any angle\n"
         "  • Press ESC when finished (need at least 2 points)\n\n"
         "Layers stack downward from this path with no gaps.")
-
     while True:
         try:
             prompt = ("Pick path point #{}  |  ESC when done ({} so far)").format(
@@ -1415,7 +1749,6 @@ def pick_path_points(view):
                 break
             TaskDialog.Show("Error", "Point pick failed:\n{}".format(str(ex)))
             return None
-
     points = _clean_pts(points)
     if len(points) < 2:
         TaskDialog.Show(
