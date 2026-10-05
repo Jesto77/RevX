@@ -124,11 +124,14 @@ class _WarnSwallower(DB.IFailuresPreprocessor):
         return FailureProcessingResult.Continue
 
 
+_WARN_SWALLOWER = _WarnSwallower()   # module-level: must stay referenced while Revit holds it
+
+
 def _cfg_tx(t):
     """Configure transaction to be less crashy / never show modal dialogs."""
     try:
         opts = t.GetFailureHandlingOptions()
-        opts.SetFailuresPreprocessor(_WarnSwallower())
+        opts.SetFailuresPreprocessor(_WARN_SWALLOWER)
         opts.SetClearAfterRollback(True)
         opts.SetDelayedMiniWarnings(True)
         opts.SetForcedModalHandling(False)
@@ -306,6 +309,8 @@ def get_flat_boundary_via_temp_copy(element):
 
     Returns list[Curve] or None (falls back to other extraction methods).
     """
+    if REVIT_VERSION < 2025:
+        return None      # copy + reset + rollback is unstable on 2024 and older
     if not _shape_editor_enabled(element):
         return None
 
@@ -426,7 +431,7 @@ def _extract_via_sketch(element):
         for arr in sketch.Profile:
             for c in arr:
                 if c is not None:
-                    curves.append(c)
+                    curves.append(c.Clone())
     except Exception:
         return []
     return curves
@@ -474,7 +479,9 @@ def _extract_via_solid_faces(element):
         if best_face is not None:
             for lp in best_face.GetEdgesAsCurveLoops():
                 for c in lp:
-                    curves.append(c)
+                    # Clone: geometry curves die when the element is rolled
+                    # back / regenerated. A clone is an independent object.
+                    curves.append(c.Clone())
     except Exception:
         pass
     return curves
