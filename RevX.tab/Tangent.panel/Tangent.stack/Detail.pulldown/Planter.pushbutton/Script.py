@@ -7,18 +7,26 @@ around that point from ALL detail components / detail lines in the view (opening
 open top of the planter walls or the gap at the drain are closed automatically) and creates a
 Filled Region of the type whose name contains "026" exactly there.
 
-It also places the line-based detail item whose family / type name contains "005"
-95 mm below the bottom-most horizontal line of the created 026 filled region,
-from the left to the right outer wall.
+Everything is measured from the 026 filled region.
 
-It then places the line-based detail item whose family / type name contains "006":
-bottom 10 mm above the 005 line (inset 10 mm from each end of 005), and two sides that are
-single STRAIGHT vertical lines from the top of 026 down to the 006 bottom line, 7.5 mm
-inside the outermost left / right edge of 026 (they do not follow the L copings or the
-sloping floor). The sides start exactly at the top (no gap).
+005 (line-based detail item):
+  bottom line 95 mm below the bottom-most horizontal line of 026, plus two straight vertical
+  sides from the top of 026 down to that bottom line, 32.5 mm OUTSIDE the INNER (main) left /
+  right wall of 026. The bottom line spans exactly from one side to the other, so sides and
+  bottom meet at their ends.
 
-It also places the line-based detail item whose family / type name contains "008"
-15 mm inward from every 026 boundary except the open top (starts exactly at the top).
+006 (line-based detail item):
+  bottom line 10 mm above the 005 bottom line, plus two straight vertical sides from the top
+  of 026 down to the 006 bottom line, 22.5 mm OUTSIDE the INNER (main) left / right wall of 026.
+  The bottom line spans exactly from side to side (sides and bottom meet at their ends).
+
+008 (line-based detail item):
+  15 mm inward from every 026 boundary except the open top (starts exactly at the top).
+  Only the topmost short vertical portion on each side is instead 10 mm inside the 006 side.
+
+010 (point-based detail component):
+  placed at the horizontal centre of 026, 80 mm below the bottom-most boundary of 026,
+  with a Halftone override in the active view.
 
 Works in Revit 2022 - 2026.
 """
@@ -33,7 +41,7 @@ from System.Collections.Generic import List
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, FilledRegion, FilledRegionType,
     Transaction, Line, Curve, CurveLoop, GeometryInstance, GeometryElement, Options,
-    XYZ, BuiltInParameter, FamilySymbol, FamilyPlacementType
+    XYZ, BuiltInParameter, FamilySymbol, FamilyPlacementType, OverrideGraphicSettings
 )
 from pyrevit import forms, script
 
@@ -48,13 +56,16 @@ v_y = view.UpDirection
 FT2_TO_M2 = 0.09290304
 MM = 1.0 / 304.8
 BOTTOM_ITEM_KEY = "005"          # detail item family / type name contains this
-BOTTOM_ITEM_OFFSET = 95.0 * MM   # 95 mm below 026 soil bottom line
+BOTTOM_ITEM_OFFSET = 95.0 * MM   # 005 bottom: 95 mm below 026 soil bottom line
+BOTTOM_ITEM_SIDE_OUT = 32.5 * MM # 005 sides: OUTSIDE the inner (main) left / right wall of 026
 LAYER_006_KEY = "006"
-LAYER_006_ABOVE_005 = 10.0 * MM  # 006 sits 10 mm above 005
-LAYER_006_BOTTOM_INSET = 10.0 * MM  # 006 bottom inset from each end of 005
-LAYER_006_SIDE_OFFSET = 7.5 * MM    # 006 sides inset from 026 side boundaries
+LAYER_006_ABOVE_005 = 10.0 * MM  # 006 bottom sits 10 mm above the 005 bottom
+LAYER_006_SIDE_OUT = 22.5 * MM   # 006 sides: OUTSIDE the inner (main) left / right wall of 026
+LAYER_010_KEY = "010"
+LAYER_010_BELOW_026 = 80.0 * MM     # 010 insertion point: below the bottom-most boundary of 026
 LAYER_008_KEY = "008"
 LAYER_008_OFFSET = 15.0 * MM        # 008 inset from 026 boundary (except top)
+LAYER_008_TOP_FROM_006 = 10.0 * MM  # 008 topmost vertical portion: inside the 006 side by this
 HORIZ_TOL = 0.008                # ~2.4 mm slope tolerance for horizontal lines
 SHOW_RESULT = False              # True = show the output window + result message again
 
@@ -741,7 +752,7 @@ def _line_intersect(p, r, q, s):
     return (p[0] + t * r[0], p[1] + t * r[1])
 
 
-def offset_poly_edges(poly, dist, keep_kinds):
+def offset_poly_edges(poly, dist, keep_kinds, overrides=None):
     """
     Inward offset of selected 026 edges. Adjacent kept edges are trimmed to their
     intersection so corners (including the top L copings) stay closed.
@@ -760,6 +771,9 @@ def offset_poly_edges(poly, dist, keep_kinds):
         nrm = _inward_normal(a, b, sign)
         if nrm is None:
             raw.append(None)
+            continue
+        if overrides and i in overrides:
+            raw.append(overrides[i])                # custom offset line for this edge
             continue
         d = 0.0 if kinds[i] == "top" else dist      # top line stays where it is
         o0 = (a[0] + d * nrm[0], a[1] + d * nrm[1])
@@ -798,20 +812,78 @@ def offset_poly_edges(poly, dist, keep_kinds):
     return segs
 
 
-def straight_sides_006(poly, y_bottom, offset):
+def inner_side_x(poly):
     """
-    Two straight vertical lines: from the top of 026 down to y_bottom (the 006 bottom line),
-    `offset` inside the outermost left / right edge of 026.
+    x of the INNER boundary of 026 on the left and on the right: the long main vertical wall
+    of the soil cavity on each side (not the wider coping / step at the top, which is the
+    outer boundary).  Returns (x_left, x_right).
     """
+    n = len(poly)
     xs = [p[0] for p in poly]
+    xc = 0.5 * (min(xs) + max(xs))
+    best = {True: None, False: None}          # side -> (length, x)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        if dy < MM or dy < 3.0 * dx:
+            continue                          # not vertical
+        xm = 0.5 * (a[0] + b[0])
+        left = xm < xc
+        if best[left] is None or dy > best[left][0]:
+            best[left] = (dy, xm)
+    x_left = best[True][1] if best[True] else min(xs)
+    x_right = best[False][1] if best[False] else max(xs)
+    return x_left, x_right
+
+
+def straight_sides_outward(poly, y_bottom, out_dist):
+    """
+    Two straight vertical lines from the top of 026 down to y_bottom, `out_dist` OUTSIDE the
+    inner (main) left / right wall of 026.  Returns (segments, x_left, x_right).
+    """
     y_top = max(p[1] for p in poly)
-    x_left = min(xs) + offset
-    x_right = max(xs) - offset
+    xl, xr = inner_side_x(poly)
+    x_left = xl - out_dist
+    x_right = xr + out_dist
     segs = []
     for x in (x_left, x_right):
         if y_top - y_bottom >= MM:
             segs.append(((x, y_top), (x, y_bottom)))
-    return segs
+    return segs, x_left, x_right
+
+
+def top_vertical_overrides(poly, x_left_target, x_right_target):
+    """
+    For the topmost short near-vertical 026 edge on the left and on the right, returns
+    {edge_index: (p0, p1)} placing that edge's offset line at the given x (same y range).
+    """
+    kinds, _top_i = classify_poly_edges(poly)
+    n = len(poly)
+    ymin = min(p[1] for p in poly)
+    ymax = max(p[1] for p in poly)
+    h = max(ymax - ymin, MM)
+    xc = 0.5 * (min(p[0] for p in poly) + max(p[0] for p in poly))
+    out = {}
+    for want_left, x_t in ((True, x_left_target), (False, x_right_target)):
+        best_i, best_top = None, None
+        for i in range(n):
+            if kinds[i] != "side":
+                continue
+            a, b = poly[i], poly[(i + 1) % n]
+            dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+            if dy < MM or dy < 3.0 * dx:
+                continue                      # not vertical
+            if ((0.5 * (a[0] + b[0])) < xc) != want_left:
+                continue
+            top = max(a[1], b[1])
+            if top < ymax - 0.25 * h:
+                continue                      # not in the top portion
+            if best_top is None or top > best_top:
+                best_i, best_top = i, top
+        if best_i is not None:
+            a, b = poly[best_i], poly[(best_i + 1) % n]
+            out[best_i] = ((x_t, a[1]), (x_t, b[1]))
+    return out
 
 
 def extend_sides_straight_down(side_segs, y_target, x_center):
@@ -879,6 +951,29 @@ def find_line_based_detail(key):
     return line_based, found
 
 
+def find_point_based_detail(key):
+    """Point-based (non line-based) detail component whose family / type name contains key.
+    Returns (point_based, all_found)."""
+    found = []
+    try:
+        syms = FilteredElementCollector(doc).OfClass(FamilySymbol)\
+            .OfCategory(BuiltInCategory.OST_DetailComponents).ToElements()
+    except Exception:
+        syms = []
+    for sym in syms:
+        try:
+            fam_name = sym.Family.Name
+            p = sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            type_name = p.AsString() if p is not None else sym.Name
+            if key in fam_name or key in (type_name or ""):
+                found.append((sym, fam_name, type_name))
+        except Exception:
+            pass
+    point_based = [f for f in found
+                   if f[0].Family.FamilyPlacementType != FamilyPlacementType.CurveBasedDetail]
+    return point_based, found
+
+
 def main():
     target_type = pick_region_type()
 
@@ -921,25 +1016,26 @@ def main():
         forms.alert("Could not build the boundary:\n{}".format(ex), exitscript=True)
 
     # ---- detail items (005 / 006 / 008): looked up before the transaction
-    bottom = find_bottom_line(segs, poly)
     item_syms, any_syms = find_line_based_detail(BOTTOM_ITEM_KEY)
     item_006_syms, any_006 = find_line_based_detail(LAYER_006_KEY)
     item_008_syms, any_008 = find_line_based_detail(LAYER_008_KEY)
+    item_010_syms, any_010 = find_point_based_detail(LAYER_010_KEY)
     item_msg = None
     item_006_msg = None
     item_008_msg = None
-    if bottom is None:
-        item_msg = "bottom line of the planter not found"
-        item_006_msg = item_msg
-    elif not any_syms:
+    item_010_msg = None
+    if not any_010:
+        item_010_msg = "no detail item with '{}' in its family / type name".format(LAYER_010_KEY)
+    elif not item_010_syms:
+        item_010_msg = "'{}' detail item is LINE-based, but a point-based component is needed".format(any_010[0][1])
+    if not any_syms:
         item_msg = "no detail item with '{}' in its family / type name".format(BOTTOM_ITEM_KEY)
         item_006_msg = "005 was not placed, so 006 was skipped"
     elif not item_syms:
         item_msg = "'{}' detail item is not a LINE-based family".format(any_syms[0][1])
         item_006_msg = "005 was not placed, so 006 was skipped"
     else:
-        log("005 span: x {:.3f}..{:.3f}; detail item: {} : {}".format(
-            bottom[0], bottom[1], item_syms[0][1], item_syms[0][2]))
+        log("005 detail item: {} : {}".format(item_syms[0][1], item_syms[0][2]))
         if len(item_syms) > 1:
             log("({} matches for '{}', using the first)".format(len(item_syms), BOTTOM_ITEM_KEY))
 
@@ -962,7 +1058,7 @@ def main():
         if len(item_008_syms) > 1:
             log("({} matches for '{}', using the first)".format(len(item_008_syms), LAYER_008_KEY))
 
-    t = Transaction(doc, "Fill Planter Cavity (026) + 005 + 006 + 008")
+    t = Transaction(doc, "Fill Planter Cavity (026) + 005 + 006 + 008 + 010")
     t.Start()
     try:
         loops = List[CurveLoop]()
@@ -984,32 +1080,28 @@ def main():
                     sym.Activate()
                     doc.Regenerate()
                 y = soil_y - BOTTOM_ITEM_OFFSET
-                p0 = to_3d(bottom[0], y)
-                p1 = to_3d(bottom[1], y)
-                doc.Create.NewFamilyInstance(Line.CreateBound(p0, p1), sym, view)
+                # sides: straight from the top of 026 to the 005 bottom line, 32.5 mm outside the inner wall of 026
+                side_005, x0_005, x1_005 = straight_sides_outward(poly, y, BOTTOM_ITEM_SIDE_OUT)
+                # bottom spans exactly side to side, so the ends meet
+                place_line_detail(sym, x0_005, y, x1_005, y)
+                place_detail_on_segs(sym, side_005)
 
                 if item_006_msg is None:
                     try:
-                        x0_006 = bottom[0] + LAYER_006_BOTTOM_INSET
-                        x1_006 = bottom[1] - LAYER_006_BOTTOM_INSET
-                        if (x1_006 - x0_006) < MM:
-                            raise Exception("006 span is too short after 10 mm side offsets")
                         y_006 = y + LAYER_006_ABOVE_005
-                        # sides: straight from the top of 026 to the 006 bottom line
-                        side_segs = straight_sides_006(poly, y_006, LAYER_006_SIDE_OFFSET)
+                        # sides: straight from the top of 026 to the 006 bottom line,
+                        # 22.5 mm outside the inner left / right wall of 026
+                        side_segs, x0_006, x1_006 = straight_sides_outward(
+                            poly, y_006, LAYER_006_SIDE_OUT)
+                        if (x1_006 - x0_006) < MM:
+                            raise Exception("006 span is too short")
                         log("006 bottom y {:.3f} (10 mm above 005), x {:.3f}..{:.3f}".format(
                             y_006, x0_006, x1_006))
-                        log("006 side segments (straight, 7.5 mm inside 026 outer edge): {}"
-                              .format(len(side_segs)))
-                        for a_, b_ in side_segs:
-                            for px, py in (a_, b_):
-                                if abs(py - y_006) < 1e-6 and not (x0_006 - 1e-6 <= px <= x1_006 + 1e-6):
-                                    log("WARNING: a 006 side ends at x {:.3f}, outside the 006 "
-                                          "bottom line x range".format(px))
                         sym006 = item_006_syms[0][0]
                         if not sym006.IsActive:
                             sym006.Activate()
                             doc.Regenerate()
+                        # bottom spans exactly side to side, so the ends meet
                         place_line_detail(sym006, x0_006, y_006, x1_006, y_006)
                         place_detail_on_segs(sym006, side_segs)
                     except Exception as ex:
@@ -1021,10 +1113,18 @@ def main():
 
         if item_008_msg is None:
             try:
-                segs_008 = offset_poly_edges(poly, LAYER_008_OFFSET, ("side", "bottom"))
+                # topmost short vertical portion: 10 mm inside the 006 side
+                in_l, in_r = inner_side_x(poly)
+                x_006_left = in_l - LAYER_006_SIDE_OUT
+                x_006_right = in_r + LAYER_006_SIDE_OUT
+                ov_008 = top_vertical_overrides(
+                    poly,
+                    x_006_left + LAYER_008_TOP_FROM_006,
+                    x_006_right - LAYER_008_TOP_FROM_006)
+                segs_008 = offset_poly_edges(poly, LAYER_008_OFFSET, ("side", "bottom"), ov_008)
                 if not segs_008:
                     raise Exception("no 026 edges to offset for 008")
-                log("008 segments (15 mm from 026, no top): {}".format(len(segs_008)))
+                log("008 segments (15 mm from 026, top vertical 10 mm from 006): {}".format(len(segs_008)))
                 sym008 = item_008_syms[0][0]
                 if not sym008.IsActive:
                     sym008.Activate()
@@ -1033,6 +1133,31 @@ def main():
                     raise Exception("008 segments were too short to place")
             except Exception as ex:
                 item_008_msg = "could not place 008: {}".format(ex)
+
+        if item_010_msg is None:
+            try:
+                floor_y = filled_region_bottom_y(fr)
+                if floor_y is None:
+                    floor_y = poly_bottom_y(poly)
+                if floor_y is None:
+                    raise Exception("could not read bottom boundary of 026")
+                x_mid = 0.5 * (min(p_[0] for p_ in poly) + max(p_[0] for p_ in poly))
+                y_010 = floor_y - LAYER_010_BELOW_026
+                log("010 at x {:.3f}, y {:.3f} (80 mm below 026 bottom)".format(x_mid, y_010))
+                sym010 = item_010_syms[0][0]
+                if not sym010.IsActive:
+                    sym010.Activate()
+                    doc.Regenerate()
+                inst010 = doc.Create.NewFamilyInstance(to_3d(x_mid, y_010), sym010, view)
+                # override this instance to Halftone in the active view
+                try:
+                    ogs = OverrideGraphicSettings()
+                    ogs.SetHalftone(True)
+                    view.SetElementOverrides(inst010.Id, ogs)
+                except Exception as ex_ht:
+                    log("010 halftone override failed: {}".format(ex_ht))
+            except Exception as ex:
+                item_010_msg = "could not place 010: {}".format(ex)
 
         t.Commit()
     except Exception as ex:
@@ -1054,6 +1179,10 @@ def main():
             msg += "\n008 placed (15 mm from 026, except top)."
         else:
             notes.append("008 NOT placed: " + item_008_msg)
+        if item_010_msg is None:
+            msg += "\n010 placed (centre, 80 mm below 026)."
+        else:
+            notes.append("010 NOT placed: " + item_010_msg)
         if notes:
             forms.alert(msg + "\n\n" + "\n".join(notes), title="Planter Fill")
         else:
