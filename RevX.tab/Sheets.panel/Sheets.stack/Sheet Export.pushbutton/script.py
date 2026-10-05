@@ -1203,6 +1203,70 @@ class SheetExportWindow(forms.WPFWindow):
         self.TxtProgress.Text = "%d / %d  %s" % (done, total, label)
         self._pump()
 
+    # ------------------------------------------------------------------ #
+    #  LINK IMAGES  (raster images written next to DWG/DGN exports)
+    # ------------------------------------------------------------------ #
+    LINK_IMAGES_NAME = "Link Images"
+    _IMG_EXTS = (".png", ".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".bmp",
+                 ".tga", ".gif", ".jp2", ".pcx", ".pict")
+
+    def _link_images_dir(self):
+        """ONE 'Link Images' folder for the whole export run. Sits beside the
+        format / series folders (directly under the export root, or under the
+        date folder when that option is on), so it is the same folder no
+        matter how many format or group sub-folders are used."""
+        root = self.TxtFolder.Text
+        if self.ChkSubfolderDate.IsChecked:
+            root = os.path.join(root, datetime.datetime.now().strftime("%Y-%m-%d"))
+        path = os.path.join(root, self.LINK_IMAGES_NAME)
+        if not os.path.isdir(path):
+            os.makedirs(path)
+        return path
+
+    def _snapshot_images(self, folder):
+        """{filename: (mtime, size)} of every image file currently in folder."""
+        snap = {}
+        try:
+            for f in os.listdir(folder):
+                full = os.path.join(folder, f)
+                if os.path.isfile(full) and f.lower().endswith(self._IMG_EXTS):
+                    st = os.stat(full)
+                    snap[f] = (st.st_mtime, st.st_size)
+        except Exception:
+            pass
+        return snap
+
+    def _collect_link_images(self, folder, before):
+        """Move images created/updated in `folder` since the `before`
+        snapshot into the single 'Link Images' folder."""
+        moved = 0
+        try:
+            after = self._snapshot_images(folder)
+            changed = [f for f, sig in after.items() if before.get(f) != sig]
+            if not changed:
+                return 0
+            dest_dir = self._link_images_dir()
+            for f in changed:
+                src = os.path.join(folder, f)
+                dest = os.path.join(dest_dir, f)
+                try:
+                    if os.path.exists(dest):
+                        if os.path.getsize(dest) == os.path.getsize(src):
+                            os.remove(src)          # same image already collected
+                            continue
+                        base, ext = os.path.splitext(f)     # different image, same name
+                        n = 2
+                        while os.path.exists(dest):
+                            dest = os.path.join(dest_dir, "%s_%d%s" % (base, n, ext))
+                            n += 1
+                    shutil.move(src, dest)
+                    moved += 1
+                except Exception as ex:
+                    self._log("Link Images: could not move %s (%s)" % (f, ex))
+        except Exception as ex:
+            self._log("Link Images: %s" % ex)
+        return moved
+
     def _output_dir(self, fmt, item=None):
         root = self.TxtFolder.Text
         if self.ChkSubfolderDate.IsChecked:
@@ -1605,7 +1669,9 @@ class SheetExportWindow(forms.WPFWindow):
             self._set_progress(index - 1, total, "DWG  " + fname)
             try:
                 ids = List[ElementId]([item.Id])
+                _before = self._snapshot_images(folder)
                 doc.Export(folder, fname, ids, opt)
+                self._collect_link_images(folder, _before)
                 records.append(("DWG", item.Number or item.Name,
                                 fname + ".dwg", "OK", ""))
             except Exception as ex:
@@ -1644,7 +1710,9 @@ class SheetExportWindow(forms.WPFWindow):
             self._set_progress(index - 1, total, "DGN  " + fname)
             try:
                 ids = List[ElementId]([item.Id])
+                _before = self._snapshot_images(folder)
                 doc.Export(folder, fname, ids, opt)
+                self._collect_link_images(folder, _before)
                 records.append(("DGN", item.Number or item.Name,
                                 fname + ".dgn", "OK", ""))
             except Exception as ex:
