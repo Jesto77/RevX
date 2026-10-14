@@ -69,6 +69,7 @@ LAYER_008_KEY = "008"
 LAYER_008_OFFSET = 15.0 * MM        # 008 inset from 026 boundary (except top)
 LAYER_008_TOP_FROM_006 = 10.0 * MM  # 008 topmost vertical portion: inside the 006 side by this
 HORIZ_TOL = 0.008                # ~2.4 mm slope tolerance for horizontal lines
+TOP_BAND_MAX = 60.0 * MM         # max depth below the highest point searched when closing the open top
 SHOW_RESULT = False              # True = show the output window + result message again
 
 
@@ -233,7 +234,9 @@ def close_top(g, seed, width):
     """Closes the open top: joins the highest node left of the seed and the highest right of it
     (closest to the seed in X) - the planter walls end without a top line."""
     ymax = max(p[1] for p in g.pts)
-    band = 0.03 * width
+    # 3 % of the width grows with the span (120 mm on a 4 m planter) and then picks coping /
+    # step nodes below the real top, so the top closing line - and 026 - ends up wrong.
+    band = min(0.03 * width, TOP_BAND_MAX)
     left = [i for i, p in enumerate(g.pts) if p[1] >= ymax - band and p[0] < seed[0]]
     right = [i for i, p in enumerate(g.pts) if p[1] >= ymax - band and p[0] > seed[0]]
     if not left or not right:
@@ -666,6 +669,7 @@ def filled_region_bottom_y(fr):
         return None
 
     horiz_ys = []
+    sloped_ys = []
     all_ys = []
     for loop in loops:
         for curve in loop:
@@ -678,9 +682,13 @@ def filled_region_bottom_y(fr):
             all_ys.append(b.Y)
             if abs(a.Y - b.Y) <= HORIZ_TOL and abs(a.X - b.X) > abs(a.Y - b.Y):
                 horiz_ys.append(0.5 * (a.Y + b.Y))
+            elif abs(a.Y - b.Y) <= 0.05 * abs(a.X - b.X):
+                sloped_ys.append(min(a.Y, b.Y))   # gently sloping floor on a long span
 
     if horiz_ys:
         return min(horiz_ys)
+    if sloped_ys:
+        return min(sloped_ys)
     if all_ys:
         return min(all_ys)
     return None
@@ -692,13 +700,18 @@ def poly_bottom_y(poly):
         return None
     n = len(poly)
     horiz_ys = []
+    sloped_ys = []
     all_ys = [p[1] for p in poly]
     for i in range(n):
         a, b = poly[i], poly[(i + 1) % n]
         if abs(a[1] - b[1]) <= HORIZ_TOL and abs(a[0] - b[0]) > abs(a[1] - b[1]):
             horiz_ys.append(0.5 * (a[1] + b[1]))
+        elif abs(a[1] - b[1]) <= 0.05 * abs(a[0] - b[0]):
+            sloped_ys.append(min(a[1], b[1]))
     if horiz_ys:
         return min(horiz_ys)
+    if sloped_ys:
+        return min(sloped_ys)
     if all_ys:
         return min(all_ys)
     return None
@@ -734,7 +747,11 @@ def classify_poly_edges(poly):
             continue
         a, b = poly[i], poly[(i + 1) % n]
         avg_y = 0.5 * (a[1] + b[1])
-        if avg_y <= ymin + 0.22 * h:
+        dx_, dy_ = abs(b[0] - a[0]), abs(b[1] - a[1])
+        # a gently sloping floor (<= 5 %) is still the bottom: on a long span the fall to the
+        # drain is bigger than 22 % of the height and the edge was wrongly treated as a side
+        gentle_floor = dx_ > 0 and dy_ <= 0.05 * dx_ and avg_y <= ymin + 0.5 * h
+        if avg_y <= ymin + 0.22 * h or gentle_floor:
             kinds.append("bottom")
         else:
             kinds.append("side")
