@@ -1,16 +1,19 @@
 title: "Planting Quantity"
 author: "Jesto Joy"
 tooltip: |
-  Fills the PQ parameter on every PLANTING Filled Region so the schedule quantity always matches the displayed area x density.
+  Copies the area of every PLANTING Filled Region into Planting Area, calculates Planting Quantity per region, and fills PQ so the schedule quantity always matches the displayed area x density.
 
   How to Use:
+  • Fill in the Planting Density type parameter on the PLANTING filled region types (manual).
   • Click "Planting Quantity" (no selection needed).
   • The tool finds all Filled Regions in the project whose type Comments value is PLANTING.
-  • For each view and filled region type, it totals the Planting Area, rounds the total, multiplies it by Planting Density and writes the result to PQ on those regions.
+  • Planting Area: the region's own Area is copied into its Planting Area parameter.
+  • Planting Quantity: Planting Area x Planting Density, rounded to a whole number, for each region.
+  • PQ: for each view and filled region type, the total Planting Area is rounded, multiplied by Planting Density and written to PQ on those regions.
   • A report table lists every view/type with its area, density and PQ.
   • Run it again after any area or density change.
 
   Requirements:
   • Filled Region types with the Type Comments value PLANTING.
-  • Instance parameters: "Planting Area" and "PQ".
-  • Type parameter: "Planting Density".
+  • Instance parameters: "Planting Area", "Planting Quantity" and "PQ".
+  • Type parameter: "Planting Density" (types without a density are skipped for Planting Quantity and PQ).
