@@ -41,8 +41,10 @@ from System.Collections.Generic import List
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, FilledRegion, FilledRegionType,
     Transaction, Line, Curve, CurveLoop, GeometryInstance, GeometryElement, Options,
-    XYZ, BuiltInParameter, FamilySymbol, FamilyPlacementType, OverrideGraphicSettings
+    XYZ, BuiltInParameter, FamilySymbol, FamilyPlacementType, OverrideGraphicSettings,
+    Plane, SketchPlane, ViewType
 )
+from Autodesk.Revit.Exceptions import OperationCanceledException
 from pyrevit import forms, script
 
 doc = __revit__.ActiveUIDocument.Document
@@ -528,6 +530,10 @@ def gather_segments(seed):
                          .WhereElementIsNotElementType().ToElements())
         except Exception:
             pass
+    # Only elements drawn IN this view (detail lines / detail components). Model walls,
+    # floors and generic models cut by a section / detail view have huge boxes that
+    # pull the whole section into the search and break the closed-area detection.
+    elems = [e for e in elems if getattr(e, "ViewSpecific", False)]
     boxed = [(e, element_box(e)) for e in elems]
     boxed = [(e, b) for e, b in boxed if b is not None]
     sx, sy = seed
@@ -974,13 +980,44 @@ def find_point_based_detail(key):
     return point_based, found
 
 
+def ensure_work_plane():
+    """PickPoint needs a work plane. Plans and drafting views have one implicitly, but
+    section / elevation / detail views do not until one is set (Set Work Plane)."""
+    if view.ViewType == ViewType.DrawingSheet:
+        return
+    if view.ViewType == ViewType.DraftingView:
+        return
+    try:
+        if view.SketchPlane is not None:
+            return
+    except Exception:
+        pass
+    tw = Transaction(doc, "Set work plane")
+    tw.Start()
+    try:
+        plane = Plane.CreateByNormalAndOrigin(view.ViewDirection, view.Origin)
+        view.SketchPlane = SketchPlane.Create(doc, plane)
+        tw.Commit()
+    except Exception:
+        tw.RollBack()
+        raise
+
+
 def main():
     target_type = pick_region_type()
 
     try:
+        ensure_work_plane()
+    except Exception as ex:
+        forms.alert("Could not set a work plane in this view:\n{}".format(ex),
+                    exitscript=True)
+    try:
         pt = uidoc.Selection.PickPoint("Click INSIDE the planter soil area (the cavity)")
-    except Exception:
+    except OperationCanceledException:
         script.exit()
+    except Exception as ex:
+        forms.alert("Could not start the point pick in this view:\n{}".format(ex),
+                    exitscript=True)
     q = to_2d(pt)
     seed = (q.X, q.Y)
 
