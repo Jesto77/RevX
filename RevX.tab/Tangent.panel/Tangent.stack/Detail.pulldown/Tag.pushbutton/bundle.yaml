@@ -1,10 +1,16 @@
 title: "Tag"
 author: "Jesto Joy"
 tooltip: |
-  Tags Filled Regions and Detail Components with the type of selected referernce tag in proper alignment (Construction Codes).
+  Tags Filled Regions and Detail Components with the type of a selected reference tag in proper alignment (Construction Codes).
 
   How to Use:
-  • Open a supported Detail, Drafting, Section view.
-  • Click "Detail Tag".
-  • Select the tag for reference. 
-  • The tags are placed downward from the picked path with uniform gaps.
+  • Open a supported Detail, Drafting or Section view.
+  • Click "Tag" and choose the tag style:
+
+  Side Tag
+  • Select ONE existing tag for reference.
+  • The tags are placed downward from the picked tag with uniform gaps, with leaders ending on the elements.
+
+  Under Tag
+  • Select ONE or TWO existing tags for reference, then click Finish.
+  • The tags are placed in columns to the right of the picked tags, with leaders coming up from below to the elements.
