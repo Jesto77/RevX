@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 __title__ = "Planting Quantity"
 __author__ = "Jesto Joy"
-__doc__ = ("1) Copies each PLANTING Filled Region's Area into Planting Area. "
+__doc__ = ("1) Copies each TAGGED PLANTING Filled Region's Area into Planting Area. "
            "2) Planting Quantity = round(Planting Area x Planting Density). "
-           "3) PQ = round(total Planting Area per view+type) x Planting Density.")
+           "3) PQ = round(total TAGGED Planting Area per view+type) x Planting Density. "
+           "Untagged regions get PQ too, but Planting Area and Planting Quantity = 0.")
 
 import math
 from collections import OrderedDict
@@ -90,7 +91,33 @@ def round_half_up(x):
     return int(math.floor(x + 0.5))
 
 
-# ---- collect PLANTING filled regions in the whole project ----
+def get_tagged_keys():
+    """Set of (view id, element id) for every element that has a tag in its view."""
+    keys = set()
+    tags = (DB.FilteredElementCollector(doc)
+            .OfClass(DB.IndependentTag)
+            .WhereElementIsNotElementType()
+            .ToElements())
+    for tg in tags:
+        vid = str(tg.OwnerViewId)
+        ids = []
+        try:                                    # Revit 2022+
+            ids = list(tg.GetTaggedLocalElementIds())
+        except Exception:
+            try:
+                el = tg.GetTaggedLocalElement()  # older versions
+                if el is not None:
+                    ids = [el.Id]
+            except Exception:
+                pass
+        for eid in ids:
+            keys.add((vid, str(eid)))
+    return keys
+
+
+# ---- collect PLANTING filled regions in the whole project (TAGGED only) ----
+tagged_keys = get_tagged_keys()
+
 regions = (DB.FilteredElementCollector(doc)
            .OfClass(DB.FilledRegion)
            .WhereElementIsNotElementType()
@@ -105,8 +132,12 @@ for fr in regions:
     if view is None:
         continue
     key = (str(fr.OwnerViewId), str(t.Id))
-    g = groups.setdefault(key, {"type": t, "view": view.Name, "items": []})
-    g["items"].append(fr)
+    g = groups.setdefault(key, {"type": t, "view": view.Name,
+                                "tagged": [], "untagged": []})
+    if (str(fr.OwnerViewId), str(fr.Id)) in tagged_keys:
+        g["tagged"].append(fr)
+    else:
+        g["untagged"].append(fr)
 
 if not groups:
     forms.alert("No Filled Regions found whose type Comments = '{}'."
@@ -114,8 +145,24 @@ if not groups:
 
 report = []
 skipped = []
+zeroed = 0
+zero_fail = 0
 with revit.Transaction("Planting Quantity"):
     for key, g in groups.items():
+        # untagged regions: always reset Planting Area and Quantity to 0
+        for fr in g["untagged"]:
+            for pname in (AREA_PARAM, QTY_PARAM):
+                if not set_num(fr.LookupParameter(pname), 0):
+                    zero_fail += 1
+        zeroed += len(g["untagged"])
+
+        if not g["tagged"]:
+            for fr in g["untagged"]:      # no total to base PQ on
+                if not set_num(fr.LookupParameter(PQ_PARAM), 0):
+                    zero_fail += 1
+            skipped.append("{} [{}] : no tagged regions - nothing calculated (untagged set to 0)"
+                           .format(type_name(g["type"]), g["view"]))
+            continue
         t = g["type"]
         name = type_name(t)
         dens = num_value(t.LookupParameter(DENSITY_PARAM))
@@ -124,7 +171,7 @@ with revit.Transaction("Planting Quantity"):
         area_fail = 0
         qty_fail = 0
         # Step 1 + 2: per-region Planting Area and Planting Quantity
-        for fr in g["items"]:
+        for fr in g["tagged"]:
             ap = fr.get_Parameter(DB.BuiltInParameter.HOST_AREA_COMPUTED)
             if ap is None or not ap.HasValue:
                 area_fail += 1
@@ -143,7 +190,7 @@ with revit.Transaction("Planting Quantity"):
             skipped.append("{} [{}] : '{}' type parameter missing/empty - "
                            "Planting Area copied, Planting Quantity and PQ "
                            "not filled".format(name, g["view"], DENSITY_PARAM))
-            report.append((g["view"], name, len(g["items"]), total_area,
+            report.append((g["view"], name, len(g["tagged"]), total_area,
                            round_half_up(total_area), "-", "-", area_fail,
                            "-"))
             continue
@@ -152,15 +199,16 @@ with revit.Transaction("Planting Quantity"):
         rounded_total = round_half_up(total_area)
         pq = round_half_up(rounded_total * dens)
         pq_fail = 0
-        for fr in g["items"]:
+        # PQ goes on tagged AND untagged regions of this view+type
+        for fr in g["tagged"] + g["untagged"]:
             if not set_num(fr.LookupParameter(PQ_PARAM), pq):
                 pq_fail += 1
-        report.append((g["view"], name, len(g["items"]), total_area,
+        report.append((g["view"], name, len(g["tagged"]), total_area,
                        rounded_total, dens, pq, area_fail,
                        qty_fail + pq_fail))
 
 out = script.get_output()
-out.print_md("## Planting Quantity - PLANTING filled regions")
+out.print_md("## Planting Quantity - TAGGED PLANTING filled regions")
 rows = [[v, n, c, "{:.3f}".format(a), ta, d, pq, af, f] for
         (v, n, c, a, ta, d, pq, af, f) in report]
 if rows:
@@ -171,3 +219,7 @@ if rows:
                                    "Qty/PQ write failed"])
 for s in skipped:
     out.print_md("**Skipped:** " + s)
+if zeroed:
+    out.print_md("_{} untagged PLANTING filled region(s): Planting Area and "
+                 "Planting Quantity set to 0, PQ filled ({} write failure(s))._"
+                 .format(zeroed, zero_fail))
