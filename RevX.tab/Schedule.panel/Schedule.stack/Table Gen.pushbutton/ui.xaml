@@ -89,6 +89,7 @@
         <!-- output settings -->
         <Border Grid.Row="2" Background="#FF26263A" CornerRadius="8"
                 Padding="12" Margin="0,0,0,8">
+            <StackPanel Orientation="Vertical">
             <StackPanel Orientation="Horizontal">
                 <StackPanel Width="200" Margin="0,0,12,0">
                     <Label Content="SCHEDULE NAME"/>
@@ -123,9 +124,31 @@
                     <Label Content="SCALE %"/>
                     <TextBox x:Name="scale_tb" Text="100"/>
                 </StackPanel>
-                <StackPanel Width="80">
-                    <Label Content="IMG SIZE (mm)"/>
-                    <TextBox x:Name="imgsize_tb" Text="20"/>
+            </StackPanel>
+
+                <!-- image placement -->
+                <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                    <StackPanel Width="200" Margin="0,0,12,0">
+                        <Label Content="IMAGE SIZING"/>
+                        <ComboBox x:Name="imgmode_cb">
+                            <ComboBoxItem Content="Fixed size (mm)" IsSelected="True"/>
+                            <ComboBoxItem Content="Fit cell width (with buffer)"/>
+                        </ComboBox>
+                    </StackPanel>
+                    <StackPanel Width="110" Margin="0,0,12,0">
+                        <Label Content="IMG SIZE (mm)"/>
+                        <TextBox x:Name="imgsize_tb" Text="20"
+                                 ToolTip="Fixed mode: image width in mm."/>
+                    </StackPanel>
+                    <StackPanel Width="130" Margin="0,0,12,0">
+                        <Label Content="SIDE BUFFER (mm)"/>
+                        <TextBox x:Name="imgbuf_tb" Text="2" IsEnabled="False"
+                                 ToolTip="Fit mode: empty space between the image and the left / right cell border. Image width = column width minus this on both sides; every image gets the same width and height, and rows grow if they are too short."/>
+                    </StackPanel>
+                    <TextBlock x:Name="imgmode_hint" Foreground="#FF9A9AB0"
+                               FontSize="11" VerticalAlignment="Bottom"
+                               Margin="0,0,0,6"
+                               Text="Fixed: every image is IMG SIZE wide, centred in its cell."/>
                 </StackPanel>
             </StackPanel>
         </Border>

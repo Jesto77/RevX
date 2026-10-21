@@ -64,6 +64,10 @@ ANS = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
 
 IMG_ASPECT = 2.0 / 3.0
 IMG_BUFFER = 1.25
+NORMALIZE_LAST_ERROR = ['']
+IMG_MODE_FIXED = 'fixed'
+IMG_MODE_FIT = 'fit'
+DEFAULT_SIDE_BUFFER_MM = 2.0
 PX_PER_MM = 12.0
 CANVAS_CAP_PX = 2000
 
@@ -1105,6 +1109,72 @@ def compute_capped_split(nrows, header_rows, num_parts,
     return ranges
 
 
+def fit_image_metrics(table, settings):
+    """Fit mode: (uniform image width mm, min row height mm) or None."""
+    scale = settings.get('scale', 1.0)
+    defw = settings.get('def_colw', 40.0)
+    buf = settings.get('side_buffer', DEFAULT_SIDE_BUFFER_MM)
+    data = table['data']
+    ncols = len(data[0]) if data else 0
+    cws = table.get('col_widths') or []
+    merge_lookup = {}
+    for (mr1, mc1, mr2, mc2) in table['merges']:
+        for rr in range(mr1, mr2 + 1):
+            for cc in range(mc1, mc2 + 1):
+                merge_lookup[(rr, cc)] = (mr1, mc1, mr2, mc2)
+    widths = []
+    for im in table.get('images', []):
+        if not im.get('file'):
+            continue
+        r1, c1, r2, c2 = merge_lookup.get(
+            (im['row'], im['col']),
+            (im['row'], im['col'], im['row'], im['col']))
+        w = 0.0
+        for c in range(c1, min(c2 + 1, ncols)):
+            cw = cws[c] if c < len(cws) and cws[c] else defw
+            w += cw * scale
+        widths.append(w)
+    if not widths:
+        return None
+    img_w = max(2.0, min(widths) - 2.0 * buf)
+    return img_w, img_w * IMG_ASPECT + 2.0 * buf
+
+
+def enforce_fit_row_heights(table, settings):
+    """Raise image rows to the minimum Fit-mode height BEFORE splitting,
+    so part heights are real and stay equal."""
+    m = fit_image_metrics(table, settings)
+    if not m:
+        return 0
+    min_h = m[1]
+    scale = settings.get('scale', 1.0) or 1.0
+    defh = settings.get('def_rowh', 8.0)
+    rh = table['row_heights']
+    for r in range(len(rh)):
+        if not rh[r]:
+            rh[r] = defh
+    merge_lookup = {}
+    for (mr1, mc1, mr2, mc2) in table['merges']:
+        for rr in range(mr1, mr2 + 1):
+            for cc in range(mc1, mc2 + 1):
+                merge_lookup[(rr, cc)] = (mr1, mc1, mr2, mc2)
+    grown = 0
+    for im in table.get('images', []):
+        if not im.get('file'):
+            continue
+        r1, c1, r2, c2 = merge_lookup.get(
+            (im['row'], im['col']),
+            (im['row'], im['col'], im['row'], im['col']))
+        rows = [r for r in range(r1, min(r2 + 1, len(rh)))]
+        cur = sum(rh[r] for r in rows) * scale
+        if cur < min_h - 1e-6 and rows:
+            add = (min_h - cur) / scale / len(rows)
+            for r in rows:
+                rh[r] += add
+            grown += 1
+    return grown
+
+
 def compute_fit_scale_factor(full_table, header_rows, num_parts,
                              max_h_mm, scale=1.0, ranges=None):
     """Return factor so tallest part becomes exactly max_h_mm."""
@@ -1530,6 +1600,10 @@ class TableGenWindow(forms.WPFWindow):
         self.paste_btn.Click += self.paste_clipboard
         self.sheet_cb.SelectionChanged += self.sheet_changed
         self.area_cb.SelectionChanged += self.area_changed
+        try:
+            self.imgmode_cb.SelectionChanged += self.imgmode_changed
+        except AttributeError:
+            pass    # old ui.xaml without the image-mode control
         self.range_tb.LostFocus += self.range_edited
         self.range_tb.KeyDown += self.range_keydown
         self.cancel_btn.Click += self._cancel
@@ -1549,6 +1623,16 @@ class TableGenWindow(forms.WPFWindow):
             self.split_btn.Click += self._split_selected
         except AttributeError:
             pass
+
+    def imgmode_changed(self, sender, args):
+        fit = (self.imgmode_cb.SelectedIndex == 1)
+        self.imgbuf_tb.IsEnabled = fit
+        self.imgsize_tb.IsEnabled = not fit
+        self.imgmode_hint.Text = (
+            "Fit: width = column width minus buffer each side; height "
+            "follows. Same size for ALL images; short rows grow to fit."
+            if fit else
+            "Fixed: every image is IMG SIZE wide, centred in its cell.")
 
     def _get_crop(self):
         if (not self.file_path
@@ -2059,6 +2143,15 @@ class TableGenWindow(forms.WPFWindow):
                 img_size = 20.0
         except Exception:
             img_size = 20.0
+        img_mode = (IMG_MODE_FIT
+                    if self.imgmode_cb.SelectedIndex == 1
+                    else IMG_MODE_FIXED)
+        try:
+            side_buffer = float(self.imgbuf_tb.Text)
+            if side_buffer < 0:
+                side_buffer = 0.0
+        except Exception:
+            side_buffer = DEFAULT_SIDE_BUFFER_MM
         self.result = {
             'table': self.table,
             'name': self.name_tb.Text.strip() or "New Table",
@@ -2077,6 +2170,8 @@ class TableGenWindow(forms.WPFWindow):
                 'def_rowh': rowh,
                 'scale': scale,
                 'img_size': img_size,
+                'img_mode': img_mode,
+                'side_buffer': side_buffer,
             },
         }
         self.Close()
@@ -2165,7 +2260,8 @@ def apply_sizes_uniform(header, first_r, first_c,
 
 
 def normalize_image(filepath, cell_w_mm, cell_h_mm,
-                    img_size_mm, out_tag=''):
+                    img_size_mm, out_tag='',
+                    img_mode=IMG_MODE_FIXED, side_buffer_mm=0.0):
     try:
         try:
             import clr
@@ -2192,11 +2288,20 @@ def normalize_image(filepath, cell_w_mm, cell_h_mm,
         else:
             actual_px_mm = PX_PER_MM
 
-        img_w_px = img_size_mm * actual_px_mm
-        img_h_px = img_size_mm * IMG_ASPECT * actual_px_mm
-
-        max_w = cw / IMG_BUFFER
-        max_h = ch / IMG_BUFFER
+        if img_mode == IMG_MODE_FIT:
+            # img_size_mm is the ONE uniform width chosen for the whole
+            # table; height follows the fixed aspect, so every image is
+            # identical regardless of row height. Rows are grown
+            # beforehand so it always fits.
+            img_w_px = img_size_mm * actual_px_mm
+            img_h_px = img_w_px * IMG_ASPECT
+            max_w = float(cw)
+            max_h = float(ch)
+        else:
+            img_w_px = img_size_mm * actual_px_mm
+            img_h_px = img_size_mm * IMG_ASPECT * actual_px_mm
+            max_w = cw / IMG_BUFFER
+            max_h = ch / IMG_BUFFER
         if img_w_px > max_w:
             k = max_w / img_w_px
             img_w_px *= k
@@ -2234,12 +2339,14 @@ def normalize_image(filepath, cell_w_mm, cell_h_mm,
             return out_path
         finally:
             src_img.Dispose()
-    except Exception:
+    except Exception as _e:
+        NORMALIZE_LAST_ERROR[0] = str(_e)
         return filepath
 
 
 def create_schedule(name, table, def_colw, def_rowh,
-                    scale=1.0, img_size_mm=20.0):
+                    scale=1.0, img_size_mm=20.0,
+                    img_mode=IMG_MODE_FIXED, side_buffer_mm=0.0):
     data = table['data']
     nrows = len(data)
     ncols = len(data[0])
@@ -2360,8 +2467,40 @@ def create_schedule(name, table, def_colw, def_rowh,
                     for r in range(r1, min(r2 + 1, nrows)))
             return w, h
 
-        min_w = img_size_mm * IMG_BUFFER
-        min_h = img_size_mm * IMG_ASPECT * IMG_BUFFER
+        def region_actual_mm(row, col):
+            """Region size as Revit REALLY has it now (read back)."""
+            reg = merge_lookup.get(
+                (row, col), (row, col, row, col))
+            r1, c1, r2, c2 = reg
+            w = 0.0
+            for c in range(c1, min(c2 + 1, ncols)):
+                try:
+                    w += header.GetColumnWidth(first_c + c) / MM_TO_FT
+                except Exception:
+                    w += col_mms[c]
+            h = 0.0
+            for r in range(r1, min(r2 + 1, nrows)):
+                try:
+                    h += header.GetRowHeight(first_r + r) / MM_TO_FT
+                except Exception:
+                    h += row_mms[r]
+            return w, h
+
+        used_sizes = {}
+
+        if img_mode == IMG_MODE_FIT:
+            # ONE uniform size for every image: column width minus the
+            # side buffer on both sides; height from the fixed aspect.
+            # Row heights grow (never shrink) to fit height + buffer.
+            _ws = [region_actual_mm(im['row'], im['col'])[0]
+                   for im in imgs if im.get('file')]
+            img_size_mm = max(2.0, (min(_ws) if _ws else img_size_mm)
+                              - 2.0 * side_buffer_mm)
+            min_w = 0.0
+            min_h = img_size_mm * IMG_ASPECT + 2.0 * side_buffer_mm
+        else:
+            min_w = img_size_mm * IMG_BUFFER
+            min_h = img_size_mm * IMG_ASPECT * IMG_BUFFER
 
         for im in imgs:
             if not im.get('file'):
@@ -2406,10 +2545,12 @@ def create_schedule(name, table, def_colw, def_rowh,
                 continue
             was_wmf = im['file'].lower().endswith(
                 ('.wmf', '.emf'))
-            reg_w, reg_h = region_mm(im['row'], im['col'])
+            reg_w, reg_h = region_actual_mm(im['row'], im['col'])
+            used_sizes[(im['row'], im['col'])] = (reg_w, reg_h)
             cache_key = (im['file'],
                          int(round(reg_w * 10)),
-                         int(round(reg_h * 10)))
+                         int(round(reg_h * 10)),
+                         img_mode, side_buffer_mm)
             if cache_key in img_id_cache:
                 img_id = img_id_cache[cache_key]
             else:
@@ -2417,7 +2558,15 @@ def create_schedule(name, table, def_colw, def_rowh,
                     im['file'], reg_w, reg_h, img_size_mm,
                     out_tag='{}x{}'.format(
                         int(round(reg_w * 10)),
-                        int(round(reg_h * 10))))
+                        int(round(reg_h * 10))),
+                    img_mode=img_mode,
+                    side_buffer_mm=side_buffer_mm)
+                if norm == im['file'] and not was_wmf:
+                    img_log.append((
+                        cell, src_name,
+                        'WARNING - image NOT normalised, shown at '
+                        'native proportions ({})'.format(
+                            NORMALIZE_LAST_ERROR[0] or 'no detail')))
                 if was_wmf and norm == im['file']:
                     img_log.append((
                         cell, src_name,
@@ -2486,6 +2635,16 @@ def create_schedule(name, table, def_colw, def_rowh,
                     'cell': cell,
                     'source': src_name,
                     'errors': ' | '.join(errors)})
+
+        # verify Revit did not resize any cell after normalising
+        for (rr, cc), (uw, uh) in used_sizes.items():
+            aw, ah = region_actual_mm(rr, cc)
+            if abs(aw - uw) > 0.5 or abs(ah - uh) > 0.5:
+                img_log.append((
+                    "{}{}".format(_index_to_col(cc), rr + 1), '',
+                    'WARNING - cell size changed by Revit '
+                    '({:.1f}x{:.1f} -> {:.1f}x{:.1f} mm); '
+                    'image may look stretched'.format(uw, uh, aw, ah)))
 
     final_cols = []
     for c in range(ncols):
@@ -2634,6 +2793,9 @@ def read_table_for_part(source_file, settings):
         nrows, ncols, full['merges'], full['styles'])
     scale = settings.get('scale', 1.0)
     max_h = settings.get('split_max_h') or 0
+    fit_mode = (settings.get('img_mode') == IMG_MODE_FIT)
+    if fit_mode:
+        enforce_fit_row_heights(full, settings)
 
     ranges = compute_balanced_split(
         nrows, header_rows, total,
@@ -2644,16 +2806,25 @@ def read_table_for_part(source_file, settings):
     start, end = ranges[part - 1]
 
     if max_h and max_h > 0:
-        fit_factor = compute_fit_scale_factor(
-            full, header_rows, len(ranges), max_h, scale,
-            ranges=ranges)
+        target_h = max_h
+        if fit_mode:
+            # images cannot shrink in Fit mode -> never scale rows
+            fit_factor = 1.0
+            tallest = max(
+                measure_part_height(full, a, b, header_rows, scale)
+                for (a, b) in ranges)
+            target_h = max(max_h, tallest)
+        else:
+            fit_factor = compute_fit_scale_factor(
+                full, header_rows, len(ranges), max_h, scale,
+                ranges=ranges)
         if fit_factor and abs(fit_factor - 1.0) > 1e-9:
             full['row_heights'] = [
                 (h * fit_factor) if h else h
                 for h in full['row_heights']]
 
         pad_overrides = pad_parts_to_equal_height(
-            full, ranges, header_rows, max_h, scale=1.0)
+            full, ranges, header_rows, target_h, scale=1.0)
         part_idx = part - 1
         part_override = {
             src_r: h
@@ -2690,7 +2861,9 @@ def run_one(name, table, settings, source_file):
             settings.get('def_colw', 40.0),
             settings.get('def_rowh', 8.0),
             settings.get('scale', 1.0),
-            settings.get('img_size', 20.0))
+            settings.get('img_size', 20.0),
+            settings.get('img_mode', IMG_MODE_FIXED),
+            settings.get('side_buffer', DEFAULT_SIDE_BUFFER_MM))
         new_view = result[0]
         img_log = result[1]
         overlay = result[2]
@@ -2977,6 +3150,11 @@ try:
                     .format(base_name, user_header_rows,
                             nrows_full))
 
+            fit_mode = (base_settings.get('img_mode')
+                        == IMG_MODE_FIT)
+            if fit_mode:
+                enforce_fit_row_heights(full_table, base_settings)
+
             cat_rows = detect_category_header_rows(
                 nrows_full, ncols_full,
                 full_table['merges'], full_table['styles'])
@@ -2991,9 +3169,26 @@ try:
             actual_parts = len(ranges)
 
             # 2) Scale so tallest part <= max_h
-            fit_factor = compute_fit_scale_factor(
-                full_table, user_header_rows, actual_parts,
-                max_h, scale, ranges=ranges)
+            target_h = max_h
+            if fit_mode:
+                # images cannot shrink in Fit mode -> never scale rows
+                fit_factor = 1.0
+                tallest = max(
+                    measure_part_height(full_table, a, b,
+                                        user_header_rows, scale)
+                    for (a, b) in ranges)
+                if tallest > max_h + 0.5:
+                    target_h = tallest
+                    all_problems.append(
+                        "{}: with uniform images the tallest part is "
+                        "{:.0f} mm (limit {:.0f} mm). All parts were "
+                        "made {:.0f} mm tall; use more parts or a "
+                        "smaller SIDE BUFFER to fit the limit."
+                        .format(base_name, tallest, max_h, tallest))
+            else:
+                fit_factor = compute_fit_scale_factor(
+                    full_table, user_header_rows, actual_parts,
+                    max_h, scale, ranges=ranges)
             if fit_factor and abs(fit_factor - 1.0) > 1e-9:
                 full_table['row_heights'] = [
                     (h * fit_factor) if h else h
@@ -3009,7 +3204,7 @@ try:
             #    EXACTLY max_h tall.
             pad_overrides = pad_parts_to_equal_height(
                 full_table, ranges, user_header_rows,
-                max_h, scale=1.0)
+                target_h, scale=1.0)
 
             # Compute final part heights (post-pad) for the log
             part_heights_after = []
@@ -3038,7 +3233,7 @@ try:
                     .format(base_name,
                             fit_factor * 100.0,
                             new_img_size,
-                            max_h,
+                            target_h,
                             user_header_rows,
                             ", ".join(
                                 "S{:02d}={:.0f}mm".format(
