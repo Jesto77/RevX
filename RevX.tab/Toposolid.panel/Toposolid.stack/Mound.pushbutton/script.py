@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Smooth Dome Topography / Toposolid from Contour Lines
-Uses Monotonic Cubic Hermite Splines (PCHIP) for true organic curvature.
+Smooth Topography / Toposolid from Contour Lines
+Thin-plate-spline (minimum-curvature) surface through the picked contours:
+smooth in every direction, passes through every contour, works for any
+boundary shape (concave / stepped / L-shaped).
 """
 
 from __future__ import division
@@ -35,10 +37,14 @@ if TopographySurface is None:
 # ----------------------------------------------------------
 # SETTINGS
 # ----------------------------------------------------------
-GRID_SPACING = 1.0           # ft – smaller = ultra-smooth surface mesh
-CONTOUR_SAMPLE = 1.0         # ft – sampling density along curves
-DOME_TOP_BUMP_RATIO = 0.35   # Extra curvature rounding above highest contour
-MAX_ARC_ANGLE_STEP = 0.08
+MIN_SPACING = 1.0            # ft – finest mesh spacing allowed
+MAX_GRID_POINTS = 3500       # interior mesh points (speed vs smoothness)
+CONTROL_POINTS = 260         # points used to solve the spline
+OVERSHOOT = 0.10             # allowed rise above top contour (x relief)
+SMOOTHNESS = 1e-2            # spline relaxation: higher = softer, less exact (0 = exact)
+SMOOTH_PASSES = 6            # mesh smoothing passes (removes steps / ripples)
+SMOOTH_STRENGTH = 0.6        # 0..1 blend toward neighbour average per pass
+EXACT_CONTOURS = False       # True = keep contour points at exact elevation
 
 # ----------------------------------------------------------
 # CURVE HELPERS
@@ -202,139 +208,115 @@ def min_dist_to_poly_edges(px, py, poly):
     return best
 
 # ----------------------------------------------------------
-# PCHIP MONOTONIC CUBIC INTERPOLATION (PERFECT S-CURVE)
+# THIN-PLATE SPLINE (minimum curvature surface)
 # ----------------------------------------------------------
 
-def create_pchip_spline(d_vals, z_vals):
-    """
-    Creates a smooth Monotonic Cubic Hermite Spline (PCHIP).
-    Guarantees tangent-continuous curves without flat plateaus or wiggles.
-    """
-    n = len(d_vals)
-    if n == 1:
-        return lambda d: z_vals[0]
+def solve_linear(A, b):
+    """Gaussian elimination with partial pivoting (in place)."""
+    n = len(b)
+    for col in range(n):
+        piv = col
+        best = abs(A[col][col])
+        for r in range(col + 1, n):
+            v = abs(A[r][col])
+            if v > best:
+                best, piv = v, r
+        if best < 1e-14:
+            raise Exception("Contour data is degenerate (singular system).")
+        if piv != col:
+            A[col], A[piv] = A[piv], A[col]
+            b[col], b[piv] = b[piv], b[col]
+        prow = A[col]
+        pv = prow[col]
+        for r in range(col + 1, n):
+            row = A[r]
+            f = row[col] / pv
+            if f != 0.0:
+                for c in range(col, n):
+                    row[c] -= f * prow[c]
+                b[r] -= f * b[col]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        row = A[r]
+        sm = b[r]
+        for c in range(r + 1, n):
+            sm -= row[c] * x[c]
+        x[r] = sm / row[r]
+    return x
 
-    dx = [d_vals[i+1] - d_vals[i] for i in range(n-1)]
-    dz = [z_vals[i+1] - z_vals[i] for i in range(n-1)]
-    S = [dz[i] / dx[i] if dx[i] > 1e-9 else 0.0 for i in range(n-1)]
+def tps_phi(r2):
+    if r2 < 1e-18:
+        return 0.0
+    return 0.5 * r2 * math.log(r2)
 
-    m = [0.0] * n
-    m[0] = 0.0   # Flat tangent at grade boundary
-    m[-1] = 0.0  # Flat tangent at dome top crest
+def build_tps(pts, vals, smoothing=1e-7):
+    """pts: [(x, y)] normalised, vals: [z]. Returns f(x, y)."""
+    n = len(pts)
+    m = n + 3
+    A = [[0.0] * m for _ in range(m)]
+    b = [0.0] * m
+    for i in range(n):
+        xi, yi = pts[i]
+        row = A[i]
+        for j in range(n):
+            dx = xi - pts[j][0]
+            dy = yi - pts[j][1]
+            row[j] = tps_phi(dx * dx + dy * dy)
+        row[i] += smoothing
+        row[n] = 1.0
+        row[n + 1] = xi
+        row[n + 2] = yi
+        A[n][i] = 1.0
+        A[n + 1][i] = xi
+        A[n + 2][i] = yi
+        b[i] = vals[i]
+    sol = solve_linear(A, b)
+    w = sol[:n]
+    a0, a1, a2 = sol[n], sol[n + 1], sol[n + 2]
 
-    for i in range(1, n - 1):
-        if S[i-1] * S[i] <= 0:
-            m[i] = 0.0
-        else:
-            m[i] = (2.0 * S[i-1] * S[i]) / (S[i-1] + S[i])
-
-    def evaluate(d):
-        if d <= d_vals[0]:
-            return z_vals[0]
-        if d >= d_vals[-1]:
-            return z_vals[-1]
-
-        idx = 0
-        for i in range(n - 1):
-            if d_vals[i] <= d <= d_vals[i+1]:
-                idx = i
-                break
-
-        x0, x1 = d_vals[idx], d_vals[idx+1]
-        y0, y1 = z_vals[idx], z_vals[idx+1]
-        h = x1 - x0
-        if abs(h) < 1e-9:
-            return y0
-
-        t = (d - x0) / h
-        h00 = (1.0 + 2.0 * t) * ((1.0 - t) ** 2)
-        h10 = t * ((1.0 - t) ** 2)
-        h01 = (t ** 2) * (3.0 - 2.0 * t)
-        h11 = (t ** 2) * (t - 1.0)
-
-        return h00 * y0 + h10 * h * m[idx] + h01 * y1 + h11 * h * m[idx+1]
-
-    return evaluate
+    def f(x, y):
+        z = a0 + a1 * x + a2 * y
+        for i in range(n):
+            dx = x - pts[i][0]
+            dy = y - pts[i][1]
+            r2 = dx * dx + dy * dy
+            if r2 > 1e-18:
+                z += w[i] * 0.5 * r2 * math.log(r2)
+        return z
+    return f
 
 # ----------------------------------------------------------
-# WAVE OF POINTS / CONCENTRIC RING LAYOUT
+# SAMPLING HELPERS
 # ----------------------------------------------------------
 
-def sample_loop_by_length(loop, step, start=0.0):
+def sample_curve(crv, spacing):
+    return densify_curve(crv, spacing)
+
+def sample_loop(loop, spacing):
     pts = []
-    next_s = start
-    c0 = 0.0
     for crv in loop:
-        try:
-            length = crv.Length
-        except Exception:
-            continue
-        if length <= 1e-9:
-            continue
-        seg_step = step
-        try:
-            radius = crv.Radius
-            if radius and radius > 1e-6:
-                seg_step = max(1e-4, min(step, radius * MAX_ARC_ANGLE_STEP))
-        except Exception:
-            pass
-        while next_s < c0 + length - 1e-9:
-            t = (next_s - c0) / length
-            pts.append(crv.Evaluate(t, True))
-            next_s += seg_step
-        c0 += length
+        pts.extend(densify_curve(crv, spacing)[:-1])
     return pts
 
-def poly_area_xy(pts):
+def poly_area(poly):
     a = 0.0
-    n = len(pts)
+    n = len(poly)
     for i in range(n):
-        j = (i + 1) % n
-        a += pts[i].X * pts[j].Y - pts[j].X * pts[i].Y
-    return abs(a * 0.5)
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return abs(a) * 0.5
 
-def offset_loop(loop, dist):
-    try:
-        return CurveLoop.CreateViaOffset(loop, dist, XYZ.BasisZ)
-    except Exception:
-        return None
-
-def build_rings(loop, row_step, point_step, max_rings=2000):
-    seed = sample_loop_by_length(loop, point_step)
-    base_area = poly_area_xy(seed)
-    if base_area <= 1e-9:
-        return []
-
-    sign = None
-    best_area = None
-    for sg in (1.0, -1.0):
-        test = offset_loop(loop, sg * row_step)
-        if test is None:
+def dedupe_xy(points, tol):
+    seen = set()
+    out = []
+    for p in points:
+        k = (int(round(p.X / tol)), int(round(p.Y / tol)))
+        if k in seen:
             continue
-        a = poly_area_xy(sample_loop_by_length(test, point_step))
-        if a < base_area - 1e-6 and (best_area is None or a < best_area):
-            sign, best_area = sg, a
-    if sign is None:
-        return []
-
-    rings = []
-    cur = loop
-    prev_area = base_area
-    for k in range(1, max_rings + 1):
-        nxt = offset_loop(cur, sign * row_step)
-        if nxt is None:
-            break
-        area = poly_area_xy(sample_loop_by_length(nxt, point_step))
-        if area >= prev_area - 1e-6:
-            break
-        shift = point_step * 0.5 if (k % 2) else 0.0
-        pts = sample_loop_by_length(nxt, point_step, shift)
-        if len(pts) < 3:
-            break
-        rings.append(pts)
-        cur = nxt
-        prev_area = area
-    return rings
+        seen.add(k)
+        out.append(p)
+    return out
 
 # ----------------------------------------------------------
 # MAIN EXECUTION
@@ -349,7 +331,8 @@ try:
 except Exception:
     script.exit()
 
-model_curves = [get_curve(doc.GetElement(r.ElementId)) for r in refs if get_curve(doc.GetElement(r.ElementId))]
+model_curves = [get_curve(doc.GetElement(r.ElementId)) for r in refs
+                if get_curve(doc.GetElement(r.ElementId))]
 if not model_curves:
     forms.alert("No valid contour curves detected.", exitscript=True)
 
@@ -362,131 +345,231 @@ try:
 except Exception:
     script.exit()
 
-boundary_curves = [get_curve(doc.GetElement(r.ElementId)) for r in brefs if get_curve(doc.GetElement(r.ElementId))]
+boundary_curves = [get_curve(doc.GetElement(r.ElementId)) for r in brefs
+                   if get_curve(doc.GetElement(r.ElementId))]
 if not boundary_curves:
     forms.alert("No boundary curves found.", exitscript=True)
 
-# Extract Densified Points
-contour_pts = []
+all_z = []
 for crv in model_curves:
-    contour_pts.extend(densify_curve(crv, CONTOUR_SAMPLE))
+    try:
+        all_z.append(crv.GetEndPoint(0).Z)
+    except Exception:
+        pass
+if not all_z:
+    forms.alert("Could not read contour elevations.", exitscript=True)
+base_z = min(all_z)
+top_z = max(all_z)
+relief = top_z - base_z
+if relief < 1e-6:
+    forms.alert("All contours are at the same elevation.", exitscript=True)
 
-if len(contour_pts) < 3:
-    forms.alert("Not enough contour points.", exitscript=True)
-
-base_z = min(p.Z for p in contour_pts)
-
-# Build Horizontal Boundary Loop
 loop = build_boundary_loop(boundary_curves, base_z)
 if loop is None:
-    forms.alert("Boundary lines must form a single continuous closed shape.", exitscript=True)
+    forms.alert("Boundary lines must form a single continuous closed shape.",
+                exitscript=True)
 
 boundary_poly = []
 for crv in loop:
     for p in crv.Tessellate()[:-1]:
         boundary_poly.append((p.X, p.Y))
 
-# ----------------------------------------------------------
-# MAP CONTOURS TO RADIAL DISTANCES FOR SMOOTH SPLINE
-# ----------------------------------------------------------
+# ---- mesh spacing from the footprint area ----
+area = poly_area(boundary_poly)
+spacing = max(MIN_SPACING, math.sqrt(area / float(MAX_GRID_POINTS)))
 
-# Group contours by Z elevation
-z_groups = {}
+# ---- contour points (own elevation, exact) ----
+contour_pts = []
+contour_len = 0.0
+for crv in model_curves:
+    contour_len += crv.Length
+    for p in densify_curve(crv, spacing):
+        contour_pts.append(p)
+contour_pts = dedupe_xy(contour_pts, spacing * 0.25)
+
+boundary_pts = [XYZ(p.X, p.Y, base_z) for p in sample_loop(loop, spacing)]
+boundary_pts = dedupe_xy(boundary_pts, spacing * 0.25)
+
+# ---- control points for the spline (limited count for speed) ----
+ctrl_sp = max(spacing, contour_len / float(CONTROL_POINTS * 0.75))
+ctrl = []
+for crv in model_curves:
+    ctrl.extend(densify_curve(crv, ctrl_sp))
+ctrl = dedupe_xy(ctrl, ctrl_sp * 0.3)
+bnd_sp = max(spacing, ctrl_sp * 1.5)
+ctrl_b = dedupe_xy([XYZ(p.X, p.Y, base_z) for p in sample_loop(loop, bnd_sp)],
+                   bnd_sp * 0.3)
+
+# drop boundary controls sitting on top of contour controls (avoid conflicts)
+filtered_b = []
+for b in ctrl_b:
+    clash = False
+    for c in ctrl:
+        if (b.X - c.X) ** 2 + (b.Y - c.Y) ** 2 < (bnd_sp * 0.5) ** 2:
+            clash = True
+            break
+    if not clash:
+        filtered_b.append(b)
+ctrl_all = ctrl + filtered_b
+
+if len(ctrl_all) < 4:
+    forms.alert("Not enough contour points to build a surface.",
+                exitscript=True)
+
+# ---- normalise coordinates ----
+xs = [p.X for p in ctrl_all] + [p[0] for p in boundary_poly]
+ys = [p.Y for p in ctrl_all] + [p[1] for p in boundary_poly]
+cx = (min(xs) + max(xs)) * 0.5
+cy = (min(ys) + max(ys)) * 0.5
+S = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.5
+if S < 1e-9:
+    S = 1.0
+
+def nx(x):
+    return (x - cx) / S
+
+def ny(y):
+    return (y - cy) / S
+
+tps_pts = [(nx(p.X), ny(p.Y)) for p in ctrl_all]
+tps_vals = [(p.Z - base_z) / relief for p in ctrl_all]
+
+try:
+    z_fun = build_tps(tps_pts, tps_vals, SMOOTHNESS)
+except Exception as e:
+    forms.alert("Could not solve the surface:\n\n{}".format(e),
+                exitscript=True)
+
+def surface_z(x, y):
+    z = base_z + z_fun(nx(x), ny(y)) * relief
+    lo = base_z
+    hi = top_z + relief * OVERSHOOT
+    if z < lo:
+        z = lo
+    elif z > hi:
+        z = hi
+    return z
+
+# ---- build mesh points: [x, y, z, locked] ----
+cell = spacing
+occupied = {}
+
+def occ_key(x, y):
+    return (int(math.floor(x / cell)), int(math.floor(y / cell)))
+
+def near_occupied(x, y, r):
+    ci, cj = occ_key(x, y)
+    r2 = r * r
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            for (px, py) in occupied.get((ci + di, cj + dj), ()):
+                if (px - x) ** 2 + (py - y) ** 2 < r2:
+                    return True
+    return False
+
+mesh = []          # [x, y, z, locked]
+for p in boundary_pts:
+    mesh.append([p.X, p.Y, base_z, True])          # boundary stays at base
+    occupied.setdefault(occ_key(p.X, p.Y), []).append((p.X, p.Y))
 for p in contour_pts:
-    z_key = round(p.Z, 3)
-    if z_key not in z_groups:
-        z_groups[z_key] = []
-    z_groups[z_key].append(p)
+    z = p.Z if EXACT_CONTOURS else surface_z(p.X, p.Y)
+    mesh.append([p.X, p.Y, z, bool(EXACT_CONTOURS)])
+    occupied.setdefault(occ_key(p.X, p.Y), []).append((p.X, p.Y))
 
-sorted_zs = sorted(z_groups.keys())
+bx = [p[0] for p in boundary_poly]
+by = [p[1] for p in boundary_poly]
+x = min(bx) + spacing * 0.5
+while x <= max(bx):
+    y = min(by) + spacing * 0.5
+    while y <= max(by):
+        if point_in_poly(x, y, boundary_poly) \
+                and min_dist_to_poly_edges(x, y, boundary_poly) > spacing * 0.5 \
+                and not near_occupied(x, y, spacing * 0.6):
+            mesh.append([x, y, surface_z(x, y), False])
+        y += spacing
+    x += spacing
 
-# Build Spline Control Points: (Distance from boundary, Elevation)
-d_control = [0.0]
-z_control = [base_z]
+# ---- smoothing passes: remove sudden steps / ripples ----
+nbr_hash = {}
+for i, m in enumerate(mesh):
+    nbr_hash.setdefault(occ_key(m[0], m[1]), []).append(i)
 
-for z_val in sorted_zs:
-    pts = z_groups[z_val]
-    # Calculate average distance of this contour level from the boundary
-    avg_d = sum(min_dist_to_poly_edges(p.X, p.Y, boundary_poly) for p in pts) / float(len(pts))
-    if avg_d > d_control[-1]:
-        d_control.append(avg_d)
-        z_control.append(z_val)
+radius = spacing * 1.6
+r2lim = radius * radius
+neighbours = []
+for i, m in enumerate(mesh):
+    ci, cj = occ_key(m[0], m[1])
+    lst = []
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            for k in nbr_hash.get((ci + di, cj + dj), ()):
+                if k != i:
+                    o = mesh[k]
+                    if (o[0] - m[0]) ** 2 + (o[1] - m[1]) ** 2 <= r2lim:
+                        lst.append(k)
+    neighbours.append(lst)
 
-# Compute max interior distance across the entire boundary footprint
-rings = build_rings(loop, GRID_SPACING * 0.866, GRID_SPACING)
-max_interior_d = (len(rings) + 1) * (GRID_SPACING * 0.866) if rings else max(d_control) * 1.3
+for _ in range(SMOOTH_PASSES):
+    new_z = [m[2] for m in mesh]
+    for i, m in enumerate(mesh):
+        if m[3] or not neighbours[i]:
+            continue
+        avg = sum(mesh[k][2] for k in neighbours[i]) / float(len(neighbours[i]))
+        new_z[i] = m[2] * (1.0 - SMOOTH_STRENGTH) + avg * SMOOTH_STRENGTH
+    for i, m in enumerate(mesh):
+        m[2] = new_z[i]
 
-# Softly round the top crest (Dome Peak)
-if max_interior_d > d_control[-1]:
-    dz = (z_control[-1] - z_control[-2]) if len(z_control) > 1 else 0.5
-    peak_z = z_control[-1] + dz * DOME_TOP_BUMP_RATIO
-    d_control.append(max_interior_d)
-    z_control.append(peak_z)
+# never below the base level
+for m in mesh:
+    if m[2] < base_z:
+        m[2] = base_z
 
-# Generate Continuous Spline Function
-z_spline = create_pchip_spline(d_control, z_control)
-
-# ----------------------------------------------------------
-# BUILD DENSE SMOOTH MESH
-# ----------------------------------------------------------
-
-xy_pts = []
-if len(rings) >= 2:
-    for ring in rings:
-        xy_pts.extend(ring)
-else:
-    # Grid Fallback
-    xs = [p[0] for p in boundary_poly]
-    ys = [p[1] for p in boundary_poly]
-    x = min(xs)
-    while x <= max(xs):
-        y = min(ys)
-        while y <= max(ys):
-            if point_in_poly(x, y, boundary_poly):
-                xy_pts.append(XYZ(x, y, 0))
-            y += GRID_SPACING
-        x += GRID_SPACING
-
-# Calculate 3D Points using the Spline Function
-smooth_pts = []
-for p in xy_pts:
-    d = min_dist_to_poly_edges(p.X, p.Y, boundary_poly)
-    z = z_spline(d)
-    smooth_pts.append(XYZ(p.X, p.Y, z))
-
-# Add Boundary Anchor Ring (at base_z)
-for crv in loop:
-    for p in crv.Tessellate()[:-1]:
-        smooth_pts.append(XYZ(p.X, p.Y, base_z))
+mesh = [XYZ(m[0], m[1], m[2]) for m in mesh]
 
 # ----------------------------------------------------------
-# CREATE TOPO / TOPOSOLID (NO SUCCESS POPUP)
+# CREATE TOPO / TOPOSOLID
 # ----------------------------------------------------------
 
-t = Transaction(doc, "Create Smooth Dome Topography")
+t = Transaction(doc, "Create Smooth Topography")
 t.Start()
 try:
     if version >= 2024 and HAS_TOPOSOLID:
         topo_type = FilteredElementCollector(doc).OfClass(ToposolidType).FirstElement()
-        level = FilteredElementCollector(doc).OfClass(Level).FirstElement()
+        levels = list(FilteredElementCollector(doc).OfClass(Level))
+        level = min(levels, key=lambda l: abs(l.Elevation - base_z)) if levels else None
         if topo_type is None or level is None:
             raise Exception("No ToposolidType or Level found in project.")
-        
+
+        # thickness must comfortably exceed the relief
+        needed = max(1.0, relief * 1.5)          # feet
+        type_name = "Dome_{}mm".format(int(needed * 304.8))
+        thick_type = None
+        for tt in FilteredElementCollector(doc).OfClass(ToposolidType):
+            if tt.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString() == type_name:
+                thick_type = tt
+                break
+        if thick_type is None:
+            thick_type = topo_type.Duplicate(type_name)
+            cs = thick_type.GetCompoundStructure()
+            cs.SetLayerWidth(0, needed)
+            thick_type.SetCompoundStructure(cs)
+        topo_type = thick_type
+
         boundaries = List[CurveLoop]()
         boundaries.Add(loop)
-        
+
         Toposolid.Create(
             doc,
             boundaries,
-            List[XYZ](smooth_pts),
+            List[XYZ](mesh),
             topo_type.Id,
             level.Id
         )
     else:
         if TopographySurface is None:
             raise Exception("TopographySurface not available in this Revit version.")
-        TopographySurface.Create(doc, List[XYZ](smooth_pts))
-        
+        TopographySurface.Create(doc, List[XYZ](mesh))
+
     t.Commit()
 
 except Exception as e:
