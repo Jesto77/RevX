@@ -589,7 +589,10 @@ class NamingWindow(forms.WPFWindow):
         if dlg.ShowDialog() != DialogResult.OK:
             return
         try:
-            rule = read_rule_xml(dlg.FileName)
+            rule = read_rule_xml(dlg.FileName, self._available)
+            if LAST_READ_NOTES:
+                forms.alert("XML imported with notes:\n\n- " + "\n- ".join(LAST_READ_NOTES),
+                            title="Custom File Name")
         except Exception as ex:
             forms.alert("Could not read the XML:\n%s" % ex, title="Custom File Name")
             return
@@ -629,35 +632,387 @@ def write_rule_xml(path, rule):
         fh.write("\n".join(lines))
 
 
-def read_rule_xml(path):
+# --------------------------------------------------------------------------- #
+#  Universal naming-rule XML reader
+#  Understands our own format AND rule files written by other software:
+#  any tag / attribute spelling, namespaces, text or attribute values,
+#  key/value "setting" elements, UTF-8 / UTF-16 / ANSI encodings.
+# --------------------------------------------------------------------------- #
+
+LAST_READ_NOTES = []          # filled by read_rule_xml (shown in the log)
+
+
+def _nk(value):
+    """Normalised key: lower-case letters and digits only."""
+    return re.sub(r"[^a-z0-9]", "", ("%s" % value).lower())
+
+
+_ALIASES = {
+    "separator": ["separator", "separatorchar", "separatorcharacter",
+                  "separatortext", "delimiter", "delim", "sep", "joiner",
+                  "connector", "divider", "seperator", "namesseparator",
+                  "parameterseparator", "fieldseparator", "partseparator"],
+    "prefix": ["prefix", "prefixtext", "starttext", "leadingtext",
+               "namprefix", "nameprefix", "filenameprefix", "pre"],
+    "suffix": ["suffix", "suffixtext", "endtext", "trailingtext", "postfix",
+               "namesuffix", "filenamesuffix", "post"],
+    "remove_spaces": ["removespaces", "removespace", "nospaces", "stripspaces",
+                      "deletespaces", "removewhitespace", "removeblanks"],
+    "upper": ["uppercase", "upper", "touppercase", "allcaps", "capitals",
+              "capitalize", "capitalise", "forceuppercase", "uppercasenames"],
+    "sanitize": ["sanitize", "sanitise", "sanitizename", "cleanname",
+                 "removeinvalidcharacters", "removeillegalcharacters",
+                 "replaceinvalidcharacters", "replaceillegalcharacters",
+                 "invalidcharacters", "illegalcharacters", "safefilename"],
+}
+
+_SEP_WORDS = {"underscore": "_", "dash": "-", "hyphen": "-", "minus": "-",
+              "space": " ", "blank": " ", "dot": ".", "period": ".",
+              "fullstop": ".", "comma": ",", "plus": "+", "pipe": "|",
+              "semicolon": ";", "none": "none", "nothing": "none",
+              "empty": "none", "nosep": "none", "noseparator": "none"}
+
+_GROUP_TAGS = set(["parameters", "parameterlist", "namingparameters",
+                   "fields", "fieldlist", "tokens", "tokenlist",
+                   "components", "namecomponents", "filenamecomponents",
+                   "elements", "segments", "parts", "nameparts", "items",
+                   "columns", "rule", "namerule", "namingrule",
+                   "naming", "filenamerule", "fileNameformat".lower(),
+                   "namingconvention", "format", "pattern", "sequence",
+                   "order", "structure", "definition"])
+
+_SETTING_TAGS = set(a for names in _ALIASES.values() for a in names)
+
+_ITEM_TAGS = set(["parameter", "param", "parametername", "field", "fieldname",
+                  "token", "component", "element", "segment", "part",
+                  "namepart", "namecomponent", "item", "column", "entry",
+                  "property", "namingparameter", "filenameparameter",
+                  "variable", "variablename", "key"])
+
+_NAME_KEYS = ["name", "displayname", "parametername", "paramname",
+              "parameter", "param", "field", "fieldname", "value", "text",
+              "label", "title", "caption", "key", "id", "source", "token",
+              "variable", "property"]
+
+_ORDER_KEYS = ["order", "index", "position", "pos", "sequence", "seq",
+               "sortorder", "no", "number", "rank", "idx"]
+
+# spellings used by other tools -> the token names this tool understands
+_TOKEN_ALIASES = {
+    "sheetnumber": "Sheet Number", "sheetno": "Sheet Number",
+    "sheetnum": "Sheet Number", "number": "Sheet Number",
+    "drawingnumber": "Sheet Number", "drawingno": "Sheet Number",
+    "dwgno": "Sheet Number", "dwgnumber": "Sheet Number",
+    "sheetid": "Sheet Number", "viewnumber": "Sheet Number",
+    "sheetname": "Sheet Name", "name": "Sheet Name",
+    "sheettitle": "Sheet Name", "drawingtitle": "Sheet Name",
+    "drawingname": "Sheet Name", "title": "Sheet Name",
+    "dwgname": "Sheet Name", "dwgtitle": "Sheet Name",
+    "viewname": "View Name", "viewtitle": "View Name",
+    "currentrevision": "Current Revision", "revision": "Current Revision",
+    "revisionnumber": "Current Revision", "rev": "Current Revision",
+    "revno": "Current Revision", "currentrevisionnumber": "Current Revision",
+    "currentrevisiondate": "Current Revision Date",
+    "revisiondate": "Current Revision Date", "revdate": "Current Revision Date",
+    "currentrevisiondescription": "Current Revision Description",
+    "revisiondescription": "Current Revision Description",
+    "revdescription": "Current Revision Description",
+    "viewtype": "View Type", "scale": "Scale", "viewscale": "Scale",
+    "projectnumber": "Project Number", "projectno": "Project Number",
+    "jobnumber": "Project Number", "jobno": "Project Number",
+    "projectname": "Project Name", "jobname": "Project Name",
+    "clientname": "Client Name", "client": "Client Name",
+    "filename": "File Name (model)", "modelname": "File Name (model)",
+    "modelfilename": "File Name (model)", "projectfile": "File Name (model)",
+    "filenamemodel": "File Name (model)", "rvtname": "File Name (model)",
+    "date": "Date (yyyy-mm-dd)", "currentdate": "Date (yyyy-mm-dd)",
+    "dateyyyymmdd": "Date (yyyymmdd)", "datecompact": "Date (yyyymmdd)",
+    "time": "Time (hhmm)", "currenttime": "Time (hhmm)",
+    "sheetissuedate": "Sheet Issue Date", "issuedate": "Sheet Issue Date",
+    "drawnby": "Drawn By", "checkedby": "Checked By",
+    "designedby": "Designed By", "approvedby": "Approved By",
+    "designer": "Designed By", "checker": "Checked By",
+    "drawer": "Drawn By", "author": "Drawn By",
+}
+
+
+def _decode_xml_bytes(raw):
+    """bytes -> text, whatever the encoding (BOM aware, ANSI fallback)."""
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[3:].decode("utf-8")
+    if raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
+        return raw.decode("utf-16")
+    for enc in ("utf-8", "utf-16", "cp1252", "latin-1"):
+        try:
+            txt = raw.decode(enc)
+            if enc == "utf-16" and "<" not in txt[:50]:
+                continue
+            return txt
+        except Exception:
+            continue
+    return raw.decode("latin-1", "replace")
+
+
+def _parse_xml_any(path):
     import xml.etree.ElementTree as ET
-    root = ET.parse(path).getroot()
-
-    def text(tag, default=""):
-        node = root.find(tag)
-        return default if node is None or node.text is None else node.text
-
-    def flag(tag, default=False):
-        return text(tag, str(default)).strip().lower() in ("true", "1", "yes")
-
-    params = root.find("Parameters")
-    tokens = []
-    if params is not None:
-        def order_of(n):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    text = _decode_xml_bytes(raw)
+    text = text.lstrip(u"\ufeff \t\r\n")
+    text = re.sub(r"^<\?xml[^>]*\?>", "", text)                 # declaration
+    text = re.sub(r"<!DOCTYPE[^>\[]*(\[[^\]]*\])?[^>]*>", "", text)  # DTD
+    root = ET.fromstring(text.encode("utf-8"))
+    for el in root.iter():                                       # drop xmlns
+        if isinstance(el.tag, str) or hasattr(el.tag, "split"):
             try:
-                return int(n.get("order", "0"))
+                el.tag = el.tag.split("}", 1)[-1]
             except Exception:
-                return 0
-        for node in sorted(params.findall("Parameter"), key=order_of):
-            if node.text:
-                tokens.append(node.text)
+                pass
+        if el.attrib:
+            for k in list(el.attrib.keys()):
+                if "}" in k:
+                    el.attrib[k.split("}", 1)[-1]] = el.attrib.pop(k)
+    return root
+
+
+def _truthy(v):
+    return ("%s" % v).strip().lower() in ("true", "1", "yes", "y", "on",
+                                           "checked", "enabled", "-1")
+
+
+def _collect_settings(root):
+    """normalised-name -> raw value, from tags, attributes and key/value
+    elements, anywhere in the document (first one wins)."""
+    kv = {}
+
+    def put(k, v):
+        k = _nk(k)
+        if k and v is not None and k not in kv:
+            kv[k] = v
+
+    for el in root.iter():
+        tag = el.tag
+        children = list(el)
+        txt = el.text if el.text is not None else None
+        if not children and txt is not None:
+            put(tag, txt if txt.strip() or txt != "" else "")
+        elif not children and el.get("value") is not None and not el.get("name"):
+            put(tag, el.get("value"))
+        # attributes on any element (e.g. <Naming separator="_" prefix="X">)
+        for ak, av in el.attrib.items():
+            if _nk(ak) in ("name", "key", "id", "property", "setting",
+                           "type", "order", "index"):
+                continue
+            put(ak, av)
+        # <Setting name="Separator" value="_"/>  /  <Option key="x">y</Option>
+        label = None
+        for lk in ("name", "key", "id", "property", "setting"):
+            if el.get(lk) is not None:
+                label = el.get(lk)
+                break
+        if label is not None:
+            val = None
+            for vk in ("value", "val", "text", "content", "default"):
+                if el.get(vk) is not None:
+                    val = el.get(vk)
+                    break
+            if val is None and not children and el.text is not None:
+                val = el.text
+            put(label, val)
+    return kv
+
+
+def _pick(kv, key):
+    for alias in _ALIASES[key]:
+        if alias in kv:
+            return kv[alias]
+    return None
+
+
+def _item_value(el):
+    """Parameter name carried by an element (text, attribute or child)."""
+    kids = dict((_nk(k.tag), k) for k in el)
+    for nm in _NAME_KEYS:
+        if nm in kids and kids[nm].text and kids[nm].text.strip():
+            return kids[nm].text.strip()
+    if el.text and el.text.strip() and not list(el):
+        return el.text.strip()
+    attr = dict((_nk(k), v) for k, v in el.attrib.items())
+    for nm in _NAME_KEYS:
+        if nm in attr and attr[nm] and attr[nm].strip():
+            return attr[nm].strip()
+    return None
+
+
+def _item_order(el, fallback):
+    attr = dict((_nk(k), v) for k, v in el.attrib.items())
+    for nm in _ORDER_KEYS:
+        if nm in attr:
+            try:
+                return float(attr[nm])
+            except Exception:
+                pass
+    for k in el:
+        if _nk(k.tag) in _ORDER_KEYS and k.text:
+            try:
+                return float(k.text.strip())
+            except Exception:
+                pass
+    return fallback
+
+
+def _resolve_token(raw, known_map):
+    """Map a token spelled by another tool onto a name we can evaluate."""
+    k = _nk(raw)
+    if k in known_map:
+        return known_map[k], True
+    if k in _TOKEN_ALIASES:
+        target = _TOKEN_ALIASES[k]
+        return known_map.get(_nk(target), target), True
+    # "Sheet_Number", "[SheetNumber]", "{Sheet Number}", "$Sheet Number$"
+    k2 = _nk(re.sub(r"[\[\]\{\}\$%<>#@]", "", raw))
+    if k2 in known_map:
+        return known_map[k2], True
+    if k2 in _TOKEN_ALIASES:
+        target = _TOKEN_ALIASES[k2]
+        return known_map.get(_nk(target), target), True
+    return raw, False
+
+
+def _tokens_from_tree(root):
+    """Parameter names, in order, from whatever structure holds them."""
+    # 1. a recognised container whose children are the parameters
+    best = []
+    for el in root.iter():
+        if _nk(el.tag) in _GROUP_TAGS:
+            vals = []
+            for i, ch in enumerate(list(el)):
+                ck = _nk(ch.tag)
+                if ck in _SETTING_TAGS or ck in _GROUP_TAGS:
+                    continue            # a setting, not a parameter entry
+                v = _item_value(ch)
+                if v:
+                    vals.append((_item_order(ch, i), i, v))
+            if len(vals) > len(best):
+                best = vals
+    if best:
+        return [v for _, _, v in sorted(best, key=lambda t: (t[0], t[1]))]
+    # 2. any elements that look like parameter items
+    vals = []
+    for i, el in enumerate(root.iter()):
+        if _nk(el.tag) in _ITEM_TAGS:
+            v = _item_value(el)
+            if v:
+                vals.append((_item_order(el, i), i, v))
+    if vals:
+        return [v for _, _, v in sorted(vals, key=lambda t: (t[0], t[1]))]
+    return []
+
+
+def _tokens_by_scanning(root, known_map):
+    """Last resort: every text / attribute value that IS a known parameter."""
+    out = []
+    for el in root.iter():
+        cand = []
+        if el.text and el.text.strip() and not list(el):
+            cand.append(el.text.strip())
+        cand.extend(v.strip() for v in el.attrib.values() if v and v.strip())
+        for c in cand:
+            name, ok = _resolve_token(c, known_map)
+            if ok:
+                out.append(name)
+    return out
+
+
+def _decode_separator(sep):
+    """Separator as written by other tools -> the real character(s).
+
+    Handles words (Hyphen, Underscore...), character codes (45 -> '-',
+    0x2D, U+002D, &#45;) and plain characters."""
+    raw = sep
+    t = sep.strip()
+    if not t:
+        return " "
+    word = _nk(t)
+    if len(t) > 1 and word in _SEP_WORDS:
+        return _SEP_WORDS[word]
+    m = re.match(r"^(?:&#x([0-9a-f]+);?|&#(\d+);?|u\+([0-9a-f]{4,6})|"
+                 r"0x([0-9a-f]{1,4})|\\x([0-9a-f]{2})|\\u([0-9a-f]{4}))$",
+                 t, re.I)
+    if m:
+        hexv = m.group(1) or m.group(3) or m.group(4) or m.group(5) or m.group(6)
+        try:
+            code = int(hexv, 16) if hexv else int(m.group(2))
+            if 32 <= code <= 0x10FFFF:
+                return unichr(code) if sys.version_info[0] < 3 else chr(code)
+        except Exception:
+            pass
+    if len(t) >= 2 and t.isdigit():              # decimal char code, e.g. 45
+        try:
+            code = int(t)
+            if 32 <= code <= 255:
+                return unichr(code) if sys.version_info[0] < 3 else chr(code)
+        except Exception:
+            pass
+    return raw
+
+
+def read_rule_xml(path, known=None):
+    """Read a naming rule from ANY reasonable XML layout.
+
+    Returns the usual rule dict. Anything unusual that was guessed or could
+    not be matched is described in LAST_READ_NOTES."""
+    del LAST_READ_NOTES[:]
+    root = _parse_xml_any(path)
+
+    known_list = list(known) if known else []
+    for t in BUILTIN_TOKENS:
+        if t not in known_list:
+            known_list.append(t)
+    known_map = dict((_nk(k), k) for k in known_list)
+
+    kv = _collect_settings(root)
+
+    raw_tokens = _tokens_from_tree(root)
+    tokens, unmatched = [], []
+    for raw in raw_tokens:
+        name, ok = _resolve_token(raw, known_map)
+        tokens.append(name)
+        if not ok:
+            unmatched.append(raw)
+    if not tokens:
+        tokens = _tokens_by_scanning(root, known_map)
+        if tokens:
+            LAST_READ_NOTES.append("no parameter list found - picked up %d "
+                                   "known parameter name(s) from the file"
+                                   % len(tokens))
+    if not tokens:
+        LAST_READ_NOTES.append("no naming parameters found in this XML")
+    if unmatched:
+        LAST_READ_NOTES.append("not a known parameter (kept as-is): %s"
+                               % ", ".join(unmatched))
+
+    sep = _pick(kv, "separator")
+    if sep is None:
+        sep = "_"
+    elif sep == "":
+        sep = "none"
+    else:
+        sep = _decode_separator(sep)
+
+    def flag(key, default=False):
+        v = _pick(kv, key)
+        return default if v is None else _truthy(v)
+
+    prefix = _pick(kv, "prefix")
+    suffix = _pick(kv, "suffix")
     return dict(tokens=tokens,
-                separator=text("Separator", "_"),
-                prefix=text("Prefix", ""),
-                suffix=text("Suffix", ""),
-                remove_spaces=flag("RemoveSpaces"),
-                upper=flag("Uppercase"),
-                do_sanitize=flag("Sanitize", True))
+                separator=sep,
+                prefix=prefix or "",
+                suffix=suffix or "",
+                remove_spaces=flag("remove_spaces"),
+                upper=flag("upper"),
+                do_sanitize=flag("sanitize", True))
 
 
 # --------------------------------------------------------------------------- #
@@ -2227,7 +2582,7 @@ class SheetExportWindow(forms.WPFWindow):
         if not path or not os.path.isfile(path):
             return
         try:
-            self._rule = read_rule_xml(path)
+            self._rule = read_rule_xml(path, self._available_params())
         except Exception as ex:
             forms.alert("Could not read '%s':\n%s" % (name, ex),
                         title="Sheet Export")
@@ -2276,10 +2631,12 @@ class SheetExportWindow(forms.WPFWindow):
         if dlg.ShowDialog() != DialogResult.OK:
             return
         try:
-            self._rule = read_rule_xml(dlg.FileName)
+            self._rule = read_rule_xml(dlg.FileName, self._available_params())
         except Exception as ex:
             forms.alert("Could not read the XML:\n%s" % ex, title="Sheet Export")
             return
+        for note in LAST_READ_NOTES:
+            self._log("Naming XML: %s" % note)
 
         label = os.path.splitext(os.path.basename(dlg.FileName))[0]
         try:
