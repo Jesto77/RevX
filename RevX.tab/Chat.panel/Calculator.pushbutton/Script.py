@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Ramp Slope Calculator for pyRevit."""
 
-__title__ = 'Ramp\nCalculator'
-__author__ = 'Your Name'
+__title__ = 'Calculator'
+__author__ = 'Jesto Joy'
 __doc__ = 'Ramp Slope Calculator with unit conversions (%, ratio, degrees)'
 
 import os

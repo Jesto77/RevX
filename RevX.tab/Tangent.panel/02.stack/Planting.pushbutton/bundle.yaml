@@ -1,0 +1,10 @@
+title: "Planting"
+author: "Jesto Joy"
+tooltip: |
+  Converts Toposolids from a linked model into Filled Regions using the existing Filled Region types whose names match.
+  
+  How to Use:
+  • Open a Plan View (or a Sheet) and run "Topo to Filled Region".
+  • Select the linked model.
+  • Tick the Toposolid types you want to convert.
+  • Each separate boundary becomes its own filled region, assigned to the existing type with a matching keyword in its name. Masking is turned off.

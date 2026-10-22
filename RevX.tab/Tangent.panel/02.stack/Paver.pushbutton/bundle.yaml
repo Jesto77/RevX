@@ -1,0 +1,10 @@
+title: "Paver"
+author: "Jesto Joy"
+tooltip: |
+  Generates Filled Regions from the Floors and Toposolids of a linked model, matching the surface pattern of their materials.
+  
+  How to Use:
+  • Open a Plan View (or a Sheet) and run "Paver".
+  • Select the linked model.
+  • Tick the Floor / Toposolid types you want.
+  • Creates filled regions named after each type, with matching foreground and background surface patterns (Model or Drafting) and masking turned off.
