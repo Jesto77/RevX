@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 # ==========================================================
-# OFFSET ELEMENTS  (mm input, consistent direction for all loops)
+# OFFSET ELEMENTS  (mm input, element grows/shrinks everywhere)
 # ==========================================================
 #
 # SUPPORTED:
 # - Floors  (multi-loop / openings supported)
 # - Ceilings
-# - Roofs   (outer loop only — inner openings are lost)
+# - Roofs   (outer loop only - inner openings are lost)
 # - Toposolids
 #
 # INPUT:
-#   + value = OUTWARD  (expand)
-#   - value = INWARD   (shrink)
+#   + value = element EXPANDS  (outer boundary moves outward,
+#                               inner openings SHRINK)
+#   - value = element SHRINKS  (outer boundary moves inward,
+#                               inner openings GROW)
 #
-# Each loop is offset individually based on its orientation so the
-# same user input behaves identically on every element AND every
-# inner void moves in the same physical direction as the boundary.
+# The outer loop is detected as the loop with the largest
+# absolute area. Every other loop is treated as an opening and
+# is offset in the opposite shape-direction, so the element
+# itself grows or shrinks evenly on all edges.
 #
 # ==========================================================
 from pyrevit import revit, forms, script
@@ -45,7 +48,7 @@ except:
     forms.alert("Invalid offset value")
     script.exit()
 
-# raw feet value — sign is handled PER LOOP below
+# raw feet value - sign is handled PER LOOP below
 raw_offset_ft = offset_mm / 304.8
 
 # ==========================================================
@@ -97,23 +100,32 @@ def signed_area(loop):
 
 
 def offset_loops(loops, raw_offset):
-    """Offset every loop so the same raw sign moves in the same
-    physical direction regardless of loop orientation.
+    """Positive raw_offset = element EXPANDS everywhere:
+       - outer boundary moves outward
+       - inner openings shrink (so the element grows into them)
 
     Revit convention with normal = Z+:
-      CCW loop  -> positive offset = OUTWARD
-      CW  loop  -> positive offset = INWARD
+      CCW loop -> positive offset = OUTWARD (loop gets bigger)
+      CW  loop -> positive offset = INWARD  (loop gets smaller)
 
-    We flip the sign for CW loops so the user's request is
-    honoured identically on every loop.
+    Step 1: flip the sign for CW loops so +value = "loop gets bigger".
+    Step 2: for openings (every loop except the outer one) reverse
+            that, because a bigger opening means a smaller element.
     """
+    # outer loop = largest absolute area
+    areas = [signed_area(lp) for lp in loops]
+    outer_idx = max(range(len(areas)), key=lambda i: abs(areas[i]))
+
     result = List[CurveLoop]()
-    for loop in loops:
-        area = signed_area(loop)
-        # CCW  : keep sign as-is  (positive = outward)
-        # CW   : flip sign         (positive = inward, so flip to outward)
+    for i, loop in enumerate(loops):
+        area = areas[i]
         loop_sign = 1.0 if area > 0 else -1.0
         effective_offset = raw_offset * loop_sign
+
+        # openings move opposite to the outer boundary's shape
+        if i != outer_idx:
+            effective_offset = -effective_offset
+
         new_loop = CurveLoop.CreateViaOffset(loop, effective_offset, XYZ.BasisZ)
         result.Add(new_loop)
     return result
@@ -219,9 +231,8 @@ for r in refs:
             failed.append("{} : No sketch loops".format(elem.Id))
             continue
 
-        # Offset every loop individually with the correct sign.
-        # This guarantees all loops (outer + inner voids) move in
-        # the same physical direction for the same user input.
+        # Outer loop follows the input sign; openings move opposite
+        # so the element grows/shrinks evenly on every edge.
         newloops = offset_loops(loops, raw_offset_ft)
 
         # FLOOR
