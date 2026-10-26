@@ -1,30 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Toposolid → Filled Region  |  Landscape-link converter.
+"""Floors + Toposolids (linked model) -> Filled Regions  |  pattern-matched.
 
-Pick a linked landscape RVT visible on the current sheet / plan view,
-then choose WHICH Toposolid types (families) to convert, and the script will:
-  1. Collect the Toposolids of the chosen types in that linked file.
-  2. Detect and SKIP parent/host Toposolids that have sub-divisions
-     (only leaf Toposolids become filled regions).
-  3. Extract the boundary (sketch profile → geometry fallback).
-  4. Deduplicate overlapping loops.
-  5. Match each Toposolid type name to an EXISTING Filled Region type
-     whose name shares a keyword (anywhere in the name). No Filled Region
-     type is ever created.
-  6. Create one SEPARATE Filled Region per separate boundary (holes stay
-     with the boundary that contains them).
+Workflow
+  1. Pick the linked model.
+  2. Tick the Floor / Toposolid TYPES you want (everything in the link is
+     listed - you decide).
+  3. For every element of the ticked types a Filled Region is created in the
+     active plan view, using a Filled Region TYPE that has the SAME NAME as
+     the element type. If that type does not exist it is created, with the
+     Surface Foreground / Background pattern + colour of the element type's
+     top material (Model patterns stay Model, Drafting stay Drafting).
+     An existing Filled Region type with that name is re-patterned to match.
 """
 
-__title__  = "Planting"
+__title__  = "Link Floors/Topo\nto Filled Region"
 __author__ = "Jesto Joy"
-__doc__    = ("Select a linked landscape model and convert its "
-              "Toposolids into filled regions with matching type names.")
+__doc__    = ("Select a linked model, choose Floor / Toposolid types and "
+              "create filled regions named and patterned like them.")
 
-# ─── stdlib ──────────────────────────────────────────────────────────
 import re
 import traceback
 
-# ─── .NET / Revit ────────────────────────────────────────────────────
 import clr
 clr.AddReference("RevitAPI")
 clr.AddReference("RevitAPIUI")
@@ -32,28 +28,30 @@ clr.AddReference("RevitAPIUI")
 from System.Collections.Generic import List
 
 from Autodesk.Revit.DB import (
-    BoundingBoxXYZ,
+    Arc,
+    BuiltInCategory,
+    Color,
     CurveLoop,
     ElementClassFilter,
     ElementId,
-    FilteredElementCollector,
     FilledRegion,
     FilledRegionType,
+    FillPatternElement,
+    FillPatternTarget,
+    FilteredElementCollector,
+    Floor,
     GeometryInstance,
     Line,
-    Arc,
     Options,
     PlanarFace,
     RevitLinkInstance,
     Sketch,
     Solid,
-    Transaction,
     ViewPlan,
     ViewSheet,
     XYZ,
 )
 
-# ─── pyRevit ─────────────────────────────────────────────────────────
 from pyrevit import revit, forms, script
 
 logger = script.get_logger()
@@ -75,28 +73,17 @@ def flush_report():
 doc   = revit.doc
 uidoc = revit.uidoc
 
-# Try to import Toposolid — Revit 2024+ only
 try:
     from Autodesk.Revit.DB import Toposolid
+    HAS_TOPOSOLID = True
 except ImportError:
-    forms.alert(
-        "Toposolid class is not available.\n\n"
-        "This tool requires Revit 2024 or later.",
-        exitscript=True,
-    )
+    Toposolid = None
+    HAS_TOPOSOLID = False
 
 
 # =====================================================================
 #  GENERAL HELPERS
 # =====================================================================
-
-def _eid(eid):
-    """ElementId -> int. Revit 2024+ uses .Value, older uses .IntegerValue."""
-    try:
-        return int(eid.Value)
-    except AttributeError:
-        return eid.IntegerValue
-
 
 def _element_name(el):
     """Return the Name property of an Element safely."""
@@ -111,88 +98,22 @@ def _element_name(el):
 
 
 def _iter_curve_loop(loop):
-    """Yield every Curve inside a CurveLoop (IronPython-safe)."""
     it = loop.GetCurveLoopIterator()
     while it.MoveNext():
         yield it.Current
 
 
 # =====================================================================
-#  HOST / SUB-DIVISION DETECTION
-#  A parent Toposolid that has sub-divisions should be SKIPPED —
-#  only the leaf (child) Toposolids become filled regions.
-# =====================================================================
-
-def _identify_host_topos(toposolids, link_doc):
-    """Return a set of Element-ID ints for parent/host Toposolids.
-
-    Tries three strategies in order:
-      1. Revit API  GetHostTopoId()  — each sub-division points to host
-      2. GetDependentElements()      — host has children as dependents
-      3. Bounding-box containment    — host bbox contains children bbox
-    """
-    host_ids = set()
-
-    # ── Strategy 1: GetHostTopoId() ──────────────────────────────────
-    try:
-        for topo in toposolids:
-            hid = topo.GetHostTopoId()
-            if hid is not None and hid != ElementId.InvalidElementId:
-                host_ids.add(_eid(hid))
-        if host_ids:
-            return host_ids
-    except Exception:
-        pass  # method may not exist in this Revit build
-
-    # ── Strategy 2: GetDependentElements ─────────────────────────────
-    try:
-        topo_filter = ElementClassFilter(Toposolid)
-        for topo in toposolids:
-            dep_ids = topo.GetDependentElements(topo_filter)
-            if dep_ids is None:
-                continue
-            for dep_id in dep_ids:
-                dep = link_doc.GetElement(dep_id)
-                if dep is not None and isinstance(dep, Toposolid):
-                    # 'topo' has a Toposolid child → it is a host
-                    host_ids.add(_eid(topo.Id))
-                    break
-        if host_ids:
-            return host_ids
-    except Exception:
-        pass
-
-    # ── Strategy 3: bounding-box containment ─────────────────────────
-    bboxes = {}
-    for topo in toposolids:
-        try:
-            bb = topo.get_BoundingBox(None)
-            if bb:
-                bboxes[_eid(topo.Id)] = bb
-        except Exception:
-            pass
-
-    TOL = 0.3  # ≈ 100 mm slop
-    for id_a, bb_a in bboxes.items():
-        contains_count = 0
-        for id_b, bb_b in bboxes.items():
-            if id_a == id_b:
-                continue
-            if (bb_a.Min.X - TOL <= bb_b.Min.X and
-                bb_a.Min.Y - TOL <= bb_b.Min.Y and
-                bb_a.Max.X + TOL >= bb_b.Max.X and
-                bb_a.Max.Y + TOL >= bb_b.Max.Y):
-                contains_count += 1
-        # If it fully contains 2 + other toposolids → it's a host
-        if contains_count >= 2:
-            host_ids.add(id_a)
-
-    return host_ids
-
-
-# =====================================================================
 #  VIEW / LINK SELECTION
 # =====================================================================
+
+def _eid(eid):
+    """ElementId -> int. Revit 2024+ uses .Value, older uses .IntegerValue."""
+    try:
+        return int(eid.Value)
+    except AttributeError:
+        return eid.IntegerValue
+
 
 def get_target_view():
     view = doc.ActiveView
@@ -252,97 +173,337 @@ def get_linked_file():
     return link_map[sel]
 
 
-def collect_toposolids(link_doc):
+def collect_elements(link_doc):
+    """All Floors and Toposolids in the link: list of (category, element)."""
+    items = []
     try:
-        return list(
-            FilteredElementCollector(link_doc)
-            .OfClass(Toposolid)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        )
+        for fl in (FilteredElementCollector(link_doc)
+                   .OfClass(Floor).WhereElementIsNotElementType()
+                   .ToElements()):
+            items.append(("Floor", fl))
     except Exception as exc:
-        forms.alert(
-            "Cannot collect Toposolids:\n{}".format(exc),
-            exitscript=True,
-        )
+        logger.debug("Floor collect failed: {}".format(exc))
+    if HAS_TOPOSOLID:
+        try:
+            for tp in (FilteredElementCollector(link_doc)
+                       .OfClass(Toposolid).WhereElementIsNotElementType()
+                       .ToElements()):
+                items.append(("Toposolid", tp))
+        except Exception as exc:
+            logger.debug("Toposolid collect failed: {}".format(exc))
+    return items
 
 
-def get_fr_type_dict():
-    d = {}
-    for frt in (
-        FilteredElementCollector(doc)
-        .OfClass(FilledRegionType)
-        .ToElements()
-    ):
-        d[_element_name(frt)] = frt
-    return d
+def _type_name(el, link_doc):
+    try:
+        t = link_doc.GetElement(el.GetTypeId())
+        return _element_name(t) if t else "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def pick_types(items, link_doc):
+    """Return {(category, type name): [elements]} for the ticked types."""
+    groups = {}
+    for cat, el in items:
+        groups.setdefault((cat, _type_name(el, link_doc)), []).append(el)
+
+    labels = {}
+    for key in sorted(groups.keys()):
+        n = len(groups[key])
+        label = "{} | {}   ({} element{})".format(
+            key[0], key[1], n, "" if n == 1 else "s")
+        labels[label] = key
+
+    chosen = forms.SelectFromList.show(
+        sorted(labels.keys()),
+        title="Select Floor / Toposolid type(s) to convert",
+        button_name="Create filled regions",
+        multiselect=True,
+    )
+    if not chosen:
+        script.exit()
+    return dict((labels[l], groups[labels[l]]) for l in chosen)
 
 
 # =====================================================================
-#  NAME-MATCHING
+#  FILLED REGION TYPE  (name + surface pattern from the element type)
 # =====================================================================
 
-def _tokenise(name):
-    """Split a name into upper-cased tokens at two granularity levels.
-
-    Level 1 — split by  _ / \\ - whitespace  (keeps dots together)
-    Level 2 — also split on dots for sub-tokens
-
-    Example:
-      'Toposolid_Shrub_LAN_Planting_S/BOUG.GR'
-      → {'TOPOSOLID','SHRUB','LAN','PLANTING','BOUG.GR','BOUG','GR'}
-    """
-    major = re.split(r"[_/\\\s\-]+", name)
-    tokens = set()
-    for t in major:
-        up = t.upper().strip()
-        if len(up) >= 2:
-            tokens.add(up)
-        for sub in t.split("."):
-            sup = sub.upper().strip()
-            if len(sup) >= 2:
-                tokens.add(sup)
-    return tokens
+_BAD_NAME_CHARS = re.compile(r'[\\{}\[\]|;<>?`~:]')
 
 
-_NOISE = frozenset([
-    "TOPOSOLID", "TOPO", "SOLID", "TYPE", "DEFAULT", "NEW",
-    "LAN", "LA", "DTC", "THE", "RGN",
-])
+def _safe_name(name):
+    n = _BAD_NAME_CHARS.sub("_", name or "Unnamed").strip()
+    return n or "Unnamed"
 
 
-def match_fr_type(topo_type_name, fr_type_dict):
-    """Find the EXISTING filled region type whose name shares a keyword
-    with the Toposolid type name - keyword may sit ANYWHERE in the name
-    (e.g. 'BOUG' inside 'LA_RGN_PLANTING_S/BOUG.GR').
+def _valid_id(eid):
+    return eid is not None and eid != ElementId.InvalidElementId
 
-    Returns (FilledRegionType, matched_name, score)."""
-    topo_tokens = _tokenise(topo_type_name) - _NOISE
-    topo_up = topo_type_name.upper()
-    best_type  = None
-    best_name  = None
-    best_score = 0
 
-    for fr_name, fr_type in fr_type_dict.items():
-        fr_up = fr_name.upper()
-        fr_tokens = _tokenise(fr_name)
-        score = sum(len(t) for t in (topo_tokens & fr_tokens))
-        # keyword found anywhere inside the filled region type name
-        for t in topo_tokens:
-            if len(t) >= 3 and t in fr_up and t not in fr_tokens:
-                score += len(t)
-        # ...or the filled region keyword sits inside the Toposolid name
-        for t in (fr_tokens - _NOISE):
-            if len(t) >= 3 and t in topo_up and t not in topo_tokens:
-                score += len(t)
-        if score > best_score:
-            best_score = score
-            best_type  = fr_type
-            best_name  = fr_name
+def _surface_ids(mat):
+    """(fg id, fg colour, bg id, bg colour) - SURFACE patterns."""
+    return (mat.SurfaceForegroundPatternId, mat.SurfaceForegroundPatternColor,
+            mat.SurfaceBackgroundPatternId, mat.SurfaceBackgroundPatternColor)
 
-    if best_score >= 3:
-        return best_type, best_name, best_score
-    return None, None, 0
+
+def _cut_ids(mat):
+    return (mat.CutForegroundPatternId, mat.CutForegroundPatternColor,
+            mat.CutBackgroundPatternId, mat.CutBackgroundPatternColor)
+
+
+def _has_pattern(ids):
+    return _valid_id(ids[0]) or _valid_id(ids[2])
+
+
+def _pick_material(elem_type, link_doc):
+    """(material, layer no., 'surface'|'cut'|'none').
+
+    Walks the layers from the top and takes the first material that really
+    has a SURFACE pattern (so a plain top layer without pattern does not
+    hide the patterned one). Falls back to a Cut pattern, then to the first
+    material found."""
+    mats = []
+    try:
+        cs = elem_type.GetCompoundStructure()
+        if cs is not None:
+            for i, layer in enumerate(cs.GetLayers()):
+                if _valid_id(layer.MaterialId):
+                    m = link_doc.GetElement(layer.MaterialId)
+                    if m is not None:
+                        mats.append((m, i + 1))
+    except Exception:
+        pass
+    if not mats:
+        try:
+            from Autodesk.Revit.DB import BuiltInParameter
+            p = elem_type.get_Parameter(BuiltInParameter.MATERIAL_ID_PARAM)
+            if p is not None and _valid_id(p.AsElementId()):
+                m = link_doc.GetElement(p.AsElementId())
+                if m is not None:
+                    mats.append((m, 0))
+        except Exception:
+            pass
+    for m, n in mats:
+        if _has_pattern(_surface_ids(m)):
+            return m, n, "surface"
+    for m, n in mats:
+        if _has_pattern(_cut_ids(m)):
+            return m, n, "cut"
+    if mats:
+        return mats[0][0], mats[0][1], "none"
+    return None, 0, "none"
+
+
+_host_pattern_cache = {}
+_pattern_problems = []
+
+
+def _host_pattern_id(link_doc, link_pattern_id):
+    """Fill pattern of the LINK (Drafting OR Model) -> same pattern in HOST.
+
+    Order: same name + SAME target (Model stays Model) -> create a
+    copy in the host (renamed if the name is taken). Solid fill is matched
+    by IsSolidFill, never by name."""
+    if not _valid_id(link_pattern_id):
+        return None
+    key = _eid(link_pattern_id)
+    if key in _host_pattern_cache:
+        return _host_pattern_cache[key]
+    result = None
+    try:
+        lp_el = link_doc.GetElement(link_pattern_id)
+        if lp_el is None:
+            raise Exception("pattern element not found in link")
+        lp = lp_el.GetFillPattern()
+        host = []
+        for fe in FilteredElementCollector(doc).OfClass(FillPatternElement):
+            try:
+                host.append((fe, fe.GetFillPattern()))
+            except Exception:
+                pass
+
+        if lp.IsSolidFill:
+            for fe, hp in host:
+                if hp.IsSolidFill and hp.Target == lp.Target:
+                    result = fe.Id
+                    break
+        else:
+            lname = (lp.Name or "").strip().lower()
+            for fe, hp in host:
+                if (not hp.IsSolidFill) and hp.Target == lp.Target \
+                        and (hp.Name or "").strip().lower() == lname:
+                    result = fe.Id
+                    break
+
+        if result is None:
+            try:
+                result = FillPatternElement.Create(doc, lp).Id
+            except Exception:
+                try:
+                    lp.Name = "{} (link)".format(lp.Name)
+                    result = FillPatternElement.Create(doc, lp).Id
+                except Exception as exc2:
+                    raise Exception("could not copy pattern '{}': {}"
+                                    .format(lp.Name, exc2))
+    except Exception as exc:
+        _pattern_problems.append(str(exc))
+        logger.debug("Pattern map failed: {}".format(exc))
+    _host_pattern_cache[key] = result
+    return result
+
+
+_fr_types = {}
+
+
+def _load_fr_types():
+    for frt in FilteredElementCollector(doc).OfClass(FilledRegionType):
+        _fr_types[_element_name(frt)] = frt
+
+
+def _pat_label(pid):
+    try:
+        fp = doc.GetElement(pid).GetFillPattern()
+        return "{} [{}]".format(fp.Name, fp.Target)
+    except Exception:
+        return "?"
+
+
+def _safe_color(col):
+    """Copy of a valid Color, else None."""
+    try:
+        if col is not None and col.IsValid:
+            return Color(col.Red, col.Green, col.Blue)
+    except Exception:
+        pass
+    return None
+
+
+def _rgb(col):
+    try:
+        if col is not None and col.IsValid:
+            return "{},{},{}".format(col.Red, col.Green, col.Blue)
+    except Exception:
+        pass
+    return "invalid"
+
+
+def get_or_create_fr_type(name, elem_type, link_doc, notes):
+    """FilledRegionType named like the element type, patterned from it:
+    foreground + background, each Model or Drafting exactly as the
+    material has it.
+
+    Pattern AND colour are ALWAYS written explicitly - nothing is left
+    inherited from the type that was duplicated (that inherited colour is
+    what showed up as magenta)."""
+    name = _safe_name(name)
+    existing = name in _fr_types
+    if existing:
+        new_t = _fr_types[name]           # re-patterned below
+    else:
+        if not _fr_types:
+            raise Exception("No Filled Region type in the project to copy from.")
+        base = None
+        for t in _fr_types.values():
+            try:
+                if not t.IsMasking:
+                    base = t
+                    break
+            except Exception:
+                pass
+        if base is None:
+            base = list(_fr_types.values())[0]
+        new_t = base.Duplicate(name)
+        new_t = doc.GetElement(new_t) if isinstance(new_t, ElementId) else new_t
+
+    # un-mask FIRST: a masking type does not accept the patterns below
+    try:
+        new_t.IsMasking = False
+    except Exception:
+        try:
+            p = new_t.LookupParameter("Masking")
+            if p is not None and not p.IsReadOnly:
+                p.Set(0)
+        except Exception as exc:
+            notes.append("masking not changed: {}".format(exc))
+
+    black = Color(0, 0, 0)
+    invalid = ElementId.InvalidElementId
+    del _pattern_problems[:]
+
+    mat, layer_no, source = _pick_material(elem_type, link_doc)
+    if mat is None:
+        notes.append("no material found - pattern/colour reset to none/black")
+        fg_id = bg_id = None
+        fg_col = bg_col = None
+    else:
+        ids = _surface_ids(mat) if source != "cut" else _cut_ids(mat)
+        fg_link, fg_col, bg_link, bg_col = ids
+        fg_id = _host_pattern_id(link_doc, fg_link)
+        bg_id = _host_pattern_id(link_doc, bg_link)
+        if _valid_id(fg_link) and fg_id is None:
+            notes.append("FG pattern could not be mapped")
+        if _valid_id(bg_link) and bg_id is None:
+            notes.append("BG pattern could not be mapped")
+        if source == "none":
+            notes.append("material has no surface/cut pattern")
+
+    fg_c = _safe_color(fg_col)
+    bg_c = _safe_color(bg_col)
+    if fg_id is not None and fg_c is None:
+        notes.append("FG colour invalid in link - black used")
+    if bg_id is not None and bg_c is None:
+        notes.append("BG colour invalid in link - black used")
+
+    # pattern first, colour afterwards (colour is re-asserted at the end)
+    try:
+        new_t.ForegroundPatternId = fg_id if fg_id is not None else invalid
+    except Exception as exc:
+        notes.append("foreground pattern failed: {}".format(exc))
+    try:
+        new_t.BackgroundPatternId = bg_id if bg_id is not None else invalid
+    except Exception as exc:
+        notes.append("background pattern failed: {}".format(exc))
+    for _ in range(2):
+        try:
+            new_t.ForegroundPatternColor = fg_c if fg_c is not None else black
+        except Exception as exc:
+            notes.append("foreground colour failed: {}".format(exc))
+        try:
+            new_t.BackgroundPatternColor = bg_c if bg_c is not None else black
+        except Exception as exc:
+            notes.append("background colour failed: {}".format(exc))
+
+    # untick "Masking" on the type
+    try:
+        new_t.IsMasking = False
+    except Exception:
+        try:
+            p = new_t.LookupParameter("Masking")
+            if p is not None and not p.IsReadOnly:
+                p.Set(0)
+        except Exception as exc:
+            notes.append("masking not changed: {}".format(exc))
+
+    # read back what the type really has now
+    try:
+        notes.append("{} of '{}' (layer {}): FG = {} ({}), BG = {} ({})".format(
+            source, _element_name(mat) if mat is not None else "-", layer_no,
+            _pat_label(new_t.ForegroundPatternId)
+            if _valid_id(new_t.ForegroundPatternId) else "none",
+            _rgb(new_t.ForegroundPatternColor),
+            _pat_label(new_t.BackgroundPatternId)
+            if _valid_id(new_t.BackgroundPatternId) else "none",
+            _rgb(new_t.BackgroundPatternColor)))
+    except Exception:
+        pass
+    for pr in set(_pattern_problems):
+        notes.append("pattern issue: {}".format(pr))
+
+    _fr_types[name] = new_t
+    notes.insert(0, "existing type UPDATED" if existing else "NEW type")
+    return new_t
 
 
 # =====================================================================
@@ -562,85 +723,6 @@ def get_topo_boundaries(topo, link_doc, transform, z=0.0):
     return None
 
 
-def _loop_poly(loop):
-    pts = []
-    for c in _iter_curve_loop(loop):
-        try:
-            tess = list(c.Tessellate())
-        except Exception:
-            continue
-        for p in tess[:-1]:
-            pts.append((p.X, p.Y))
-    return pts
-
-
-def _poly_area(poly):
-    a = 0.0
-    n = len(poly)
-    for i in range(n):
-        x1, y1 = poly[i]
-        x2, y2 = poly[(i + 1) % n]
-        a += x1 * y2 - x2 * y1
-    return abs(a) * 0.5
-
-
-def _pt_in_poly(x, y, poly):
-    inside = False
-    n = len(poly)
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        dy = (yj - yi) if abs(yj - yi) > 1e-15 else 1e-15
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / dy + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
-def _poly_inside(inner, outer):
-    """True when most vertices of 'inner' lie inside 'outer'."""
-    if not inner or not outer:
-        return False
-    step = max(1, len(inner) // 12)
-    pts = inner[::step]
-    hits = sum(1 for (x, y) in pts if _pt_in_poly(x, y, outer))
-    return hits >= max(1, int(len(pts) * 0.7 + 0.5))
-
-
-def split_into_regions(loops):
-    """Separate boundaries -> separate filled regions.
-
-    Returns a list of loop groups: [outer, hole, hole ...]. Every outer
-    boundary becomes its OWN filled region; only genuine holes (loops
-    inside an outer) travel with it."""
-    info = []
-    for lp in loops:
-        poly = _loop_poly(lp)
-        if len(poly) >= 3:
-            info.append({"loop": lp, "poly": poly, "area": _poly_area(poly)})
-    info.sort(key=lambda d: -d["area"])
-
-    for d in info:
-        d["containers"] = [o for o in info
-                           if o is not d and o["area"] > d["area"]
-                           and _poly_inside(d["poly"], o["poly"])]
-        d["depth"] = len(d["containers"])
-
-    groups = {}
-    order = []
-    for d in info:
-        if d["depth"] % 2 == 0:                 # outer boundary
-            groups[id(d)] = [d["loop"]]
-            order.append(id(d))
-    for d in info:
-        if d["depth"] % 2 == 1:                 # hole of its tightest outer
-            parent = min(d["containers"], key=lambda o: o["area"])
-            if id(parent) in groups:
-                groups[id(parent)].append(d["loop"])
-    return [groups[k] for k in order]
-
-
 # =====================================================================
 #  CROSS-ELEMENT DEDUP TRACKER
 # =====================================================================
@@ -678,76 +760,12 @@ class GlobalDedup(object):
 
 
 # =====================================================================
-#  TOPOSOLID TYPE PICKER
-# =====================================================================
-
-def _topo_type_name(topo, link_doc):
-    try:
-        t = link_doc.GetElement(topo.GetTypeId())
-        return _element_name(t) if t else "Unknown"
-    except Exception:
-        return "Unknown"
-
-
-def pick_topo_types(toposolids, link_doc):
-    """Ask which Toposolid types to convert; return the chosen elements.
-    Every type in the link is listed - YOU decide what gets converted."""
-    groups = {}
-    for topo in toposolids:
-        name = _topo_type_name(topo, link_doc)
-        groups.setdefault(name, []).append(topo)
-
-    labels = {}
-    for name in sorted(groups.keys()):
-        n = len(groups[name])
-        label = "{}   ({} element{})".format(
-            name, n, "" if n == 1 else "s")
-        labels[label] = name
-
-    chosen_labels = forms.SelectFromList.show(
-        sorted(labels.keys()),
-        title="Select Toposolid type(s) to convert",
-        button_name="Convert selected",
-        multiselect=True,
-    )
-    if not chosen_labels:
-        script.exit()
-
-    chosen_names = sorted(set(labels[l] for l in chosen_labels))
-    chosen = []
-    for name in chosen_names:
-        chosen.extend(groups[name])
-    return chosen, chosen_names
-
-
-_masking_done = set()
-
-
-def unmask_fr_type(fr_type):
-    """Untick 'Masking' on a filled region type (once per type)."""
-    key = _eid(fr_type.Id)
-    if key in _masking_done:
-        return
-    _masking_done.add(key)
-    try:
-        fr_type.IsMasking = False
-    except Exception:
-        try:
-            p = fr_type.LookupParameter("Masking")
-            if p is not None and not p.IsReadOnly:
-                p.Set(0)
-        except Exception as exc:
-            logger.debug("Masking not changed: {}".format(exc))
-
-
-# =====================================================================
 #  MAIN
 # =====================================================================
 
-log("# 🌿 Toposolid → Filled Region Converter")
+log("# Link Floors / Toposolids -> Filled Regions")
 log("---")
 
-# 1 ── target view
 target_view = get_target_view()
 log("**Target view:** {}".format(target_view.Name))
 
@@ -758,159 +776,71 @@ try:
 except Exception:
     pass
 
-# 2 ── linked file
 link_instance, link_doc = get_linked_file()
 link_transform = link_instance.GetTotalTransform()
 log("**Linked file:** {}".format(link_doc.Title))
 
-# 3 ── collect Toposolids
-toposolids = collect_toposolids(link_doc)
-if not toposolids:
-    forms.alert(
-        "No Toposolids found in '{}'.".format(link_doc.Title),
-        exitscript=True,
-    )
-log("**Toposolids found:** {}".format(len(toposolids)))
+items = collect_elements(link_doc)
+if not items:
+    forms.alert("No Floors or Toposolids found in '{}'."
+                .format(link_doc.Title), exitscript=True)
 
-host_ids = set()      # automatic host skipping removed - you choose the types
-
-# 4 ── choose which Toposolid types to convert
-toposolids, chosen_type_names = pick_topo_types(toposolids, link_doc)
-log("**Converting types:** {}".format(
-    ", ".join(chosen_type_names)))
-log("**Toposolids in selected types:** {}".format(
-    len(toposolids)))
-
-# 5 ── existing filled-region types (nothing new is ever created)
-fr_type_dict = get_fr_type_dict()
-if not fr_type_dict:
-    forms.alert("No Filled Region types in the project.", exitscript=True)
-
-sorted_names = sorted(fr_type_dict.keys())
-unmatched = [n for n in chosen_type_names
-             if match_fr_type(n, fr_type_dict)[0] is None]
-
-default_fr_type = None
-default_name = None
-if unmatched:
-    SKIP = "<Skip types with no matching name>"
-    preview = ", ".join(unmatched[:4]) + (" ..." if len(unmatched) > 4 else "")
-    pick = forms.SelectFromList.show(
-        [SKIP] + sorted_names,
-        title="No Filled Region type matches: {}  -  use which one?"
-              .format(preview),
-        button_name="OK",
-    )
-    if pick and pick != SKIP:
-        default_name = pick
-        default_fr_type = fr_type_dict[pick]
-
-# 6 ── process each Toposolid
-created  = 0
-failed   = 0
-skipped  = 0
-host_skipped = 0
-no_type  = 0
-dedup    = GlobalDedup(tol=0.15)
-
+selected = pick_types(items, link_doc)
+log("**Types chosen:** {}".format(len(selected)))
 log("---")
-log("## Processing …")
-log("")
 
-with revit.Transaction("Topo → Filled Region"):
-    for idx, topo in enumerate(toposolids):
-        topo_type_name = "?"
+created = 0
+failed = 0
+dups = 0
+dedups = {}
+
+with revit.Transaction("Link Floors/Topo -> Filled Regions"):
+    _load_fr_types()
+    for (cat, tname), elements in sorted(selected.items()):
+        notes = []
         try:
-            # ── type name
-            topo_type = link_doc.GetElement(topo.GetTypeId())
-            topo_type_name = (
-                _element_name(topo_type) if topo_type else "Unknown"
-            )
+            elem_type = link_doc.GetElement(elements[0].GetTypeId())
+            fr_type = get_or_create_fr_type(tname, elem_type, link_doc, notes)
+        except Exception as exc:
+            failed += len(elements)
+            log("- ❌ **{} | {}** - filled region type: {}"
+                            .format(cat, tname, exc))
+            continue
 
-            # ── skip host/parent Toposolids ──────────────────────────
-            if _eid(topo.Id) in host_ids:
-                log(
-                    "- 🚫 **{}** — host/parent, skipped (ID {})"
-                    .format(topo_type_name, _eid(topo.Id))
-                )
-                host_skipped += 1
-                continue
-
-            # ── match filled-region type
-            matched_type, matched_name, score = match_fr_type(
-                topo_type_name, fr_type_dict
-            )
-            if matched_type:
-                use_type = matched_type
-                use_name = matched_name
-                status   = "✅ Matched (score {})".format(score)
-            elif default_fr_type is not None:
-                use_type = default_fr_type
-                use_name = default_name
-                status   = "⚠️ No match → chosen type"
-            else:
-                log("- ⏭️ **{}** — no matching filled region type, skipped"
-                    .format(topo_type_name))
-                no_type += 1
-                continue
-
-            unmask_fr_type(use_type)
-
-            # ── boundary curves
-            loops = get_topo_boundaries(
-                topo, link_doc, link_transform, z=flatten_z
-            )
-            if not loops:
-                log(
-                    "- ❌ **{}** — boundary extraction failed"
-                    .format(topo_type_name)
-                )
-                failed += 1
-                continue
-
-            # ── one filled region PER separate boundary
-            made = 0
-            for group in split_into_regions(loops):
-                outer = group[0]
-                if dedup.is_duplicate([outer]):
-                    skipped += 1
+        dd = dedups.setdefault(tname, GlobalDedup(tol=0.15))
+        made = 0
+        for el in elements:
+            try:
+                loops = get_topo_boundaries(
+                    el, link_doc, link_transform, z=flatten_z)
+                if not loops:
+                    failed += 1
+                    log("  - ❌ boundary extraction failed "
+                                    "(ID {})".format(_eid(el.Id)))
+                    continue
+                if dd.is_duplicate(loops):
+                    dups += 1
                     continue
                 FilledRegion.Create(
-                    doc, use_type.Id, target_view.Id, List[CurveLoop](group))
-                dedup.register([outer])
+                    doc, fr_type.Id, target_view.Id, List[CurveLoop](loops))
+                dd.register(loops)
                 made += 1
                 created += 1
-            if made:
-                log("- {} **{}** → **{}**  ({} separate region{})"
-                    .format(status, topo_type_name, use_name, made,
-                            "" if made == 1 else "s"))
-            else:
-                log("- 🔄 **{}** — duplicate boundary, skipped"
-                    .format(topo_type_name))
+            except Exception as exc:
+                failed += 1
+                log("  - ❌ ID {} - {}".format(_eid(el.Id), exc))
+                logger.debug(traceback.format_exc())
+        log("- **{} | {}** -> type **{}**: {} region(s)  _({})_"
+                        .format(cat, tname, _safe_name(tname), made,
+                                "; ".join(notes)))
 
-        except Exception as exc:
-            failed += 1
-            log(
-                "- ❌ **{}** — {}".format(topo_type_name, str(exc))
-            )
-            logger.debug(traceback.format_exc())
-
-# 7 ── summary
 log("---")
 log("## Summary")
 log("- ✅ Created: **{}** filled region(s)".format(created))
-if host_skipped:
-    log(
-        "- 🚫 Host/parent skipped: **{}**".format(host_skipped)
-    )
-if skipped:
-    log("- 🔄 Duplicate skipped: **{}**".format(skipped))
-if no_type:
-    log("- ⏭️ No matching type, skipped: **{}**".format(no_type))
+if dups:
+    log("- 🔄 Duplicate boundaries skipped: **{}**".format(dups))
 if failed:
     log("- ❌ Failed: **{}**".format(failed))
 log("- View: **{}**".format(target_view.Name))
-if default_name:
-    log("- Fallback type: **{}**".format(default_name))
 
 flush_report()
