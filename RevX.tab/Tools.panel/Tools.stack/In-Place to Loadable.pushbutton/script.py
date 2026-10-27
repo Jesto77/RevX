@@ -473,14 +473,81 @@ def copy_instance_parameters(source, target):
             pass
 
 
-def get_level(fi):
+def _all_levels():
     try:
-        lvl_id = fi.LevelId
-        if lvl_id and get_element_id_value(lvl_id) != get_element_id_value(ElementId.InvalidElementId):
-            return doc.GetElement(lvl_id)
+        return sorted(
+            FilteredElementCollector(doc).OfClass(DB.Level).ToElements(),
+            key=lambda l: l.Elevation
+        )
+    except Exception:
+        return []
+
+
+def get_level(fi):
+    """Reference level for the new instance.
+
+    Some in-place families have NO level (LevelId is invalid - e.g. they are
+    not level-based, or sit in a 3D view with no associated level), but the
+    loadable family made from the template is level-based and cannot be
+    created without one. So when the source has none we pick one. The level
+    only sets the instance's 'Level' parameter - the instance is still
+    placed at the exact same XYZ, so the position does not change.
+    """
+    invalid = get_element_id_value(ElementId.InvalidElementId)
+
+    def _valid_level(eid):
+        try:
+            if eid is not None and get_element_id_value(eid) != invalid:
+                lv = doc.GetElement(eid)
+                if isinstance(lv, DB.Level):
+                    return lv
+        except Exception:
+            pass
+        return None
+
+    # 1. the element's own level
+    try:
+        lv = _valid_level(fi.LevelId)
+        if lv is not None:
+            return lv
     except Exception:
         pass
-    return None
+
+    # 2. level-type parameters of the element
+    for bip_name in ("FAMILY_LEVEL_PARAM", "INSTANCE_REFERENCE_LEVEL_PARAM",
+                     "SCHEDULE_LEVEL_PARAM", "FAMILY_BASE_LEVEL_PARAM"):
+        try:
+            bip = getattr(DB.BuiltInParameter, bip_name)
+            p = fi.get_Parameter(bip)
+            if p is not None and p.HasValue:
+                lv = _valid_level(p.AsElementId())
+                if lv is not None:
+                    return lv
+        except Exception:
+            pass
+
+    levels = _all_levels()
+
+    # 3. nearest level at/below the element (by elevation)
+    try:
+        bb = fi.get_BoundingBox(None)
+        if bb is not None and levels:
+            z = bb.Min.Z
+            below = [l for l in levels if l.Elevation <= z + 0.01]
+            if below:
+                return below[-1]
+            return levels[0]
+    except Exception:
+        pass
+
+    # 4. level of the active view, else the lowest level
+    try:
+        gl = doc.ActiveView.GenLevel
+        if gl is not None:
+            return gl
+    except Exception:
+        pass
+    return levels[0] if levels else None
 
 
 def rename_family_type(fam_doc, type_name):
@@ -889,6 +956,8 @@ def place_family_instance(info, symbol):
     level  = info.level
     new_fi = None
     errors = []
+    if level is None:
+        errors.append("No reference level could be found (project has no Levels?)")
 
     # S1: face-hosted
     if info.face_ref is not None and info.face_point is not None:
