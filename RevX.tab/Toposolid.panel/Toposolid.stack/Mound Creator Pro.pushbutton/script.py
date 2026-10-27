@@ -386,6 +386,19 @@ class MoundEditorWindow(forms.WPFWindow):
     def _quintic_smooth(self, t):
         return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
+    def _bell(self, t, smoothness):
+        """Smooth mound cross-section. t = 0 at the boundary, 1 at the crest.
+        quintic smoothstep ^ k: zero slope at the boundary (the mound meets
+        the boundary flat, so boundary points never need to be pulled up),
+        zero slope at the crest (rounded top). Lower smoothness = k up to
+        2.5 = fuller body with a tighter crest; 100 = broad soft bell."""
+        import math
+        t = min(max(t, 0.0), 1.0)
+        s = self._quintic_smooth(t)
+        sm = min(max(smoothness, 0.0), 100.0)
+        k = 1.0 + (100.0 - sm) / 100.0 * 1.5
+        return math.pow(s, k)
+
     def _calculate_profile_height(self, d, max_interior, target_height, profile_type, smoothness, plateau_ratio, x=0.5, y=0.5, boundary_pts=[]):
         import math
         if max_interior <= 0:
@@ -393,11 +406,8 @@ class MoundEditorWindow(forms.WPFWindow):
         t = min(max(d / max_interior, 0.0), 1.0)
         sigma = 0.15 + (smoothness / 100.0) * 0.60
 
-        if profile_type == 0:  # Dome / Smooth Gaussian Hill
-            q = self._quintic_smooth(t)
-            g = math.exp(-((t - 1.0) ** 2) / (2.0 * sigma * sigma))
-            blended = (1.0 - t) * q + t * g
-            return target_height * blended
+        if profile_type == 0:  # Dome / smooth bell hill
+            return target_height * self._bell(t, smoothness)
 
         elif profile_type == 1:  # Mesa / Flat-Top Plateau
             flat_frac = plateau_ratio / 100.0
@@ -409,14 +419,12 @@ class MoundEditorWindow(forms.WPFWindow):
                 return target_height * q
 
         elif profile_type == 2:  # Cone / Sharp Peak Hill
-            exponent = 0.6 + (100.0 - smoothness) / 100.0 * 0.8
+            exponent = 1.0 + (100.0 - smoothness) / 100.0 * 0.8   # >= 1: no vertical wall at the edge
             factor = math.pow(t, exponent)
             return target_height * factor
 
         elif profile_type == 3:  # Ridge / Elongated Crest
-            q = self._quintic_smooth(t)
-            g = math.exp(-((t - 1.0) ** 2) / (2.0 * sigma * sigma))
-            base_h = (1.0 - t) * q + t * g
+            base_h = self._bell(t, smoothness)
             ripple = 1.0 + 0.04 * math.sin(float(x) * 0.5) * math.cos(float(y) * 0.5)
             return target_height * base_h * ripple
 
@@ -790,8 +798,33 @@ class MoundEditorWindow(forms.WPFWindow):
             segs.extend(self._ensure_bound_curve_segments(c))
         return segs
 
+    def _sketch_profile_curves(self, el):
+        """The element's real boundary: the curves of its own sketch.
+        Independent of any shape editing (the old top-surface silhouette
+        treated edges around steep facets as 'boundary')."""
+        try:
+            from Autodesk.Revit.DB import ElementId
+            sid = el.SketchId
+            if sid is None or sid == ElementId.InvalidElementId:
+                return []
+            doc, uidoc = self.get_doc_and_uidoc()
+            sk = doc.GetElement(sid)
+            if sk is None:
+                return []
+            curves = []
+            for arr in sk.Profile:
+                for c in arr:
+                    curves.append(c)
+            return curves
+        except Exception:
+            return []
+
     def _get_element_footprint_curves(self, el):
         from Autodesk.Revit.DB import Options, ViewDetailLevel, Line, XYZ
+
+        sketch_curves = self._sketch_profile_curves(el)
+        if sketch_curves:
+            return sketch_curves
 
         # Preferred path: full silhouette from ALL top-facing facets, not
         # just the single largest one. Handles a target that's already
@@ -1007,6 +1040,512 @@ class MoundEditorWindow(forms.WPFWindow):
         except Exception:
             pass
 
+    # ---------------- SHAPE-EDITOR POINT HELPERS ----------------
+
+    def _add_vertex(self, editor, pt):
+        """Add one shape-edit point. Revit 2026 removed SlabShapeEditor
+        .DrawPoint - the call is AddPoint(XYZ). Older Revit versions only
+        have DrawPoint, so fall back to it."""
+        fn = getattr(editor, "AddPoint", None)
+        if fn is None:
+            fn = getattr(editor, "DrawPoint", None)
+        if fn is None:
+            raise Exception("SlabShapeEditor has neither AddPoint nor DrawPoint.")
+        return fn(pt)
+
+    def _add_vertices(self, editor, pts):
+        added = 0
+        failed = 0
+        last_err = None
+        for pt in pts:
+            try:
+                self._add_vertex(editor, pt)
+                added += 1
+            except Exception as ex:
+                failed += 1
+                last_err = ex
+        return added, failed, last_err
+
+    def _edit_spacing_diag(self, diag):
+        """Point spacing for edits = the Density value used at creation
+        (Create tab slider), kept sensible for the footprint size."""
+        sp = None
+        try:
+            sp = float(self.SldDensity.Value)
+        except Exception:
+            sp = None
+        if not sp or sp <= 0:
+            sp = diag / 60.0 if diag > 0 else 1.0
+        return max(0.3, min(sp, max(diag / 10.0, 0.3)))
+
+    def _edit_spacing(self, pts):
+        import math
+        if not pts:
+            return 1.0
+        xs = [p.X for p in pts]
+        ys = [p.Y for p in pts]
+        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return self._edit_spacing_diag(diag)
+
+    def _inside_segs(self, x, y, segs):
+        """Even-odd point-in-outline test over outline segments (handles
+        openings too)."""
+        inside = False
+        for (x1, y1), (x2, y2) in segs:
+            if (y1 > y) != (y2 > y):
+                xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+                if xi > x:
+                    inside = not inside
+        return inside
+
+    def _neighbour_lists(self, xs, ys, radius, skip=None):
+        import math
+        cell = max(radius, 1e-6)
+        grid = {}
+        for i in range(len(xs)):
+            grid.setdefault((int(math.floor(xs[i] / cell)), int(math.floor(ys[i] / cell))), []).append(i)
+        r2 = radius * radius
+        nbrs = []
+        for i in range(len(xs)):
+            if skip is not None and skip[i]:
+                nbrs.append([])
+                continue
+            cx = int(math.floor(xs[i] / cell))
+            cy = int(math.floor(ys[i] / cell))
+            lst = []
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for j in grid.get((gx, gy), []):
+                        if j != i and (xs[j] - xs[i]) ** 2 + (ys[j] - ys[i]) ** 2 <= r2:
+                            lst.append(j)
+            nbrs.append(lst)
+        return nbrs
+
+    def _relax_heights(self, pts, fixed, passes, strength, radius):
+        """Laplacian smoothing of Z. Points flagged in `fixed` (boundary)
+        are never changed but still act as neighbours, so the mound blends
+        into the boundary."""
+        from Autodesk.Revit.DB import XYZ
+        xs = [p.X for p in pts]
+        ys = [p.Y for p in pts]
+        zs = [p.Z for p in pts]
+        nbrs = self._neighbour_lists(xs, ys, radius, fixed)
+        for _ in range(passes):
+            new = list(zs)
+            for i in range(len(zs)):
+                nb = nbrs[i]
+                if fixed[i] or not nb:
+                    continue
+                avg = sum(zs[j] for j in nb) / float(len(nb))
+                new[i] = zs[i] + (avg - zs[i]) * strength
+            zs = new
+        return [XYZ(xs[i], ys[i], zs[i]) for i in range(len(pts))]
+
+    def _max_slope_deg(self, pts, radius):
+        import math
+        xs = [p.X for p in pts]
+        ys = [p.Y for p in pts]
+        zs = [p.Z for p in pts]
+        nbrs = self._neighbour_lists(xs, ys, radius)
+        best = 0.0
+        dmin = radius * 0.35
+        for i in range(len(pts)):
+            for j in nbrs[i]:
+                d = math.hypot(xs[i] - xs[j], ys[i] - ys[j])
+                if d >= dmin:
+                    s = abs(zs[i] - zs[j]) / d
+                    if s > best:
+                        best = s
+        return math.degrees(math.atan(best))
+
+    def _densify_mound(self, el, pts, spacing):
+        """Add inner points wherever the existing points are sparser than
+        `spacing` (the creation density). New points sit on the CURRENT
+        surface (z interpolated from neighbouring points) so nothing jumps;
+        the edit then has enough points to make a smooth, curved mound."""
+        import math
+        from Autodesk.Revit.DB import Toposolid, XYZ, Transaction
+        if not (self._has_toposolid() and isinstance(el, Toposolid)):
+            return pts
+        if len(pts) < 3:
+            return pts
+        segs = self._boundary_segments(el)
+        if not segs:
+            return pts
+        ex = [(p.X, p.Y, p.Z) for p in pts]
+        cell = spacing
+        idx = {}
+        for i, (x, y, z) in enumerate(ex):
+            idx.setdefault((int(math.floor(x / cell)), int(math.floor(y / cell))), []).append(i)
+
+        def near(x, y, rings):
+            cx = int(math.floor(x / cell))
+            cy = int(math.floor(y / cell))
+            out = []
+            for gx in range(cx - rings, cx + rings + 1):
+                for gy in range(cy - rings, cy + rings + 1):
+                    for i in idx.get((gx, gy), []):
+                        out.append(((ex[i][0] - x) ** 2 + (ex[i][1] - y) ** 2, i))
+            return out
+
+        sx = [s[0][0] for s in segs] + [s[1][0] for s in segs]
+        sy = [s[0][1] for s in segs] + [s[1][1] for s in segs]
+        min_x, max_x, min_y, max_y = min(sx), max(sx), min(sy), max(sy)
+
+        adds = []
+        x = min_x + spacing * 0.5
+        while x < max_x:
+            y = min_y + spacing * 0.5
+            while y < max_y:
+                if self._inside_segs(x, y, segs) and self._dist_to_segments(x, y, segs) >= 0.5 * spacing:
+                    close = False
+                    for d2, i in near(x, y, 1):
+                        if d2 < (0.7 * spacing) ** 2:
+                            close = True
+                            break
+                    if not close:
+                        cand = []
+                        for rings in (2, 4, 7):
+                            cand = near(x, y, rings)
+                            if len(cand) >= 4:
+                                break
+                        if cand:
+                            cand.sort()
+                            num = 0.0
+                            den = 0.0
+                            for d2, i in cand[:6]:
+                                w = 1.0 / (d2 + 1e-9)
+                                num += w * ex[i][2]
+                                den += w
+                            adds.append(XYZ(x, y, num / den))
+                y += spacing
+            x += spacing
+        if not adds:
+            return pts
+        if len(adds) > 2500:
+            step = int(math.ceil(len(adds) / 2500.0))
+            adds = adds[::step]
+
+        doc, uidoc = self.get_doc_and_uidoc()
+        t = Transaction(doc, "Add Mound Points")
+        t.Start()
+        try:
+            editor = el.GetSlabShapeEditor()
+            added, failed, last_err = self._add_vertices(editor, adds)
+            doc.Regenerate()
+            t.Commit()
+        except Exception as ex:
+            t.RollBack()
+            self._log_error("Adding points failed", ex)
+            return pts
+        self._log("Added {} inner points (spacing {:.2f} ft = creation density){}.".format(
+            added, spacing, "; {} rejected".format(failed) if failed else ""))
+        if added == 0 and last_err is not None:
+            self._log("No points could be added: {}".format(last_err))
+            return pts
+        return self._get_points(el)
+
+    def _densify_for_edit(self, el):
+        pts = self._densify_if_flat(el)
+        try:
+            pts = self._densify_mound(el, pts, self._edit_spacing(pts))
+        except Exception as ex:
+            self._log("Point densify skipped ({}).".format(ex))
+        return pts
+
+    # ---------------- FIXED-BOUNDARY HELPERS ----------------
+    # Boundary vertices (the ones lying on the element's outline) are never
+    # moved by Set Peak / Apply Profile Shape / Smooth - only inner points.
+
+    def _segs_from_curves(self, raw_curves):
+        """2D outline segments ((x1,y1),(x2,y2)) from a list of curves."""
+        from Autodesk.Revit.DB import Line
+        segs = []
+        try:
+            for crv in (raw_curves or []):
+                for c in self._ensure_bound_curve_segments(crv):
+                    if not c.IsBound:
+                        continue
+                    try:
+                        if isinstance(c, Line):
+                            pts = [c.GetEndPoint(0), c.GetEndPoint(1)]
+                        else:
+                            n = max(4, min(60, int(c.Length / 0.5) + 2))
+                            pts = [c.Evaluate(i / float(n - 1), True) for i in range(n)]
+                    except Exception:
+                        pts = list(c.Tessellate())
+                    for i in range(len(pts) - 1):
+                        segs.append(((pts[i].X, pts[i].Y), (pts[i + 1].X, pts[i + 1].Y)))
+        except Exception as ex:
+            self._log("Boundary read failed ({}).".format(ex))
+        return segs
+
+    def _boundary_segments(self, el):
+        """Outline of the element (from its own sketch when possible)."""
+        return self._segs_from_curves(self._get_element_footprint_curves(el) or [])
+
+    def _dist_to_segments(self, x, y, segs):
+        import math
+        best = 1e18
+        for (x1, y1), (x2, y2) in segs:
+            dx = x2 - x1
+            dy = y2 - y1
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-12:
+                t = 0.0
+            else:
+                t = ((x - x1) * dx + (y - y1) * dy) / l2
+                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            px = x1 + t * dx - x
+            py = y1 + t * dy - y
+            d2 = px * px + py * py
+            if d2 < best:
+                best = d2
+        return math.sqrt(best)
+
+    def _boundary_flags(self, pts, segs, tol=0.06):
+        """True for every point lying on the outline (tol ~ 18 mm)."""
+        if not segs:
+            return None
+        return [self._dist_to_segments(p.X, p.Y, segs) <= tol for p in pts]
+
+    def _boundary_elevation_fn(self, pts, flags, fallback_z):
+        """z of the boundary 'base' at any x,y: constant when the boundary
+        is level (the usual case), distance-weighted otherwise."""
+        bz = []
+        if flags:
+            bz = [(p.X, p.Y, p.Z) for p, f in zip(pts, flags) if f]
+        if not bz:
+            return lambda x, y: fallback_z
+        zs = [b[2] for b in bz]
+        if max(zs) - min(zs) < 1e-4:
+            z0 = sum(zs) / len(zs)
+            return lambda x, y: z0
+
+        def fn(x, y):
+            num = 0.0
+            den = 0.0
+            for bx, by, bzz in bz:
+                d2 = (bx - x) ** 2 + (by - y) ** 2
+                if d2 < 1e-8:
+                    return bzz
+                w = 1.0 / d2
+                num += w * bzz
+                den += w
+            return num / den
+        return fn
+
+    def _anchors_from_curves(self, raw_curves, spacing, z_fn):
+        """Points exactly ON the outline curves (curve evaluations, never
+        chords) at the elevation z_fn gives."""
+        import math
+        from Autodesk.Revit.DB import XYZ
+        step = max(spacing, 0.1)
+        out = []
+        try:
+            for crv in (raw_curves or []):
+                for c in self._ensure_bound_curve_segments(crv):
+                    if not c.IsBound:
+                        continue
+                    n = max(1, int(math.ceil(c.Length / step)))
+                    for i in range(n + 1):
+                        p = c.Evaluate(i / float(n), True)
+                        out.append(XYZ(p.X, p.Y, z_fn(p.X, p.Y)))
+        except Exception as ex:
+            self._log("Boundary anchor points failed ({}).".format(ex))
+        return out
+
+    def _boundary_anchor_points(self, el, spacing, z_fn):
+        return self._anchors_from_curves(self._get_element_footprint_curves(el) or [], spacing, z_fn)
+
+    def _smooth_mound_points(self, segs, anchor_fn, target_height, spacing, profile_type,
+                             smoothness, plateau_ratio):
+        """Smooth mound on a REGULAR grid (even triangles, no fans or
+        slivers): profile height from the centre, then heat-smoothing so no
+        crease, ridge or spike survives, then scaled so the crest is exactly
+        the requested peak. Heights are relative to the flat base; the
+        boundary points are exactly on the sketch outline at height 0."""
+        import math
+        from Autodesk.Revit.DB import XYZ
+        if not segs or len(segs) < 3:
+            return []
+        xs = [s[0][0] for s in segs] + [s[1][0] for s in segs]
+        ys = [s[0][1] for s in segs] + [s[1][1] for s in segs]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+
+        area2 = 0.0
+        gx = 0.0
+        gy = 0.0
+        for (x1, y1), (x2, y2) in segs:
+            cr = x1 * y2 - x2 * y1
+            area2 += cr
+            gx += (x1 + x2) * cr
+            gy += (y1 + y2) * cr
+        area = abs(area2) / 2.0
+        if area < 1e-6:
+            return []
+        cx = gx / (3.0 * area2)
+        cy = gy / (3.0 * area2)
+
+        # inscribed radius (= half the narrow dimension) + a safe centre
+        best_d, best_x, best_y = 0.0, cx, cy
+        N = 40
+        for i in range(N + 1):
+            for j in range(N + 1):
+                x = min_x + (max_x - min_x) * i / float(N)
+                y = min_y + (max_y - min_y) * j / float(N)
+                if self._inside_segs(x, y, segs):
+                    d = self._dist_to_segments(x, y, segs)
+                    if d > best_d:
+                        best_d, best_x, best_y = d, x, y
+        d_max = best_d
+        if d_max <= 1e-6:
+            return []
+        if not self._inside_segs(cx, cy, segs):
+            cx, cy = best_x, best_y
+
+        # grid spacing: creation density, but always >= 12 points across the
+        # radius so every footprint gets a finely sampled, smooth curve
+        s = min(max(spacing, 0.15), max(d_max / 12.0, 0.1))
+        if area / (s * s) > 3500.0:
+            s = math.sqrt(area / 3500.0)
+
+        def ray_len(ux, uy):
+            best = None
+            for (x1, y1), (x2, y2) in segs:
+                ex = x2 - x1
+                ey = y2 - y1
+                den = ux * ey - uy * ex
+                if abs(den) < 1e-12:
+                    continue
+                t = ((x1 - cx) * ey - (y1 - cy) * ex) / den
+                u = ((x1 - cx) * uy - (y1 - cy) * ux) / den
+                if t > 1e-9 and -1e-9 <= u <= 1.0 + 1e-9:
+                    if best is None or t < best:
+                        best = t
+            return best
+
+        # convex footprint -> height measured along rays from the centre (a
+        # round dome). Concave footprint -> measured from the nearest edge,
+        # which stays continuous around re-entrant corners (rays would give
+        # cliffs there).
+        hull_pts = sorted(set([(round(a, 6), round(b, 6)) for a, b in
+                               [sg[0] for sg in segs] + [sg[1] for sg in segs]]))
+
+        def _cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+        lower = []
+        for p in hull_pts:
+            while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(hull_pts):
+            while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = lower[:-1] + upper[:-1]
+        hull_area = 0.0
+        for i in range(len(hull)):
+            h1 = hull[i]
+            h2 = hull[(i + 1) % len(hull)]
+            hull_area += h1[0] * h2[1] - h2[0] * h1[1]
+        hull_area = abs(hull_area) / 2.0
+        use_rays = hull_area > 0 and (area / hull_area) > 0.985
+
+        nodes = []
+        y = min_y + s * 0.5
+        while y < max_y:
+            x = min_x + s * 0.5
+            while x < max_x:
+                if self._inside_segs(x, y, segs) and self._dist_to_segments(x, y, segs) >= 0.5 * s:
+                    nodes.append((x, y))
+                x += s
+            y += s
+        if len(nodes) < 3:
+            return []
+
+        vals = []
+        for (x, y) in nodes:
+            dx = x - cx
+            dy = y - cy
+            r = math.hypot(dx, dy)
+            if not use_rays:
+                t = self._dist_to_segments(x, y, segs) / d_max
+            elif r < 1e-9:
+                t = 1.0
+            else:
+                R = ray_len(dx / r, dy / r)
+                if R is None or R <= r:
+                    t = self._dist_to_segments(x, y, segs) / d_max
+                else:
+                    t = 1.0 - r / R
+            t = min(max(t, 0.0), 1.0)
+            vals.append(self._calculate_profile_height(t, 1.0, 1.0, profile_type,
+                                                        smoothness, plateau_ratio, x, y))
+
+        anchors = anchor_fn(s) if anchor_fn is not None else []
+        pts = [XYZ(x, y, v) for (x, y), v in zip(nodes, vals)] + list(anchors)
+        fixed = [False] * len(nodes) + [True] * len(anchors)
+
+        # smoothing reach = 10%..22% of the inscribed radius, whatever the grid
+        # spacing, so the finer the grid the more passes it takes
+        reach = 0.10 + (min(max(smoothness, 0.0), 100.0) / 100.0) * 0.12
+        passes = min(40, int(((reach * d_max / s) ** 2) / 0.5) + 2)
+        pts = self._relax_heights(pts, fixed, passes, 0.5, 1.6 * s)
+
+        peak = max(p.Z for p in pts[:len(nodes)])
+        if peak > 1e-9:
+            k = target_height / peak
+            pts = [XYZ(p.X, p.Y, p.Z * k) for p in pts]
+        self._smooth_grid_spacing = s
+        return self._dedupe_points(pts)
+
+    def _create_mound_points_smooth(self, curves, base_z, target_height, grid_spacing,
+                                    profile_type, smoothness, plateau_ratio, lock_base=True):
+        """Create Mound / preview points from the footprint curves, built
+        with the same smooth regular-grid generator as the edit tools."""
+        from Autodesk.Revit.DB import XYZ
+        try:
+            segs = self._segs_from_curves(curves)
+            anchor_fn = (lambda s: self._anchors_from_curves(curves, s, lambda x, y: 0.0)) if lock_base else None
+            rel = self._smooth_mound_points(segs, anchor_fn, target_height, grid_spacing,
+                                            profile_type, smoothness, plateau_ratio)
+            if len(rel) >= 3:
+                return [XYZ(p.X, p.Y, base_z + p.Z) for p in rel]
+        except Exception as ex:
+            self._log("Smooth mound generation failed ({}) - using standard points.".format(ex))
+        return []
+
+    def _mound_points_fixed_boundary(self, el, boundary_pts, existing_pts, target_height,
+                                     grid_spacing, profile_type, smoothness, plateau_ratio):
+        """Clean, smooth mound with the boundary kept flat at the base
+        level. Returns (points with z RELATIVE to the flat base, []).
+        Whatever shape the target has now is ignored - it is rebuilt."""
+        pts = []
+        try:
+            pts = self._smooth_mound_points(
+                self._boundary_segments(el),
+                lambda s: self._boundary_anchor_points(el, s, lambda x, y: 0.0),
+                target_height, grid_spacing, profile_type, smoothness, plateau_ratio)
+        except Exception as ex:
+            self._log("Smooth mound generation failed ({}) - using fallback.".format(ex))
+        if len(pts) >= 3:
+            try:
+                slope = self._max_slope_deg(pts, 1.8 * getattr(self, "_smooth_grid_spacing", grid_spacing))
+                if slope > 35.0:
+                    self._log("Note: steepest slope is {:.0f} deg - the footprint is narrow/small "
+                              "for this peak height. A lower peak or a wider footprint "
+                              "gives a gentler mound.".format(slope))
+                else:
+                    self._log("Steepest slope {:.0f} deg.".format(slope))
+            except Exception:
+                pass
+            return pts, []
+        raw = self._create_mound_points(boundary_pts, 0.0, target_height, grid_spacing,
+                                        profile_type, smoothness, plateau_ratio, lock_base=True)
+        return self._dedupe_points(raw), []
+
     def _get_points(self, el):
         topo_cls = self._get_topography_class()
         if topo_cls is not None and isinstance(el, topo_cls):
@@ -1051,7 +1590,10 @@ class MoundEditorWindow(forms.WPFWindow):
                     # so there is no correctness reason to regenerate between
                     # every single point — only speed was lost doing that.
                     # Apply the whole batch, then regenerate once.
-                    for v, new_pt in zip(vertices, new_points):
+                    olds = list(old_points) if (old_points is not None and len(old_points) == len(new_points)) else [None] * len(new_points)
+                    for v, new_pt, old_pt in zip(vertices, new_points, olds):
+                        if old_pt is not None and abs(new_pt.Z - old_pt.Z) < 1e-7:
+                            continue  # untouched vertex (e.g. boundary) - never rewritten
                         value = new_pt.Z - ref_z  # ABSOLUTE offset from flat baseline
                         try:
                             editor.ModifySubElement(v, value)
@@ -1064,14 +1606,14 @@ class MoundEditorWindow(forms.WPFWindow):
                     # actually adds a new shape-edit vertex is DrawPoint(XYZ).
                     for pt in new_points:
                         try:
-                            editor.DrawPoint(pt)
+                            self._add_vertex(editor, pt)
                         except Exception:
                             pass
                     doc.Regenerate()
                 return
         raise Exception("Unsupported element type for point editing.")
 
-    def _rebuild_shape_points(self, el, grid_pts):
+    def _rebuild_shape_points(self, el, grid_pts, restore_pts=None, relative_to_flat=False):
         """Wipes whatever shape-edit points the target currently has and
         lays down a brand new set — boundary + interior grid, exactly what
         Create Mound would produce on a fresh element. Used by Apply
@@ -1089,6 +1631,9 @@ class MoundEditorWindow(forms.WPFWindow):
         topo_cls = self._get_topography_class()
         if topo_cls is not None and isinstance(el, topo_cls):
             old_pts = list(el.GetPoints())
+            if relative_to_flat:
+                base0 = min(p.Z for p in old_pts) if old_pts else 0.0
+                grid_pts = [XYZ(p.X, p.Y, base0 + p.Z) for p in grid_pts]
             if old_pts:
                 el.DeletePoints(List[XYZ](old_pts))
             el.AddPoints(List[XYZ](grid_pts))
@@ -1116,6 +1661,22 @@ class MoundEditorWindow(forms.WPFWindow):
                 editor = el.GetSlabShapeEditor()
                 self._ensure_shape_editor_enabled(editor)
 
+                if relative_to_flat:
+                    # after the reset the top is flat: its elevation is the
+                    # base the mound heights are measured from
+                    base = None
+                    if reset_ok:
+                        try:
+                            bb = el.get_BoundingBox(None)
+                            if bb is not None:
+                                base = bb.Max.Z
+                        except Exception:
+                            base = None
+                    if base is None:
+                        base = self._get_param_datum_z(el)
+                    grid_pts = [XYZ(p.X, p.Y, base + p.Z) for p in grid_pts]
+                    self._log("Flat base elevation {:.3f} ft.".format(base))
+
                 added, failed, last_err = 0, 0, None
                 for pt in grid_pts:
                     try:
@@ -1123,12 +1684,46 @@ class MoundEditorWindow(forms.WPFWindow):
                         # a TopographySurface method. DrawPoint(XYZ) is the
                         # real Toposolid call that adds a new shape-edit
                         # vertex and returns the new SlabShapeVertex.
-                        editor.DrawPoint(pt)
+                        self._add_vertex(editor, pt)
                         added += 1
                     except Exception as ex:
                         failed += 1
                         last_err = ex
                 doc.Regenerate()
+
+                # ResetSlabShape flattened the boundary vertices too - put
+                # them back at the elevation they had before.
+                if restore_pts and added > 0:
+                    try:
+                        editor = el.GetSlabShapeEditor()
+                        verts = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+                        if verts:
+                            ref_z = self._detect_ref_z(doc, el, editor, verts[0])
+                            if ref_z is None:
+                                ref_z = self._get_param_datum_z(el)
+                            editor = el.GetSlabShapeEditor()
+                            verts = list(editor.SlabShapeVertices) if editor.SlabShapeVertices else []
+                            fixed_n = 0
+                            for v in verts:
+                                pos = v.Position
+                                best = None
+                                best_d2 = 0.03 ** 2
+                                for bp in restore_pts:
+                                    d2 = (bp.X - pos.X) ** 2 + (bp.Y - pos.Y) ** 2
+                                    if d2 <= best_d2:
+                                        best_d2 = d2
+                                        best = bp
+                                if best is not None and abs(pos.Z - best.Z) > 1e-4:
+                                    try:
+                                        editor.ModifySubElement(v, best.Z - ref_z)
+                                        fixed_n += 1
+                                    except Exception:
+                                        pass
+                            if fixed_n:
+                                doc.Regenerate()
+                                self._log("Boundary vertices kept at their original elevation ({}).".format(fixed_n))
+                    except Exception as ex:
+                        self._log("Boundary restore skipped ({}).".format(ex))
 
                 if added == 0:
                     raise Exception(
@@ -1207,7 +1802,7 @@ class MoundEditorWindow(forms.WPFWindow):
                 try:
                     # FIX: SlabShapeEditor has no AddPoint method — use
                     # DrawPoint(XYZ), the real call that adds a new vertex.
-                    editor.DrawPoint(p)
+                    self._add_vertex(editor, p)
                 except Exception:
                     pass
             doc.Regenerate()
@@ -1682,10 +2277,15 @@ class MoundEditorWindow(forms.WPFWindow):
         plateau_ratio = self.SldPlateauRatio.Value
         lock_base = bool(self.ChkLockBase.IsChecked)
 
-        grid_pts = self._create_mound_points(
-            boundary_pts, base_z, target_height, grid_spacing,
+        grid_pts = self._create_mound_points_smooth(
+            curves, base_z, target_height, grid_spacing,
             profile_type, smoothness, plateau_ratio, lock_base
         )
+        if len(grid_pts) < 3:
+            grid_pts = self._create_mound_points(
+                boundary_pts, base_z, target_height, grid_spacing,
+                profile_type, smoothness, plateau_ratio, lock_base
+            )
 
         return (curves, boundary_pts, grid_pts, base_z, target_height)
 
@@ -1842,7 +2442,7 @@ class MoundEditorWindow(forms.WPFWindow):
                             try:
                                 # FIX: SlabShapeEditor has no AddPoint method —
                                 # DrawPoint(XYZ) is the correct call.
-                                editor.DrawPoint(pt)
+                                self._add_vertex(editor, pt)
                             except Exception:
                                 pass
                 else:
@@ -1874,28 +2474,20 @@ class MoundEditorWindow(forms.WPFWindow):
             try: passes = max(1, int(self.TxtSmoothPasses.Text.strip()))
             except Exception: passes = 1
 
-            pts = self._densify_if_flat(el)
+            pts = self._densify_for_edit(el)
             if len(pts) < 3:
                 self._log("Not enough points to smooth.")
                 return
 
             min_z = min(p.Z for p in pts)
+            segs = self._boundary_segments(el)
+            b_flags = self._boundary_flags(pts, segs) if segs else None
+            if b_flags is None:
+                b_flags = [False] * len(pts)
             search_r = self._estimate_spacing(pts) * 1.8
-            work = list(pts)
-
-            for _ in range(passes):
-                new_z = []
-                for p in work:
-                    if lock_edges and abs(p.Z - min_z) < 0.05:
-                        new_z.append(p.Z)
-                        continue
-                    neighbours = [q for q in work if 0 < math.hypot(p.X - q.X, p.Y - q.Y) <= search_r]
-                    if not neighbours:
-                        new_z.append(p.Z)
-                        continue
-                    avg = sum(q.Z for q in neighbours) / len(neighbours)
-                    new_z.append(p.Z + (avg - p.Z) * strength)
-                work = [XYZ(p.X, p.Y, z) for p, z in zip(work, new_z)]
+            fixed = [bool(b_flags[i]) or (lock_edges and abs(pts[i].Z - min_z) < 0.05)
+                     for i in range(len(pts))]
+            work = self._relax_heights(pts, fixed, passes, strength, search_r)
 
             from Autodesk.Revit.DB import Transaction
             t = Transaction(doc, "Smooth Surface")
@@ -2032,83 +2624,11 @@ class MoundEditorWindow(forms.WPFWindow):
         return out
 
     def do_peak_api(self, uiapp):
-        import traceback, math
-        doc, uidoc = self.get_doc_and_uidoc(uiapp)
-        el = self._require_target()
-        if el is None: return
-        try:
-            target_peak_ft = self._mm_to_ft(float(self.TxtPeakTarget.Text.strip()))
-            raw_pts = self._get_points(el)
-
-            zs = [p.Z for p in raw_pts]
-            is_flat = (not zs) or (max(zs) - min(zs) < 1e-6)
-
-            from Autodesk.Revit.DB import XYZ, Transaction
-
-            if is_flat:
-                # Flat surface: nothing to rescale, so BUILD a smooth dome.
-                # Generate boundary points from the real footprint, then a
-                # full interior grid, and rebuild the shape with them
-                # (same point generation Create Mound uses).
-                boundary_pts = self._flat_footprint_boundary(el, raw_pts)
-                if len(boundary_pts) < 3:
-                    self._log("Could not read a boundary for this surface.")
-                    return
-                if zs:
-                    base_z = min(zs)
-                else:
-                    base_z = min(p.Z for p in boundary_pts)
-
-                min_x = min(p.X for p in boundary_pts); max_x = max(p.X for p in boundary_pts)
-                min_y = min(p.Y for p in boundary_pts); max_y = max(p.Y for p in boundary_pts)
-                diag = math.hypot(max_x - min_x, max_y - min_y)
-                grid_spacing = max(0.5, min(diag / 40.0, 3.0)) if diag > 0 else 1.0
-
-                grid_pts = self._create_mound_points(
-                    boundary_pts, base_z, target_peak_ft, grid_spacing,
-                    0, 50, 0,  # Dome profile, mid smoothness, no plateau
-                    lock_base=True
-                )
-                self._log("Diag: boundary pts={}  grid pts={}  spacing={:.2f} ft".format(
-                    len(boundary_pts), len(grid_pts), grid_spacing))
-                if len(grid_pts) < 3:
-                    self._log("Footprint too small to build a peak at this density.")
-                    return
-
-                t = Transaction(doc, "Set Peak Elevation")
-                t.Start()
-                try:
-                    added = self._rebuild_shape_points(el, grid_pts)
-                    t.Commit()
-                    self._log("Flat surface - built a smooth peak of {} mm ({} points).".format(
-                        self.TxtPeakTarget.Text.strip(), added))
-                except Exception as ex:
-                    t.RollBack()
-                    self._log_error("Set peak failed", ex)
-                return
-
-            # Already sculpted: densify if sparse, then rescale the height.
-            pts = self._densify_if_flat(el)
-            min_z = min(p.Z for p in pts)
-            max_z = max(p.Z for p in pts)
-            current_peak = max_z - min_z
-            if current_peak < 1e-6:
-                self._log("Surface has no height range to rescale.")
-                return
-            scale = target_peak_ft / current_peak
-            new_pts = [XYZ(p.X, p.Y, min_z + (p.Z - min_z) * scale) for p in pts]
-
-            t = Transaction(doc, "Set Peak Elevation")
-            t.Start()
-            try:
-                self._set_points(el, new_pts, pts)
-                t.Commit()
-                self._log("Peak elevation set to {} mm above base.".format(self.TxtPeakTarget.Text.strip()))
-            except Exception as ex:
-                t.RollBack()
-                self._log_error("Set peak failed", ex)
-        except Exception as ex:
-            self._log_error("Set peak failed", ex)
+        """Set Peak: rebuilds the target as a clean, smooth mound whose crest
+        is exactly the requested peak (same engine as Apply Profile Shape,
+        using the profile chosen in the Modify tab). Rescaling whatever
+        points happen to exist is what produced spikes, so it is not used."""
+        self.do_reshape_profile_api(uiapp)
 
     def do_reshape_profile_api(self, uiapp):
         """Modify Existing tab's 'Apply Profile Shape' button. Unlike Smooth
@@ -2151,6 +2671,7 @@ class MoundEditorWindow(forms.WPFWindow):
 
             # Start from wherever this mound already sits rather than
             # whatever Z the footprint curves themselves evaluated to.
+            existing_pts = []
             try:
                 existing_pts = self._get_points(el)
                 base_z = min(p.Z for p in existing_pts) if existing_pts else min(p.Z for p in boundary_pts)
@@ -2166,12 +2687,11 @@ class MoundEditorWindow(forms.WPFWindow):
             min_x = min(p.X for p in boundary_pts); max_x = max(p.X for p in boundary_pts)
             min_y = min(p.Y for p in boundary_pts); max_y = max(p.Y for p in boundary_pts)
             diag = math.hypot(max_x - min_x, max_y - min_y)
-            grid_spacing = max(0.5, min(diag / 40.0, 3.0)) if diag > 0 else 1.0
+            grid_spacing = self._edit_spacing_diag(diag)
 
-            grid_pts = self._create_mound_points(
-                boundary_pts, base_z, target_height_ft, grid_spacing,
-                profile_type, smoothness, plateau_ratio, lock_base=True
-            )
+            grid_pts, restore_pts = self._mound_points_fixed_boundary(
+                el, boundary_pts, existing_pts, target_height_ft, grid_spacing,
+                profile_type, smoothness, plateau_ratio)
             if len(grid_pts) < 3:
                 self._log("Boundary footprint too small to reshape at this density.")
                 return
@@ -2183,7 +2703,7 @@ class MoundEditorWindow(forms.WPFWindow):
             t = Transaction(doc, "Apply Profile Shape")
             t.Start()
             try:
-                added_count = self._rebuild_shape_points(el, grid_pts)
+                added_count = self._rebuild_shape_points(el, grid_pts, restore_pts, True)
                 t.Commit()
                 self._log("Profile shape applied ({}, {} mm peak, {} points).".format(
                     profile_label, self.TxtPeakTarget.Text.strip(), added_count))
