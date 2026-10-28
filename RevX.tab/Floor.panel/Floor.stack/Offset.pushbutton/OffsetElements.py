@@ -15,10 +15,13 @@
 #   - value = element SHRINKS  (outer boundary moves inward,
 #                               inner openings GROW)
 #
-# The outer loop is detected as the loop with the largest
-# absolute area. Every other loop is treated as an opening and
-# is offset in the opposite shape-direction, so the element
-# itself grows or shrinks evenly on all edges.
+# Every loop is classified by NESTING (even-odd rule):
+#   - not inside any other loop        -> outer boundary
+#   - inside one loop                  -> opening
+#   - inside an opening (island)       -> outer boundary again, etc.
+# Several independent outer boundaries in one element are therefore
+# all treated as outer boundaries, and every opening as an opening,
+# so the element itself grows or shrinks evenly on all edges.
 #
 # ==========================================================
 from pyrevit import revit, forms, script
@@ -84,48 +87,88 @@ def get_loops(elem):
     return loops
 
 
-def signed_area(loop):
-    """Signed area of a CurveLoop in the XY plane.
-    Positive  = counter-clockwise (CCW)
-    Negative  = clockwise (CW)
-    """
-    area = 0.0
+def loop_points(loop):
+    """XY points of a CurveLoop (arcs/splines tessellated), in loop order."""
+    pts = []
     it = loop.GetCurveLoopIterator()
     while it.MoveNext():
         c = it.Current
-        p0 = c.GetEndPoint(0)
-        p1 = c.GetEndPoint(1)
-        area += (p0.X - p1.X) * (p0.Y + p1.Y)
+        tess = list(c.Tessellate())
+        for p in tess[:-1]:
+            pts.append((p.X, p.Y))
+    return pts
+
+
+def poly_area(pts):
+    """Signed polygon area. Positive = CCW, negative = CW."""
+    area = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
     return area / 2.0
+
+
+def point_in_poly(x, y, pts):
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if xi > x:
+                inside = not inside
+    return inside
+
+
+def sample_point(loop):
+    """A point on the loop itself (middle of its first curve)."""
+    it = loop.GetCurveLoopIterator()
+    it.MoveNext()
+    p = it.Current.Evaluate(0.5, True)
+    return (p.X, p.Y)
+
+
+def classify_loops(loops):
+    """Returns (areas, is_opening) per loop using the even-odd rule:
+    a loop nested inside an ODD number of other loops is an opening."""
+    polys = [loop_points(lp) for lp in loops]
+    areas = [poly_area(p) for p in polys]
+    samples = [sample_point(lp) for lp in loops]
+    is_opening = []
+    for i in range(len(polys)):
+        depth = 0
+        for j in range(len(polys)):
+            if i != j and point_in_poly(samples[i][0], samples[i][1], polys[j]):
+                depth += 1
+        is_opening.append(depth % 2 == 1)
+    return areas, is_opening
 
 
 def offset_loops(loops, raw_offset):
     """Positive raw_offset = element EXPANDS everywhere:
-       - outer boundary moves outward
-       - inner openings shrink (so the element grows into them)
+       - every outer boundary moves outward
+       - every opening shrinks (so the element grows into it)
+    Negative = the reverse.
 
     Revit convention with normal = Z+:
       CCW loop -> positive offset = OUTWARD (loop gets bigger)
       CW  loop -> positive offset = INWARD  (loop gets smaller)
 
     Step 1: flip the sign for CW loops so +value = "loop gets bigger".
-    Step 2: for openings (every loop except the outer one) reverse
-            that, because a bigger opening means a smaller element.
+    Step 2: for openings reverse that, because a bigger opening means
+            a smaller element.
     """
-    # outer loop = largest absolute area
-    areas = [signed_area(lp) for lp in loops]
-    outer_idx = max(range(len(areas)), key=lambda i: abs(areas[i]))
+    areas, is_opening = classify_loops(loops)
 
     result = List[CurveLoop]()
     for i, loop in enumerate(loops):
-        area = areas[i]
-        loop_sign = 1.0 if area > 0 else -1.0
+        loop_sign = 1.0 if areas[i] > 0 else -1.0
         effective_offset = raw_offset * loop_sign
-
-        # openings move opposite to the outer boundary's shape
-        if i != outer_idx:
+        if is_opening[i]:
             effective_offset = -effective_offset
-
         new_loop = CurveLoop.CreateViaOffset(loop, effective_offset, XYZ.BasisZ)
         result.Add(new_loop)
     return result
@@ -181,9 +224,12 @@ def recreate_roof(elem, loops):
     # NOTE: NewFootPrintRoof only accepts a single outer profile.
     # Inner openings are lost in this simplified recreate.
     outer = None
+    best = -1.0
     for lp in loops:
-        outer = lp
-        break
+        a = abs(poly_area(loop_points(lp)))
+        if a > best:
+            best = a
+            outer = lp
     if outer is None:
         return None
     curve_array = CurveArray()
