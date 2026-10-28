@@ -117,7 +117,7 @@
         <GroupBox Grid.Row="2" Header="Options" Margin="0,12,0,0">
             <WrapPanel>
                 <TextBlock Text="Separator" VerticalAlignment="Center" Margin="0,4,4,4"/>
-                <ComboBox x:Name="CmbSeparator" Width="80" Height="24" SelectedIndex="1" IsEditable="True"
+                <ComboBox x:Name="CmbSeparator" Width="80" Height="24" SelectedIndex="0" IsEditable="True"
                           Margin="0,4,0,4">
                     <sys:String>-</sys:String>
                     <sys:String>_</sys:String>

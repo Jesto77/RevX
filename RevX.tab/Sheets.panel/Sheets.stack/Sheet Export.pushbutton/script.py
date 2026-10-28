@@ -398,7 +398,8 @@ def build_name(item, tokens, separator, prefix, suffix,
 #  Custom File Name dialog (modal, opened from the Selection tab)
 # --------------------------------------------------------------------------- #
 
-DEFAULT_RULE = dict(tokens=["Sheet Number", "Sheet Name"], separator="_",
+DEFAULT_SEPARATOR = "-"          # preset separator (editable in the dialog)
+DEFAULT_RULE = dict(tokens=["Sheet Number", "Sheet Name"], separator=DEFAULT_SEPARATOR,
                     prefix="", suffix="", remove_spaces=False, upper=False,
                     do_sanitize=True)
 
@@ -422,7 +423,7 @@ class NamingWindow(forms.WPFWindow):
             if token not in self._available:
                 self.LstAvailable.Items.Add(token)
 
-        self.CmbSeparator.Text = rule.get("separator", "_")
+        self.CmbSeparator.Text = rule.get("separator", DEFAULT_SEPARATOR)
         self.TxtPrefix.Text = rule.get("prefix", "")
         self.TxtSuffix.Text = rule.get("suffix", "")
         self.ChkRemoveSpaces.IsChecked = rule.get("remove_spaces", False)
@@ -460,7 +461,7 @@ class NamingWindow(forms.WPFWindow):
     # ---------------- rule ----------------
     def current_rule(self):
         sep_item = self.CmbSeparator.SelectedItem
-        sep = str(sep_item) if sep_item is not None else (self.CmbSeparator.Text or "_")
+        sep = str(sep_item) if sep_item is not None else (self.CmbSeparator.Text or DEFAULT_SEPARATOR)
         return dict(
             tokens=[str(t) for t in self.LstSelected.Items],
             separator=sep,
@@ -590,12 +591,15 @@ class NamingWindow(forms.WPFWindow):
             return
         try:
             rule = read_rule_xml(dlg.FileName, self._available)
-            if LAST_READ_NOTES:
-                forms.alert("XML imported with notes:\n\n- " + "\n- ".join(LAST_READ_NOTES),
-                            title="Custom File Name")
         except Exception as ex:
             forms.alert("Could not read the XML:\n%s" % ex, title="Custom File Name")
             return
+        if not rule["tokens"]:
+            forms.alert(explain_empty_read(), title="Custom File Name")
+            return                            # keep what is already set up
+        if LAST_READ_NOTES:
+            forms.alert("XML imported with notes:\n\n- " + "\n- ".join(LAST_READ_NOTES),
+                        title="Custom File Name")
         self.LstSelected.Items.Clear()
         for token in rule["tokens"]:
             self.LstSelected.Items.Add(token)
@@ -753,15 +757,30 @@ def _decode_xml_bytes(raw):
     return raw.decode("latin-1", "replace")
 
 
+def _clean_xml_text(text):
+    """Make slightly non-standard XML parseable: no declaration / DTD,
+    namespaces and prefixes removed, stray '&' escaped, control chars out."""
+    text = text.lstrip(u"\ufeff \t\r\n")
+    text = re.sub(r"^<\?xml[^>]*\?>", "", text)
+    text = re.sub(r"<!DOCTYPE[^>\[]*(\[[^\]]*\])?[^>]*>", "", text)
+    text = re.sub(r"\sxmlns(:[\w.\-]+)?\s*=\s*(\"[^\"]*\"|'[^']*')", "", text)
+    text = re.sub(r"<(/?)[\w.\-]+:([\w.\-]+)", r"<\1\2", text)
+    text = re.sub(r"(\s)[\w.\-]+:([\w.\-]+)\s*=", r"\1\2=", text)
+    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#[xX][0-9a-fA-F]+);)", "&amp;", text)
+    text = re.sub(u"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return text
+
+
 def _parse_xml_any(path):
     import xml.etree.ElementTree as ET
     with open(path, "rb") as fh:
         raw = fh.read()
-    text = _decode_xml_bytes(raw)
-    text = text.lstrip(u"\ufeff \t\r\n")
-    text = re.sub(r"^<\?xml[^>]*\?>", "", text)                 # declaration
-    text = re.sub(r"<!DOCTYPE[^>\[]*(\[[^\]]*\])?[^>]*>", "", text)  # DTD
-    root = ET.fromstring(text.encode("utf-8"))
+    text = _clean_xml_text(_decode_xml_bytes(raw))
+    try:
+        root = ET.fromstring(text.encode("utf-8"))
+    except Exception:
+        # several top-level elements / text around the document: wrap it
+        root = ET.fromstring((u"<root>" + text + u"</root>").encode("utf-8"))
     for el in root.iter():                                       # drop xmlns
         if isinstance(el.tag, str) or hasattr(el.tag, "split"):
             try:
@@ -775,15 +794,65 @@ def _parse_xml_any(path):
     return root
 
 
+def _text_to_root(path):
+    """Not XML at all (or broken beyond repair): every line / attribute
+    value / tag text becomes a pseudo element so the pattern and scan
+    strategies still work."""
+    import xml.etree.ElementTree as ET
+    with open(path, "rb") as fh:
+        text = _decode_xml_bytes(fh.read())
+    root = ET.Element("root")
+    for m in re.finditer(r"=\s*\"([^\"]*)\"|=\s*'([^']*)'", text):
+        v = (m.group(1) or m.group(2) or "").strip()
+        if v:
+            ET.SubElement(root, "line").text = v
+    for line in re.split(r"[\r\n]+", re.sub(r"<[^>]+>", "\n", text)):
+        line = line.strip()
+        if line:
+            ET.SubElement(root, "line").text = line
+    return root
+
+
 def _truthy(v):
     return ("%s" % v).strip().lower() in ("true", "1", "yes", "y", "on",
                                            "checked", "enabled", "-1")
 
 
-def _collect_settings(root):
+def _falsy(v):
+    return ("%s" % v).strip().lower() in ("false", "0", "no", "n", "off",
+                                           "unchecked", "disabled", "hidden")
+
+
+_ENABLE_KEYS = set(["enabled", "include", "included", "active", "selected",
+                    "use", "used", "checked", "visible", "isenabled",
+                    "isselected", "isactive", "isincluded", "isused"])
+
+
+def _item_enabled(el):
+    """False when the entry is switched off in the other tool's file."""
+    for k, v in el.attrib.items():
+        if _nk(k) in _ENABLE_KEYS and _falsy(v):
+            return False
+    for ch in el:
+        if _nk(ch.tag) in _ENABLE_KEYS and ch.text and _falsy(ch.text):
+            return False
+    return True
+
+
+def _tag_stem(tag):
+    """Normalised tag without trailing digits (Parameter1 -> parameter)."""
+    return re.sub(r"\d+$", "", _nk(tag))
+
+
+def _collect_settings(root, item_els=None):
     """normalised-name -> raw value, from tags, attributes and key/value
     elements, anywhere in the document (first one wins)."""
     kv = {}
+    item_ids = set(id(e) for e in (item_els or []))
+    parents = {}
+    for p_ in root.iter():
+        for c_ in p_:
+            parents[id(c_)] = p_
 
     def put(k, v):
         k = _nk(k)
@@ -794,6 +863,12 @@ def _collect_settings(root):
         tag = el.tag
         children = list(el)
         txt = el.text if el.text is not None else None
+        parent = parents.get(id(el))
+        # prefix / suffix / separator written on the parameter ENTRIES
+        # themselves are per-item settings, not global ones
+        in_item = parent is not None and id(parent) in item_ids
+        if in_item and _nk(tag) in _SETTING_TAGS:
+            continue
         if not children and txt is not None:
             put(tag, txt if txt.strip() or txt != "" else "")
         elif not children and el.get("value") is not None and not el.get("name"):
@@ -802,6 +877,8 @@ def _collect_settings(root):
         for ak, av in el.attrib.items():
             if _nk(ak) in ("name", "key", "id", "property", "setting",
                            "type", "order", "index"):
+                continue
+            if id(el) in item_ids and _nk(ak) in _SETTING_TAGS:
                 continue
             put(ak, av)
         # <Setting name="Separator" value="_"/>  /  <Option key="x">y</Option>
@@ -858,55 +935,68 @@ def _item_order(el, fallback):
                 return float(k.text.strip())
             except Exception:
                 pass
+    m = re.search(r"(\d+)$", ("%s" % el.tag))          # <Parameter3> ...
+    if m:
+        return float(m.group(1))
     return fallback
 
 
 def _resolve_token(raw, known_map):
     """Map a token spelled by another tool onto a name we can evaluate."""
+    exact = set(known_map.values()) | set(BUILTIN_TOKENS)
+    if raw in exact:                           # exact spelling wins (the two
+        return raw, True                       # Date formats share a key)
+
+    def alias_target(key):
+        target = _TOKEN_ALIASES[key]
+        return target if target in exact else known_map.get(_nk(target), target)
+
     k = _nk(raw)
     if k in known_map:
         return known_map[k], True
     if k in _TOKEN_ALIASES:
-        target = _TOKEN_ALIASES[k]
-        return known_map.get(_nk(target), target), True
+        return alias_target(k), True
     # "Sheet_Number", "[SheetNumber]", "{Sheet Number}", "$Sheet Number$"
     k2 = _nk(re.sub(r"[\[\]\{\}\$%<>#@]", "", raw))
     if k2 in known_map:
         return known_map[k2], True
     if k2 in _TOKEN_ALIASES:
-        target = _TOKEN_ALIASES[k2]
-        return known_map.get(_nk(target), target), True
+        return alias_target(k2), True
     return raw, False
 
 
-def _tokens_from_tree(root):
-    """Parameter names, in order, from whatever structure holds them."""
-    # 1. a recognised container whose children are the parameters
+def _group_items(root):
+    """[(order, index, value, element)] of the parameter entries, in order,
+    from whatever structure holds them (switched-off entries skipped)."""
     best = []
     for el in root.iter():
-        if _nk(el.tag) in _GROUP_TAGS:
+        if _nk(el.tag) in _GROUP_TAGS or _tag_stem(el.tag) in _GROUP_TAGS:
             vals = []
             for i, ch in enumerate(list(el)):
                 ck = _nk(ch.tag)
                 if ck in _SETTING_TAGS or ck in _GROUP_TAGS:
                     continue            # a setting, not a parameter entry
+                if not _item_enabled(ch):
+                    continue
                 v = _item_value(ch)
                 if v:
-                    vals.append((_item_order(ch, i), i, v))
+                    vals.append((_item_order(ch, i), i, v, ch))
             if len(vals) > len(best):
                 best = vals
-    if best:
-        return [v for _, _, v in sorted(best, key=lambda t: (t[0], t[1]))]
-    # 2. any elements that look like parameter items
-    vals = []
-    for i, el in enumerate(root.iter()):
-        if _nk(el.tag) in _ITEM_TAGS:
-            v = _item_value(el)
-            if v:
-                vals.append((_item_order(el, i), i, v))
-    if vals:
-        return [v for _, _, v in sorted(vals, key=lambda t: (t[0], t[1]))]
-    return []
+    if not best:
+        for i, el in enumerate(root.iter()):
+            if _nk(el.tag) in _ITEM_TAGS or _tag_stem(el.tag) in _ITEM_TAGS:
+                if not _item_enabled(el):
+                    continue
+                v = _item_value(el)
+                if v:
+                    best.append((_item_order(el, i), i, v, el))
+    best.sort(key=lambda t: (t[0], t[1]))
+    return best
+
+
+def _tokens_from_tree(root):
+    return [v for _, _, v, _ in _group_items(root)]
 
 
 def _tokens_by_scanning(root, known_map):
@@ -922,6 +1012,149 @@ def _tokens_by_scanning(root, known_map):
             if ok:
                 out.append(name)
     return out
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"\{([^{}]+)\}|\[([^\[\]]+)\]|<([^<>]+)>|%([^%]+)%|\$([^$]+)\$")
+
+
+def _compile_token_patterns(known_map):
+    """Regexes for every parameter spelling we know, longest first."""
+    pats = []
+    for k, name in known_map.items():
+        words = re.findall(r"[A-Za-z0-9]+", name)
+        if words:
+            pats.append((r"[ _\-\.]?".join(re.escape(w) for w in words), name))
+    for k, target in _TOKEN_ALIASES.items():
+        pats.append((re.escape(k), known_map.get(_nk(target), target)))
+    pats.sort(key=lambda p: -len(p[0]))
+    return [(re.compile(p, re.I), n) for p, n in pats]
+
+
+def _parse_sequence(text, patterns):
+    """'Sheet Number-Sheet Name' / 'SheetNumber_SheetName' -> tokens + seps.
+    The whole text must be known parameters joined by separators."""
+    pos = 0
+    n = len(text)
+    toks, seps = [], []
+    while pos < n:
+        hit = None
+        for rx, name in patterns:
+            m = rx.match(text, pos)
+            if m and m.end() > pos and not (m.end() < n and text[m.end()].isalnum()):
+                hit = (m.end(), name)
+                break
+        if hit is None:
+            return None
+        toks.append(hit[1])
+        pos = hit[0]
+        s = pos
+        while pos < n and not text[pos].isalnum():
+            pos += 1
+        if pos < n:
+            if pos - s > 5 or pos == s:
+                return None
+            seps.append(text[s:pos])
+    return toks, seps
+
+
+_PH_PREFIXES = set(["param", "parameter", "par", "p", "prop", "property",
+                    "field", "fld", "token", "tok", "var", "variable", "sheet",
+                    "sheetparam", "sheetparameter", "view", "viewparam",
+                    "instance", "inst", "project", "proj", "projectinfo", "pi",
+                    "type", "lookup", "get", "value", "val", "name", "col",
+                    "column", "key", "attr", "attribute"])
+
+
+def _clean_placeholder(inner, known_map):
+    """{Param:Sheet Number} -> Sheet Number ; {Date:yyyyMMdd} -> Date."""
+    t = inner.strip()
+    if ":" in t:
+        left, right = [s.strip() for s in t.split(":", 1)]
+        if right and _nk(left) in _PH_PREFIXES:
+            return right                       # prefix word, name after it
+        if left and _resolve_token(left, known_map)[1]:
+            return left                        # name, then a format after it
+        if right:
+            return right
+    return t
+
+
+def _parse_template(text, known_map, patterns):
+    """A naming PATTERN written as one string, e.g. '{Sheet Number}-{Sheet
+    Name}', '[SheetNumber]_[SheetName]', '%Sheet Number% - %Sheet Name%' or
+    plain 'Sheet Number-Sheet Name'. Returns dict or None."""
+    ms = list(_PLACEHOLDER_RE.finditer(text))
+    if ms:
+        toks, seps = [], []
+        resolved = 0
+        for i, m in enumerate(ms):
+            inner = [g for g in m.groups() if g is not None][0].strip()
+            inner = _clean_placeholder(inner, known_map)
+            name, ok = _resolve_token(inner, known_map)
+            resolved += 1 if ok else 0
+            toks.append(name)
+            if i > 0:
+                seps.append(text[ms[i - 1].end():m.start()])
+        if len(ms) >= 2 or resolved >= 1:      # several placeholders = a real pattern
+            return dict(tokens=toks, seps=seps, prefix=text[:ms[0].start()],
+                        suffix=text[ms[-1].end():], real_seps=True)
+        return None
+    seq = _parse_sequence(text, patterns)
+    if seq and len(seq[0]) >= 2:
+        toks, seps = seq
+        lst = all(s.strip() in (";", ",", "|") for s in seps)
+        return dict(tokens=toks, seps=[] if lst else seps, prefix="", suffix="",
+                    real_seps=not lst)
+    return None
+
+
+def _template_from_tree(root, known_map, patterns):
+    best = None
+    for el in root.iter():
+        vals = []
+        if el.text and el.text.strip() and not list(el):
+            vals.append(el.text.strip())
+        vals.extend(v.strip() for v in el.attrib.values() if v and v.strip())
+        for v in vals:
+            t = _parse_template(v, known_map, patterns)
+            if t and (best is None or len(t["tokens"]) > len(best["tokens"])):
+                best = t
+    return best
+
+
+def _tokens_from_tagnames(root, known_map):
+    """Tags that ARE the parameter: <SheetNumber/> <SheetName/> ..."""
+    out = []
+    for i, el in enumerate(root.iter()):
+        k = _nk(el.tag)
+        stem = _tag_stem(el.tag)
+        if k in _SETTING_TAGS or k in _GROUP_TAGS or stem in _GROUP_TAGS:
+            continue
+        for cand in (k, stem):
+            hit = None
+            if cand in known_map:
+                hit = known_map[cand]
+            elif cand in _TOKEN_ALIASES and len(cand) >= 6:
+                hit = known_map.get(_nk(_TOKEN_ALIASES[cand]), _TOKEN_ALIASES[cand])
+            if hit:
+                if _item_enabled(el):
+                    out.append((_item_order(el, i), i, hit))
+                break
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [v for _, _, v in out]
+
+
+def _item_setting(el, key):
+    """A per-entry setting (separator / suffix ...) written on the entry."""
+    for alias in _ALIASES[key]:
+        for ak, av in el.attrib.items():
+            if _nk(ak) == alias and av is not None:
+                return av
+        for ch in el:
+            if _nk(ch.tag) == alias and ch.text is not None:
+                return ch.text
+    return None
 
 
 def _decode_separator(sep):
@@ -957,48 +1190,115 @@ def _decode_separator(sep):
     return raw
 
 
+LAST_READ_VALUES = []         # distinct strings seen (shown when nothing matched)
+
+
 def read_rule_xml(path, known=None):
     """Read a naming rule from ANY reasonable XML layout.
+
+    Strategies, best first: parameter entries (text / attributes / child
+    tags / numbered tags / switched-off entries skipped) -> a naming
+    PATTERN string ({Sheet Number}-{Sheet Name}, [..], %..%, plain) ->
+    tags that are parameters -> any known parameter name found in the
+    file. Not well-formed XML is read as plain text.
 
     Returns the usual rule dict. Anything unusual that was guessed or could
     not be matched is described in LAST_READ_NOTES."""
     del LAST_READ_NOTES[:]
-    root = _parse_xml_any(path)
+    del LAST_READ_VALUES[:]
 
     known_list = list(known) if known else []
     for t in BUILTIN_TOKENS:
         if t not in known_list:
             known_list.append(t)
     known_map = dict((_nk(k), k) for k in known_list)
+    patterns = _compile_token_patterns(known_map)
 
-    kv = _collect_settings(root)
+    try:
+        root = _parse_xml_any(path)
+    except Exception as ex:
+        LAST_READ_NOTES.append("not well-formed XML (%s) - read as plain text" % ex)
+        root = _text_to_root(path)
 
-    raw_tokens = _tokens_from_tree(root)
+    seen = []
+    for el in root.iter():
+        for v in [el.text] + list(el.attrib.values()):
+            if v and v.strip() and v.strip() not in seen and len(v.strip()) < 80:
+                seen.append(v.strip())
+    LAST_READ_VALUES.extend(seen[:20])
+
+    items = _group_items(root)
+    item_els = [t[3] for t in items]
+    kv = _collect_settings(root, item_els)
+
+    raw_tokens = [t[2] for t in items]
     tokens, unmatched = [], []
     for raw in raw_tokens:
         name, ok = _resolve_token(raw, known_map)
         tokens.append(name)
         if not ok:
             unmatched.append(raw)
-    if not tokens:
-        tokens = _tokens_by_scanning(root, known_map)
-        if tokens:
-            LAST_READ_NOTES.append("no parameter list found - picked up %d "
-                                   "known parameter name(s) from the file"
-                                   % len(tokens))
+
+    tpl = None
+    if raw_tokens and len(unmatched) < len(raw_tokens):
+        pass                                   # structured list is usable
+    else:
+        # structured list missing or nothing in it is recognisable: try the
+        # other layouts and keep whichever finds recognisable parameters
+        alt = None
+        tpl = _template_from_tree(root, known_map, patterns)
+        if tpl:
+            alt = list(tpl["tokens"])
+            LAST_READ_NOTES.append("naming pattern text found - parameters and "
+                                   "separator taken from it")
+        else:
+            names = _tokens_from_tagnames(root, known_map)
+            if names:
+                alt = names
+                LAST_READ_NOTES.append("parameters taken from the tag names")
+            else:
+                scanned = _tokens_by_scanning(root, known_map)
+                if scanned:
+                    alt = []
+                    for s_ in scanned:
+                        if s_ not in alt:
+                            alt.append(s_)
+                    LAST_READ_NOTES.append("no parameter list found - picked up "
+                                           "%d known parameter name(s) from the "
+                                           "file" % len(alt))
+        if alt:
+            tokens, unmatched = alt, []
     if not tokens:
         LAST_READ_NOTES.append("no naming parameters found in this XML")
     if unmatched:
         LAST_READ_NOTES.append("not a known parameter (kept as-is): %s"
                                % ", ".join(unmatched))
 
+    # ---- separator: explicit setting > pattern text > per-entry > preset
     sep = _pick(kv, "separator")
-    if sep is None:
-        sep = "_"
-    elif sep == "":
-        sep = "none"
+    if sep is not None:
+        sep = "none" if sep == "" else _decode_separator(sep)
+    elif tpl and tpl.get("real_seps") and tpl["seps"]:
+        counts = {}
+        for s_ in tpl["seps"]:
+            counts[s_] = counts.get(s_, 0) + 1
+        sep = sorted(counts.items(), key=lambda kv_: -kv_[1])[0][0]
+        sep = "none" if sep == "" else sep
     else:
-        sep = _decode_separator(sep)
+        per = []
+        for el in item_els[:-1]:
+            v = _item_setting(el, "separator")
+            if v is None:
+                v = _item_setting(el, "suffix")
+            if v is not None and v != "":
+                per.append(_decode_separator(v))
+        if per:
+            counts = {}
+            for s_ in per:
+                counts[s_] = counts.get(s_, 0) + 1
+            sep = sorted(counts.items(), key=lambda kv_: -kv_[1])[0][0]
+    if sep is None:
+        sep = DEFAULT_SEPARATOR
 
     def flag(key, default=False):
         v = _pick(kv, key)
@@ -1006,6 +1306,10 @@ def read_rule_xml(path, known=None):
 
     prefix = _pick(kv, "prefix")
     suffix = _pick(kv, "suffix")
+    if not prefix and tpl and tpl.get("prefix"):
+        prefix = tpl["prefix"]
+    if not suffix and tpl and tpl.get("suffix"):
+        suffix = tpl["suffix"]
     return dict(tokens=tokens,
                 separator=sep,
                 prefix=prefix or "",
@@ -1013,6 +1317,19 @@ def read_rule_xml(path, known=None):
                 remove_spaces=flag("remove_spaces"),
                 upper=flag("upper"),
                 do_sanitize=flag("sanitize", True))
+
+
+def explain_empty_read():
+    """Text for the dialog shown when an XML gave no parameters."""
+    msg = "No naming parameters could be found in this file."
+    if LAST_READ_NOTES:
+        msg += "\n\n- " + "\n- ".join(LAST_READ_NOTES)
+    if LAST_READ_VALUES:
+        msg += ("\n\nValues found in the file:\n  " +
+                "\n  ".join(LAST_READ_VALUES[:12]) +
+                "\n\nIf the parameter names are in there, send me the file and "
+                "I will add its layout.")
+    return msg
 
 
 # --------------------------------------------------------------------------- #
@@ -2582,11 +2899,15 @@ class SheetExportWindow(forms.WPFWindow):
         if not path or not os.path.isfile(path):
             return
         try:
-            self._rule = read_rule_xml(path, self._available_params())
+            new_rule = read_rule_xml(path, self._available_params())
         except Exception as ex:
             forms.alert("Could not read '%s':\n%s" % (name, ex),
                         title="Sheet Export")
             return
+        if not new_rule["tokens"]:
+            forms.alert(explain_empty_read(), title="Sheet Export")
+            return
+        self._rule = new_rule
         self._update_rule_summary()
         self._fill_names(only_empty=False)
         self.GridItems.Items.Refresh()
@@ -2631,12 +2952,18 @@ class SheetExportWindow(forms.WPFWindow):
         if dlg.ShowDialog() != DialogResult.OK:
             return
         try:
-            self._rule = read_rule_xml(dlg.FileName, self._available_params())
+            new_rule = read_rule_xml(dlg.FileName, self._available_params())
         except Exception as ex:
             forms.alert("Could not read the XML:\n%s" % ex, title="Sheet Export")
             return
+        if not new_rule["tokens"]:
+            forms.alert(explain_empty_read(), title="Sheet Export")
+            return                            # keep the current rule
+        self._rule = new_rule
         for note in LAST_READ_NOTES:
             self._log("Naming XML: %s" % note)
+        self._log("Naming XML read: %s | separator '%s'" % (
+            ", ".join(self._rule["tokens"]), self._rule["separator"]))
 
         label = os.path.splitext(os.path.basename(dlg.FileName))[0]
         try:
